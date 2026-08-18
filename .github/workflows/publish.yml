@@ -1,0 +1,182 @@
+name: Publish course
+
+on:
+  workflow_dispatch:
+    inputs:
+      source_repository:
+        description: Private source repository
+        required: true
+        type: string
+      source_tag:
+        description: Immutable course-v* source tag
+        required: true
+        type: string
+      source_sha:
+        description: Exact commit SHA for the source tag
+        required: true
+        type: string
+      actor:
+        description: Private release initiator
+        required: true
+        type: string
+
+permissions:
+  contents: write
+  pages: write
+  id-token: write
+
+concurrency:
+  group: publish-course
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Validate dispatch
+        shell: bash
+        env:
+          SOURCE_REPOSITORY: ${{ inputs.source_repository }}
+          SOURCE_TAG: ${{ inputs.source_tag }}
+          SOURCE_SHA: ${{ inputs.source_sha }}
+          RELEASE_ACTOR: ${{ inputs.actor }}
+        run: |
+          set -euo pipefail
+          test "$SOURCE_REPOSITORY" = "KStocky/LearnGraphicsProgramming"
+          [[ "$SOURCE_TAG" =~ ^course-v[0-9]+(\.[0-9]+){2}([.-][0-9A-Za-z]+)*$ ]]
+          [[ "$SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]]
+          [[ "$RELEASE_ACTOR" =~ ^[A-Za-z0-9][A-Za-z0-9-]{0,38}(\[bot\])?$ ]]
+
+      - name: Check out public repository
+        uses: actions/checkout@v6.0.2
+        with:
+          path: public
+          fetch-depth: 0
+
+      - name: Reject an existing public tag
+        shell: bash
+        working-directory: public
+        env:
+          SOURCE_TAG: ${{ inputs.source_tag }}
+        run: |
+          set -euo pipefail
+          if git ls-remote --exit-code --tags origin "refs/tags/$SOURCE_TAG" >/dev/null 2>&1; then
+            echo "::error::Public tag $SOURCE_TAG already exists."
+            exit 1
+          fi
+
+      - name: Check out exact private tagged source
+        uses: actions/checkout@v6.0.2
+        with:
+          repository: ${{ inputs.source_repository }}
+          ref: refs/tags/${{ inputs.source_tag }}
+          token: ${{ secrets.PRIVATE_SOURCE_TOKEN }}
+          path: source
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Verify immutable source tag
+        shell: bash
+        working-directory: source
+        env:
+          SOURCE_TAG: ${{ inputs.source_tag }}
+          SOURCE_SHA: ${{ inputs.source_sha }}
+        run: |
+          set -euo pipefail
+          git fetch --force origin "refs/tags/$SOURCE_TAG:refs/tags/$SOURCE_TAG"
+          test "$(git rev-parse "$SOURCE_TAG^{commit}")" = "$SOURCE_SHA"
+          test "$(git rev-parse HEAD)" = "$SOURCE_SHA"
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.13"
+
+      - name: Validate exporter
+        working-directory: source
+        run: python -m unittest discover -s tools/distribution -p "test_*.py" -v
+
+      - name: Export learner repository
+        working-directory: source
+        run: python tools/distribution/export_public.py ../staging --version "${{ inputs.source_tag }}"
+
+      - name: Replace generated allowlisted content
+        shell: bash
+        run: |
+          set -euo pipefail
+          cmp staging/.github/workflows/publish.yml public/.github/workflows/publish.yml
+          rm -rf \
+            public/LICENSE public/README.md public/CMakeLists.txt public/CMakePresets.json \
+            public/cmake public/framework public/chapters
+          cp staging/LICENSE staging/README.md staging/CMakeLists.txt staging/CMakePresets.json public/
+          cp -R staging/cmake staging/framework staging/chapters public/
+          git -C public add -- \
+            LICENSE README.md CMakeLists.txt CMakePresets.json cmake framework chapters
+          git -C public status --porcelain --untracked-files=all | while IFS= read -r line; do
+            path="${line:3}"
+            case "$path" in
+              LICENSE|README.md|CMakeLists.txt|CMakePresets.json|cmake/*|framework/*|chapters/*) ;;
+              *) echo "::error::Unexpected public path changed: $path"; exit 1 ;;
+            esac
+          done
+
+      - name: Commit, tag, and push learner source
+        shell: bash
+        working-directory: public
+        env:
+          SOURCE_TAG: ${{ inputs.source_tag }}
+          SOURCE_SHA: ${{ inputs.source_sha }}
+          RELEASE_ACTOR: ${{ inputs.actor }}
+        run: |
+          set -euo pipefail
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git commit -m "Publish $SOURCE_TAG from $SOURCE_SHA" \
+            -m "Requested by $RELEASE_ACTOR."
+          git tag -a "$SOURCE_TAG" -m "Learn Graphics Programming $SOURCE_TAG"
+          git push origin HEAD:main "refs/tags/$SOURCE_TAG"
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: "24"
+          cache: npm
+          cache-dependency-path: source/site/package-lock.json
+
+      - name: Set up Hugo
+        uses: peaceiris/actions-hugo@v3
+        with:
+          hugo-version: "0.164.0"
+          extended: true
+
+      - name: Build tagged release site
+        shell: bash
+        env:
+          SOURCE_TAG: ${{ inputs.source_tag }}
+        run: |
+          set -euo pipefail
+          npm --prefix source/site ci
+          npm --prefix source/site run sync-vendor
+          hugo \
+            --source source/site \
+            --environment production \
+            --gc --minify --cleanDestinationDir \
+            --baseURL "https://kstocky.github.io/LearnGraphicsProgrammingCourse/" \
+            --destination "$GITHUB_WORKSPACE/public-site" \
+            --params "siteVersion=$SOURCE_TAG" \
+            --params "publicSourceArchiveURL=https://github.com/KStocky/LearnGraphicsProgrammingCourse/archive/refs/tags/$SOURCE_TAG.zip"
+
+      - name: Configure Pages
+        uses: actions/configure-pages@v5
+
+      - name: Upload Pages artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: public-site
+
+      - name: Deploy Pages
+        id: deployment
+        uses: actions/deploy-pages@v4
