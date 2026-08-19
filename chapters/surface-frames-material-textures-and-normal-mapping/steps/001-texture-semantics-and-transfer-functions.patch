@@ -1,0 +1,58 @@
+diff --git a/chapters/surface-frames-material-textures-and-normal-mapping/Starter/SurfaceBaseline.hlsl b/chapters/surface-frames-material-textures-and-normal-mapping/Starter/SurfaceBaseline.hlsl
+index c6a4cc8..06838c9 100644
+--- a/chapters/surface-frames-material-textures-and-normal-mapping/Starter/SurfaceBaseline.hlsl
++++ b/chapters/surface-frames-material-textures-and-normal-mapping/Starter/SurfaceBaseline.hlsl
+@@ -50,6 +50,7 @@ struct LitVertex
+     float4 position : SV_Position;
+     float3 worldPosition : POSITION;
+     float3 worldNormal : NORMAL;
++    float2 uv : TEXCOORD0;
+ };
+
+ struct FullscreenVertex
+@@ -68,6 +69,7 @@ LitVertex LightingVS(MeshVertex input)
+     output.position = mul(worldPosition, lighting.viewProjection);
+     output.worldPosition = worldPosition.xyz;
+     output.worldNormal = input.normal;
++    output.uv = input.uv * 8.0;
+     return output;
+ }
+
+@@ -100,9 +102,19 @@ float SmithG1(float nDotDirection, float roughness)
+     return (2.0 * cosine) / max(cosine + root, 1.0e-7);
+ }
+
++float3 SrgbToLinear(float3 encoded)
++{
++    float3 low = encoded / 12.92;
++    float3 high = pow((encoded + 0.055) / 1.055, 2.4);
++    return lerp(high, low, encoded <= 0.04045);
++}
++
+ float4 LightingPS(LitVertex input) : SV_Target
+ {
+     float3 normal = normalize(input.worldNormal);
++    float checker = fmod(floor(input.uv.x) + floor(input.uv.y), 2.0);
++    float3 encodedBaseColor = lerp(float3(0.045, 0.28, 0.78), float3(0.78, 0.16, 0.055), checker);
++    float3 baseColor = SrgbToLinear(encodedBaseColor);
+     float3 viewDirection = normalize(lighting.cameraPosition - input.worldPosition);
+     float3 lightDirection = normalize(lighting.directionToLight);
+     float nDotL = saturate(dot(normal, lightDirection));
+@@ -110,7 +122,7 @@ float4 LightingPS(LitVertex input) : SV_Target
+     float3 halfVector = normalize(viewDirection + lightDirection);
+     float nDotH = saturate(dot(normal, halfVector));
+     float vDotH = saturate(dot(viewDirection, halfVector));
+-    float3 f0 = lerp(objectData.dielectricF0, objectData.baseColor, objectData.metalness);
++    float3 f0 = lerp(objectData.dielectricF0, baseColor, objectData.metalness);
+     float3 fresnel = SchlickFresnel(f0, vDotH);
+     float distribution = GgxDistribution(nDotH, objectData.roughness);
+     float geometry = SmithG1(nDotV, objectData.roughness) * SmithG1(nDotL, objectData.roughness);
+@@ -120,7 +132,7 @@ float4 LightingPS(LitVertex input) : SV_Target
+         : 0.0;
+     float3 diffuseWeight =
+         (1.0 - SchlickFresnel(f0, nDotV)) * (1.0 - SchlickFresnel(f0, nDotL)) * (1.0 - objectData.metalness);
+-    float3 diffuseBrdf = diffuseWeight * objectData.baseColor / Pi;
++    float3 diffuseBrdf = diffuseWeight * baseColor / Pi;
+     float3 irradiance = lighting.lightColor * lighting.intensity * nDotL;
+     return float4(irradiance * (diffuseBrdf + specularBrdf), 1.0);
+ }

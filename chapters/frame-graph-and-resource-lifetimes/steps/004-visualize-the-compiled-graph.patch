@@ -1,0 +1,611 @@
+diff --git a/chapters/frame-graph-and-resource-lifetimes/CMakeLists.txt b/chapters/frame-graph-and-resource-lifetimes/CMakeLists.txt
+index 2df08e0..9674d9e 100644
+--- a/chapters/frame-graph-and-resource-lifetimes/CMakeLists.txt
++++ b/chapters/frame-graph-and-resource-lifetimes/CMakeLists.txt
+@@ -54,13 +54,24 @@ set_target_properties(
+         FOLDER "Chapters/FrameGraph")
+ source_group(TREE "${CMAKE_CURRENT_SOURCE_DIR}" FILES ${LGP_CH08_COMMON_SOURCES})
+ 
+-add_library(ch08_pass_graph_starter_logic STATIC ${LGP_CH08_STARTER_SOURCES})
++add_library(
++    ch08_pass_graph_starter_logic
++    STATIC
++        ${LGP_CH08_STARTER_SOURCES}
++        "${LGP_CH08_IMGUI_DX12_BACKEND}")
+ target_link_libraries(
+     ch08_pass_graph_starter_logic
+     PUBLIC
++        DearImGui::DearImGui
+         LGP::Ch08FrameGraphContracts
+         LGP::Framework)
+-target_include_directories(ch08_pass_graph_starter_logic PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}")
++target_include_directories(
++    ch08_pass_graph_starter_logic
++    PUBLIC
++        "${CMAKE_CURRENT_SOURCE_DIR}"
++        "${LGP_CH08_IMGUI_ROOT}"
++        "${LGP_CH08_IMGUI_ROOT}/backends")
++target_compile_definitions(ch08_pass_graph_starter_logic PRIVATE IMGUI_IMPL_WIN32_DISABLE_GAMEPAD)
+ set_target_properties(
+     ch08_pass_graph_starter_logic
+     PROPERTIES
+@@ -109,6 +120,7 @@ set_target_properties(
+ source_group(TREE "${CMAKE_CURRENT_SOURCE_DIR}" FILES "${CMAKE_CURRENT_SOURCE_DIR}/Starter/Main.cpp")
+ lgp_configure_framework_chapter_app(
+     TARGET Ch08_PassGraph_Starter
++    ENABLE_IMGUI
+     EXTRA_DEPENDENCIES ch08_pass_graph_starter_logic)
+ 
+ add_executable(Ch08_PassGraph_Solution "${CMAKE_CURRENT_SOURCE_DIR}/Solution/Main.cpp")
+diff --git a/chapters/frame-graph-and-resource-lifetimes/Starter/Main.cpp b/chapters/frame-graph-and-resource-lifetimes/Starter/Main.cpp
+index b5498c6..ed747c2 100644
+--- a/chapters/frame-graph-and-resource-lifetimes/Starter/Main.cpp
++++ b/chapters/frame-graph-and-resource-lifetimes/Starter/Main.cpp
+@@ -4,10 +4,10 @@
+ 
+ int wmain(int argc, wchar_t **argv)
+ {
+-    ch08::frame_graph::starter::Renderer renderer{};
++    ch08::frame_graph::solution::Renderer renderer{};
+ 
+     lgp::framework::ApplicationConfiguration configuration{};
+-    configuration.title = L"Ch08 Pass Graph Starter";
++    configuration.title = L"Ch08 Pass Graph Solution";
+     configuration.width = 1600U;
+     configuration.height = 900U;
+     configuration.rtvDescriptorCount = 32U;
+diff --git a/chapters/frame-graph-and-resource-lifetimes/Starter/Renderer.cpp b/chapters/frame-graph-and-resource-lifetimes/Starter/Renderer.cpp
+index 33da3ff..ab0aa90 100644
+--- a/chapters/frame-graph-and-resource-lifetimes/Starter/Renderer.cpp
++++ b/chapters/frame-graph-and-resource-lifetimes/Starter/Renderer.cpp
+@@ -8,19 +8,25 @@
+ 
+ #include "Renderer.hpp"
+ 
++#include <imgui.h>
++#include <imgui_impl_dx12.h>
++
+ #include <d3d12.h>
+ #include <wrl/client.h>
+ 
++#include <algorithm>
+ #include <array>
+ #include <cstddef>
+ #include <cstdint>
+ #include <filesystem>
++#include <optional>
+ #include <string>
++#include <string_view>
+ #include <utility>
+ 
+ #include <lgp/framework/barriers.hpp>
+ 
+-namespace ch08::frame_graph::starter
++namespace ch08::frame_graph::solution
+ {
+ namespace
+ {
+@@ -116,6 +122,117 @@ enum RootParameter : UINT
+     return message;
+ }
+ 
++[[nodiscard]] std::string_view DependencyKindLabel(DependencyKind kind) noexcept
++{
++    switch (kind)
++    {
++    case DependencyKind::ReadAfterWrite:
++        return "RAW";
++    case DependencyKind::WriteAfterRead:
++        return "WAR";
++    case DependencyKind::WriteAfterWrite:
++        return "WAW";
++    case DependencyKind::Explicit:
++        return "Explicit";
++    default:
++        return "Unknown";
++    }
++}
++
++[[nodiscard]] std::string_view BarrierSyncLabel(D3D12_BARRIER_SYNC sync) noexcept
++{
++    switch (sync)
++    {
++    case D3D12_BARRIER_SYNC_NONE:
++        return "None";
++    case D3D12_BARRIER_SYNC_PIXEL_SHADING:
++        return "PixelShading";
++    case D3D12_BARRIER_SYNC_RENDER_TARGET:
++        return "RenderTarget";
++    default:
++        return "Unknown";
++    }
++}
++
++[[nodiscard]] std::string_view BarrierAccessLabel(D3D12_BARRIER_ACCESS access) noexcept
++{
++    switch (access)
++    {
++    case D3D12_BARRIER_ACCESS_NO_ACCESS:
++        return "NoAccess";
++    case D3D12_BARRIER_ACCESS_SHADER_RESOURCE:
++        return "ShaderResource";
++    case D3D12_BARRIER_ACCESS_RENDER_TARGET:
++        return "RenderTarget";
++    default:
++        return "Unknown";
++    }
++}
++
++[[nodiscard]] std::string_view BarrierLayoutLabel(D3D12_BARRIER_LAYOUT layout) noexcept
++{
++    if (layout == D3D12_BARRIER_LAYOUT_COMMON)
++    {
++        return "Present/Common";
++    }
++    if (layout == D3D12_BARRIER_LAYOUT_SHADER_RESOURCE)
++    {
++        return "ShaderResource";
++    }
++    if (layout == D3D12_BARRIER_LAYOUT_RENDER_TARGET)
++    {
++        return "RenderTarget";
++    }
++
++    return "Unknown";
++}
++
++[[nodiscard]] std::string FormatBarrierState(lgp::framework::TextureBarrierState const &state)
++{
++    return "sync=" + std::string{BarrierSyncLabel(state.sync)} +
++           ", access=" + std::string{BarrierAccessLabel(state.access)} +
++           ", layout=" + std::string{BarrierLayoutLabel(state.layout)};
++}
++
++[[nodiscard]] std::string FormatLifetimeInterval(ResourceLifetime const &lifetime)
++{
++    if (!lifetime.firstExecutionIndex.has_value() || !lifetime.lastExecutionIndex.has_value())
++    {
++        return "unused";
++    }
++
++    return "[" + std::to_string(*lifetime.firstExecutionIndex) + ", " + std::to_string(*lifetime.lastExecutionIndex) +
++           "]";
++}
++
++[[nodiscard]] bool LifetimeUsesPassSlot(ResourceLifetime const &lifetime, std::uint32_t slot) noexcept
++{
++    return lifetime.firstExecutionIndex.has_value() && lifetime.lastExecutionIndex.has_value() &&
++           *lifetime.firstExecutionIndex <= slot && slot <= *lifetime.lastExecutionIndex;
++}
++
++[[nodiscard]] std::string_view ResourceName(CompiledPassGraph const &graph, TextureResourceId resourceId) noexcept
++{
++    if (resourceId.value >= graph.textureResources.size())
++    {
++        return "Unknown";
++    }
++
++    return graph.textureResources[resourceId.value].name;
++}
++
++[[nodiscard]] std::string_view PassName(CompiledPassGraph const &graph, PassId passId) noexcept
++{
++    auto const pass = std::find_if(graph.scheduledPasses.begin(), graph.scheduledPasses.end(),
++                                   [passId](CompiledPass const &candidate) { return candidate.id == passId; });
++    if (pass != graph.scheduledPasses.end())
++    {
++        return pass->name;
++    }
++
++    return "Unknown";
++}
++
+ } // namespace
+ 
+ lgp::framework::Status Renderer::CreateShaders()
+@@ -344,6 +461,38 @@ lgp::framework::Status Renderer::CreateHdrIntermediate(lgp::framework::Extent2D
+     return {};
+ }
+ 
++lgp::framework::Status Renderer::InitializeImGui()
++{
++    auto descriptorResult = deviceResources_->shader_visible_cbv_srv_uav_heap().Allocate(1U);
++    if (!descriptorResult)
++    {
++        return std::unexpected(std::move(descriptorResult.error()));
++    }
++    imguiFontDescriptor_ = *descriptorResult;
++
++    IMGUI_CHECKVERSION();
++    ImGui::CreateContext();
++    ImGui::StyleColorsDark();
++    ImGui::GetIO().BackendPlatformName = "LGP.ManualInput";
++
++    ImGui_ImplDX12_InitInfo info{};
++    info.Device = deviceResources_->device();
++    info.CommandQueue = deviceResources_->graphics_queue();
++    info.NumFramesInFlight = static_cast<int>(deviceResources_->back_buffer_count());
++    info.RTVFormat = deviceResources_->back_buffer_format();
++    info.SrvDescriptorHeap = deviceResources_->shader_visible_cbv_srv_uav_heap().Get();
++    info.LegacySingleSrvCpuDescriptor = imguiFontDescriptor_.cpuHandle;
++    info.LegacySingleSrvGpuDescriptor = imguiFontDescriptor_.gpuHandle;
++    if (!ImGui_ImplDX12_Init(&info))
++    {
++        return std::unexpected(
++            lgp::framework::MakeError("ImGui_ImplDX12_Init", "Failed to initialize the Chapter 8 diagnostics UI."));
++    }
++
++    imguiInitialized_ = true;
++    return {};
++}
++
+ std::expected<Renderer::FrameGraphPlan, lgp::framework::Error> Renderer::CompileFrameGraph(
+     lgp::framework::FrameContext const &frameContext) const
+ {
+@@ -414,7 +563,179 @@ void Renderer::ExecuteAnalyticPass(ID3D12GraphicsCommandList7 &commandList) cons
+     commandList.DrawInstanced(3U, 1U, 0U, 0U);
+ }
+ 
+-void Renderer::ExecuteDisplayPass(lgp::framework::FrameContext const &frameContext) const
++void Renderer::BuildDiagnosticsWindow(lgp::framework::UpdateContext const &context) const
++{
++    ImGui::SetNextWindowSize(ImVec2(760.0F, 560.0F), ImGuiCond_FirstUseEver);
++    ImGui::Begin("Frame graph diagnostics");
++
++    if (!lastCompiledGraph_.has_value() || !lastCompiledFrameIndex_.has_value())
++    {
++        ImGui::TextWrapped("Waiting for the first completed frame. The diagnostics window will display the previous "
++                           "frame's compiled schedule after frame 0 finishes.");
++        ImGui::End();
++        return;
++    }
++
++    CompiledPassGraph const &graph = *lastCompiledGraph_;
++    ImGui::Text("Showing completed frame %llu at %ux%u", static_cast<unsigned long long>(*lastCompiledFrameIndex_),
++                context.drawableSize.width, context.drawableSize.height);
++    ImGui::Text("Passes: %zu  Dependencies: %zu  Textures: %zu", graph.scheduledPasses.size(),
++                graph.dependencyEdges.size(), graph.textureResources.size());
++
++    if (ImGui::CollapsingHeader("Schedule", ImGuiTreeNodeFlags_DefaultOpen))
++    {
++        if (ImGui::BeginTable("schedule", 2, ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg))
++        {
++            ImGui::TableSetupColumn("Slot");
++            ImGui::TableSetupColumn("Pass");
++            ImGui::TableHeadersRow();
++            for (CompiledPass const &pass : graph.scheduledPasses)
++            {
++                ImGui::TableNextRow();
++                ImGui::TableNextColumn();
++                ImGui::Text("%u", pass.executionIndex);
++                ImGui::TableNextColumn();
++                ImGui::TextUnformatted(pass.name.c_str());
++            }
++            ImGui::EndTable();
++        }
++    }
++
++    if (ImGui::CollapsingHeader("Dependencies", ImGuiTreeNodeFlags_DefaultOpen))
++    {
++        if (graph.dependencyEdges.empty())
++        {
++            ImGui::TextUnformatted("No derived or explicit dependencies.");
++        }
++        else if (ImGui::BeginTable("dependencies", 4, ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg))
++        {
++            ImGui::TableSetupColumn("From");
++            ImGui::TableSetupColumn("To");
++            ImGui::TableSetupColumn("Kind");
++            ImGui::TableSetupColumn("Resource");
++            ImGui::TableHeadersRow();
++            for (DependencyEdge const &edge : graph.dependencyEdges)
++            {
++                ImGui::TableNextRow();
++                ImGui::TableNextColumn();
++                ImGui::TextUnformatted(std::string{PassName(graph, edge.beforePassId)}.c_str());
++                ImGui::TableNextColumn();
++                ImGui::TextUnformatted(std::string{PassName(graph, edge.afterPassId)}.c_str());
++                ImGui::TableNextColumn();
++                ImGui::TextUnformatted(std::string{DependencyKindLabel(edge.kind)}.c_str());
++                ImGui::TableNextColumn();
++                ImGui::TextUnformatted(edge.textureResourceId.has_value()
++                                           ? graph.textureResources[edge.textureResourceId->value].name.c_str()
++                                           : "-");
++            }
++            ImGui::EndTable();
++        }
++    }
++
++    if (ImGui::CollapsingHeader("Grouped enhanced barriers", ImGuiTreeNodeFlags_DefaultOpen))
++    {
++        std::size_t barrierRecordCount{};
++        for (CompiledPass const &pass : graph.scheduledPasses)
++        {
++            for (TextureBarrierGroup const &group : pass.barrierGroups)
++            {
++                barrierRecordCount += group.records.size();
++            }
++        }
++
++        if (barrierRecordCount == 0U)
++        {
++            ImGui::TextUnformatted("No derived barriers were needed.");
++        }
++        else if (ImGui::BeginTable("barriers", 5,
++                                   ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg | ImGuiTableFlags_ScrollX))
++        {
++            ImGui::TableSetupColumn("Pass");
++            ImGui::TableSetupColumn("Group");
++            ImGui::TableSetupColumn("Resource");
++            ImGui::TableSetupColumn("Before");
++            ImGui::TableSetupColumn("After");
++            ImGui::TableHeadersRow();
++
++            for (CompiledPass const &pass : graph.scheduledPasses)
++            {
++                for (std::size_t groupIndex = 0U; groupIndex < pass.barrierGroups.size(); ++groupIndex)
++                {
++                    TextureBarrierGroup const &group = pass.barrierGroups[groupIndex];
++                    for (TextureBarrierRecord const &record : group.records)
++                    {
++                        std::string const beforeState = FormatBarrierState(record.before);
++                        std::string const afterState = FormatBarrierState(record.after);
++
++                        ImGui::TableNextRow();
++                        ImGui::TableNextColumn();
++                        ImGui::TextUnformatted(pass.name.c_str());
++                        ImGui::TableNextColumn();
++                        ImGui::Text("%zu", groupIndex);
++                        ImGui::TableNextColumn();
++                        ImGui::TextUnformatted(std::string{ResourceName(graph, record.resourceId)}.c_str());
++                        ImGui::TableNextColumn();
++                        ImGui::TextUnformatted(beforeState.c_str());
++                        ImGui::TableNextColumn();
++                        ImGui::TextUnformatted(afterState.c_str());
++                    }
++                }
++            }
++            ImGui::EndTable();
++        }
++    }
++
++    if (ImGui::CollapsingHeader("Texture lifetimes", ImGuiTreeNodeFlags_DefaultOpen))
++    {
++        int const columnCount = 3 + static_cast<int>(graph.scheduledPasses.size());
++        if (ImGui::BeginTable("lifetimes", columnCount,
++                              ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg | ImGuiTableFlags_ScrollX))
++        {
++            ImGui::TableSetupColumn("Texture");
++            ImGui::TableSetupColumn("Owner");
++            ImGui::TableSetupColumn("Range");
++            for (CompiledPass const &pass : graph.scheduledPasses)
++            {
++                std::string const label = "P" + std::to_string(pass.executionIndex);
++                ImGui::TableSetupColumn(label.c_str());
++            }
++            ImGui::TableHeadersRow();
++
++            for (ResourceLifetime const &lifetime : graph.resourceLifetimes)
++            {
++                TextureResource const &resource = graph.textureResources[lifetime.resourceId.value];
++                ImGui::TableNextRow();
++                ImGui::TableNextColumn();
++                ImGui::TextUnformatted(resource.name.c_str());
++                ImGui::TableNextColumn();
++                ImGui::TextUnformatted(resource.imported ? "Imported" : "Transient");
++                ImGui::TableNextColumn();
++                std::string const interval = FormatLifetimeInterval(lifetime);
++                ImGui::TextUnformatted(interval.c_str());
++
++                for (CompiledPass const &pass : graph.scheduledPasses)
++                {
++                    bool const active = LifetimeUsesPassSlot(lifetime, pass.executionIndex);
++                    ImGui::TableNextColumn();
++                    if (active)
++                    {
++                        ImGui::TextColored(ImVec4(0.35F, 0.85F, 0.35F, 1.0F), "##");
++                    }
++                    else
++                    {
++                        ImGui::TextUnformatted("..");
++                    }
++                }
++            }
++
++            ImGui::EndTable();
++        }
++    }
++
++    ImGui::End();
++}
++
++void Renderer::ExecuteDisplayPass(lgp::framework::FrameContext const &frameContext)
+ {
+     ID3D12GraphicsCommandList7 &commandList = *frameContext.commandList;
+     float const frameClear[]{0.0F, 0.0F, 0.0F, 1.0F};
+@@ -425,11 +746,20 @@ void Renderer::ExecuteDisplayPass(lgp::framework::FrameContext const &frameConte
+     commandList.SetPipelineState(displayPipeline_.Get());
+     commandList.SetGraphicsRootDescriptorTable(HdrTexture, hdrSrv_.gpuHandle);
+     commandList.DrawInstanced(3U, 1U, 0U, 0U);
++
++    if (imguiFrameBegun_)
++    {
++        commandList.SetDescriptorHeaps(1U, descriptorHeaps);
++        ImGui::Render();
++        ImGui_ImplDX12_RenderDrawData(ImGui::GetDrawData(), &commandList);
++        imguiFrameBegun_ = false;
++    }
+ }
+ 
+ lgp::framework::Status Renderer::Initialize(lgp::framework::ApplicationInitContext const &context)
+ {
+     deviceResources_ = &context.deviceResources;
++    headless_ = context.commandLine.headless;
+ 
+     if (auto status = CreateShaders(); !status)
+     {
+@@ -443,7 +773,15 @@ lgp::framework::Status Renderer::Initialize(lgp::framework::ApplicationInitConte
+     {
+         return status;
+     }
+-    return CreateHdrIntermediate(context.drawableSize);
++    if (auto status = CreateHdrIntermediate(context.drawableSize); !status)
++    {
++        return status;
++    }
++    if (!headless_)
++    {
++        return InitializeImGui();
++    }
++    return {};
+ }
+ 
+ lgp::framework::Status Renderer::OnResize(lgp::framework::DeviceResources &, lgp::framework::Extent2D drawableSize)
+@@ -451,8 +789,31 @@ lgp::framework::Status Renderer::OnResize(lgp::framework::DeviceResources &, lgp
+     return CreateHdrIntermediate(drawableSize);
+ }
+ 
+-lgp::framework::Status Renderer::Update(lgp::framework::UpdateContext const &)
++lgp::framework::Status Renderer::Update(lgp::framework::UpdateContext const &context)
+ {
++    if (headless_ || !imguiInitialized_)
++    {
++        return {};
++    }
++
++    if (imguiFrameBegun_)
++    {
++        ImGui::EndFrame();
++        imguiFrameBegun_ = false;
++    }
++
++    ImGuiIO &io = ImGui::GetIO();
++    io.DisplaySize = {static_cast<float>(context.drawableSize.width), static_cast<float>(context.drawableSize.height)};
++    io.DeltaTime = static_cast<float>(std::max(context.deltaSeconds, 1.0 / 240.0));
++    io.AddMousePosEvent(static_cast<float>(context.input.mouse.x), static_cast<float>(context.input.mouse.y));
++    io.AddMouseButtonEvent(0, context.input.mouse.IsButtonDown(lgp::framework::MouseButton::Left));
++    io.AddMouseButtonEvent(1, context.input.mouse.IsButtonDown(lgp::framework::MouseButton::Right));
++    io.AddMouseWheelEvent(0.0F, context.input.mouse.wheelDelta);
++
++    ImGui_ImplDX12_NewFrame();
++    ImGui::NewFrame();
++    imguiFrameBegun_ = true;
++    BuildDiagnosticsWindow(context);
+     return {};
+ }
+ 
+@@ -460,7 +821,11 @@ lgp::framework::Status Renderer::Render(lgp::framework::FrameContext const &fram
+ {
+     if (frameContext.commandList == nullptr || frameContext.renderTarget == nullptr || hdrIntermediate_ == nullptr)
+     {
+-        lastCompiledGraph_.reset();
++        if (imguiFrameBegun_)
++        {
++            ImGui::EndFrame();
++            imguiFrameBegun_ = false;
++        }
+         return {};
+     }
+ 
+@@ -470,7 +835,6 @@ lgp::framework::Status Renderer::Render(lgp::framework::FrameContext const &fram
+         return std::unexpected(std::move(planResult.error()));
+     }
+     FrameGraphPlan plan = std::move(*planResult);
+-    lastCompiledGraph_ = plan.compiledGraph;
+ 
+     std::vector<ID3D12Resource *> resources(plan.compiledGraph.textureResources.size(), nullptr);
+     resources[plan.hdrResourceId.value] = hdrIntermediate_.Get();
+@@ -510,15 +874,29 @@ lgp::framework::Status Renderer::Render(lgp::framework::FrameContext const &fram
+         }
+ 
+         return std::unexpected(lgp::framework::MakeError(
+-            "Renderer::Render", "Encountered an unexpected compiled pass while executing the Chapter 8 starter."));
++            "Renderer::Render", "Encountered an unexpected compiled pass while executing the Chapter 8 solution."));
+     }
+ 
++    lastCompiledFrameIndex_ = frameContext.frameIndex;
++    lastCompiledGraph_ = std::move(plan.compiledGraph);
+     return {};
+ }
+ 
+ void Renderer::Shutdown(lgp::framework::DeviceResources &) noexcept
+ {
++    if (imguiFrameBegun_)
++    {
++        ImGui::EndFrame();
++        imguiFrameBegun_ = false;
++    }
++    if (imguiInitialized_)
++    {
++        ImGui_ImplDX12_Shutdown();
++        ImGui::DestroyContext();
++        imguiInitialized_ = false;
++    }
+     lastCompiledGraph_.reset();
++    lastCompiledFrameIndex_.reset();
+     hdrIntermediate_.Reset();
+     if (deviceResources_ != nullptr && hdrRtv_)
+     {
+@@ -530,6 +908,11 @@ void Renderer::Shutdown(lgp::framework::DeviceResources &) noexcept
+         deviceResources_->shader_visible_cbv_srv_uav_heap().Free(hdrSrv_);
+         hdrSrv_ = {};
+     }
++    if (deviceResources_ != nullptr && imguiFontDescriptor_)
++    {
++        deviceResources_->shader_visible_cbv_srv_uav_heap().Free(imguiFontDescriptor_);
++        imguiFontDescriptor_ = {};
++    }
+     displayPipeline_.Reset();
+     hdrPipeline_.Reset();
+     rootSignature_.Reset();
+@@ -541,4 +924,4 @@ CompiledPassGraph const *Renderer::LastCompiledGraph() const noexcept
+     return lastCompiledGraph_.has_value() ? &*lastCompiledGraph_ : nullptr;
+ }
+ 
+-} // namespace ch08::frame_graph::starter
++} // namespace ch08::frame_graph::solution
+diff --git a/chapters/frame-graph-and-resource-lifetimes/Starter/Renderer.hpp b/chapters/frame-graph-and-resource-lifetimes/Starter/Renderer.hpp
+index 4e445f7..de490fa 100644
+--- a/chapters/frame-graph-and-resource-lifetimes/Starter/Renderer.hpp
++++ b/chapters/frame-graph-and-resource-lifetimes/Starter/Renderer.hpp
+@@ -12,7 +12,7 @@
+ #include <optional>
+ #include <vector>
+ 
+-namespace ch08::frame_graph::starter
++namespace ch08::frame_graph::solution
+ {
+ 
+ class Renderer final : public lgp::framework::IChapterRenderer
+@@ -42,13 +42,15 @@ class Renderer final : public lgp::framework::IChapterRenderer
+     [[nodiscard]] lgp::framework::Status CreateRootSignature();
+     [[nodiscard]] lgp::framework::Status CreatePipelineStates();
+     [[nodiscard]] lgp::framework::Status CreateHdrIntermediate(lgp::framework::Extent2D size);
++    [[nodiscard]] lgp::framework::Status InitializeImGui();
+     [[nodiscard]] std::expected<FrameGraphPlan, lgp::framework::Error> CompileFrameGraph(
+         lgp::framework::FrameContext const &frameContext) const;
+     [[nodiscard]] lgp::framework::Status ApplyBarrierGroup(ID3D12GraphicsCommandList7 &commandList,
+                                                            TextureBarrierGroup const &group,
+                                                            std::vector<ID3D12Resource *> const &resources) const;
++    void BuildDiagnosticsWindow(lgp::framework::UpdateContext const &context) const;
+     void ExecuteAnalyticPass(ID3D12GraphicsCommandList7 &commandList) const;
+-    void ExecuteDisplayPass(lgp::framework::FrameContext const &frameContext) const;
++    void ExecuteDisplayPass(lgp::framework::FrameContext const &frameContext);
+ 
+     lgp::framework::DeviceResources *deviceResources_{};
+     lgp::framework::CompiledShader fullscreenVertexShader_{};
+@@ -59,8 +61,13 @@ class Renderer final : public lgp::framework::IChapterRenderer
+     Microsoft::WRL::ComPtr<ID3D12PipelineState> displayPipeline_{};
+     lgp::framework::DescriptorAllocation hdrRtv_{};
+     lgp::framework::DescriptorAllocation hdrSrv_{};
++    lgp::framework::DescriptorAllocation imguiFontDescriptor_{};
+     Microsoft::WRL::ComPtr<ID3D12Resource> hdrIntermediate_{};
++    bool headless_{};
++    bool imguiInitialized_{};
++    bool imguiFrameBegun_{};
++    std::optional<std::uint64_t> lastCompiledFrameIndex_{};
+     std::optional<CompiledPassGraph> lastCompiledGraph_{};
+ };
+ 
+-} // namespace ch08::frame_graph::starter
++} // namespace ch08::frame_graph::solution

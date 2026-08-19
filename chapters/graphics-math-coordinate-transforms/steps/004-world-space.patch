@@ -1,0 +1,23 @@
+diff --git a/chapters/graphics-math-coordinate-transforms/Starter/Scene.cpp b/chapters/graphics-math-coordinate-transforms/Starter/Scene.cpp
+--- a/chapters/graphics-math-coordinate-transforms/Starter/Scene.cpp
++++ b/chapters/graphics-math-coordinate-transforms/Starter/Scene.cpp
+@@ -103,7 +103,7 @@ lgp::framework::Result<ChapterDerivedScene> BuildScene(ChapterControls const &co
+         true, false, false, false, false, false, false, false, false, true,
+     };
+     scene.implementationNote =
+-        "Step 3: the composed model matrix can now be compared against an intentionally wrong multiplication order.";
++        "Step 4: object-space positions and reference directions are being transformed into world space.";
+     scene.model = StoreMatrix(modelMatrix);
+     scene.comparisonModel = StoreMatrix(comparisonModelMatrix);
+     scene.wrongOrderModel = StoreMatrix(wrongOrderModelMatrix);
+@@ -158,8 +158,8 @@ lgp::framework::Result<ChapterDerivedScene> BuildScene(ChapterControls const &co
+         scene.inspection.world.z,
+     };
+
+-    scene.correctNormalWorld = kReferenceNormalObject;
+-    scene.incorrectNormalWorld = kReferenceNormalObject;
++    scene.correctNormalWorld = TransformDirection(kReferenceNormalObject, modelMatrix);
++    scene.incorrectNormalWorld = scene.correctNormalWorld;
+
+     return scene;
+ }

@@ -1,0 +1,55 @@
+diff --git a/chapters/color-spaces-hdr-exposure-and-tone-mapping/Starter/Main.cpp b/chapters/color-spaces-hdr-exposure-and-tone-mapping/Starter/Main.cpp
+index 90f8401..c4703a1 100644
+--- a/chapters/color-spaces-hdr-exposure-and-tone-mapping/Starter/Main.cpp
++++ b/chapters/color-spaces-hdr-exposure-and-tone-mapping/Starter/Main.cpp
+@@ -4,10 +4,10 @@
+ 
+ int wmain(int argc, wchar_t **argv)
+ {
+-    ch04::color_pipeline::starter::Renderer renderer{};
++    ch04::color_pipeline::solution::Renderer renderer{};
+ 
+     lgp::framework::ApplicationConfiguration configuration{};
+-    configuration.title = L"Ch04 Color Pipeline Starter";
++    configuration.title = L"Ch04 Color Pipeline Solution";
+     configuration.width = 1600U;
+     configuration.height = 900U;
+     configuration.rtvDescriptorCount = 32U;
+diff --git a/chapters/color-spaces-hdr-exposure-and-tone-mapping/Starter/Renderer.cpp b/chapters/color-spaces-hdr-exposure-and-tone-mapping/Starter/Renderer.cpp
+index ae23f19..26766f3 100644
+--- a/chapters/color-spaces-hdr-exposure-and-tone-mapping/Starter/Renderer.cpp
++++ b/chapters/color-spaces-hdr-exposure-and-tone-mapping/Starter/Renderer.cpp
+@@ -26,7 +26,7 @@
+ #include <lgp/framework/descriptors.hpp>
+ #include <lgp/framework/shader_compiler.hpp>
+ 
+-namespace ch04::color_pipeline::starter
++namespace ch04::color_pipeline::solution
+ {
+ namespace
+ {
+@@ -580,4 +580,4 @@ void Renderer::Shutdown(lgp::framework::DeviceResources &) noexcept
+     impl_->Shutdown();
+ }
+ 
+-} // namespace ch04::color_pipeline::starter
++} // namespace ch04::color_pipeline::solution
+diff --git a/chapters/color-spaces-hdr-exposure-and-tone-mapping/Starter/Renderer.hpp b/chapters/color-spaces-hdr-exposure-and-tone-mapping/Starter/Renderer.hpp
+index d229b43..eb7d351 100644
+--- a/chapters/color-spaces-hdr-exposure-and-tone-mapping/Starter/Renderer.hpp
++++ b/chapters/color-spaces-hdr-exposure-and-tone-mapping/Starter/Renderer.hpp
+@@ -6,7 +6,7 @@
+ 
+ #include <memory>
+ 
+-namespace ch04::color_pipeline::starter
++namespace ch04::color_pipeline::solution
+ {
+ 
+ class Renderer final : public lgp::framework::IChapterRenderer
+@@ -33,4 +33,4 @@ class Renderer final : public lgp::framework::IChapterRenderer
+     std::unique_ptr<Impl> impl_;
+ };
+ 
+-} // namespace ch04::color_pipeline::starter
++} // namespace ch04::color_pipeline::solution

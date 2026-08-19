@@ -1,0 +1,192 @@
+diff --git a/chapters/tiled-forward-plus-and-clustered-lighting/Starter/Main.cpp b/chapters/tiled-forward-plus-and-clustered-lighting/Starter/Main.cpp
+index ffc49e2..05dc8c4 100644
+--- a/chapters/tiled-forward-plus-and-clustered-lighting/Starter/Main.cpp
++++ b/chapters/tiled-forward-plus-and-clustered-lighting/Starter/Main.cpp
+@@ -4,10 +4,10 @@
+ 
+ int wmain(int argc, wchar_t **argv)
+ {
+-    ch14::clustered_lighting::starter::Renderer renderer{};
++    ch14::clustered_lighting::solution::Renderer renderer{};
+ 
+     lgp::framework::ApplicationConfiguration configuration{};
+-    configuration.title = L"Ch14 Clustered Lighting Starter";
++    configuration.title = L"Ch14 Clustered Lighting Solution (1/2/3 modes, O occupancy, V overflow)";
+     configuration.width = 320U;
+     configuration.height = 180U;
+     configuration.enableDebugLayer = false;
+diff --git a/chapters/tiled-forward-plus-and-clustered-lighting/Starter/Renderer.cpp b/chapters/tiled-forward-plus-and-clustered-lighting/Starter/Renderer.cpp
+index 96d12ac..7045906 100644
+--- a/chapters/tiled-forward-plus-and-clustered-lighting/Starter/Renderer.cpp
++++ b/chapters/tiled-forward-plus-and-clustered-lighting/Starter/Renderer.cpp
+@@ -23,7 +23,7 @@
+ #include <string>
+ #include <utility>
+ 
+-namespace ch14::clustered_lighting::starter
++namespace ch14::clustered_lighting::solution
+ {
+ namespace
+ {
+@@ -406,7 +406,7 @@ lgp::framework::Status Renderer::CreateGeometry()
+     auto const vertices = gpu::BuildUnitQuadVertices();
+     auto const indices = gpu::BuildUnitQuadIndices();
+     auto vertexBuffer = lgp::framework::CreateUploadBuffer(*deviceResources_->device(), sizeof(vertices),
+-                                                           L"Ch14 Starter quad vertices");
++                                                           L"Ch14 Solution quad vertices");
+     if (!vertexBuffer)
+     {
+         return std::unexpected(std::move(vertexBuffer.error()));
+@@ -417,7 +417,7 @@ lgp::framework::Status Renderer::CreateGeometry()
+         return status;
+     }
+     auto indexBuffer =
+-        lgp::framework::CreateUploadBuffer(*deviceResources_->device(), sizeof(indices), L"Ch14 Starter quad indices");
++        lgp::framework::CreateUploadBuffer(*deviceResources_->device(), sizeof(indices), L"Ch14 Solution quad indices");
+     if (!indexBuffer)
+     {
+         return std::unexpected(std::move(indexBuffer.error()));
+@@ -497,7 +497,7 @@ lgp::framework::Status Renderer::CreateSizeDependentResources(lgp::framework::Ex
+         {
+             return std::unexpected(
+                 lgp::framework::MakeHResultError("ID3D12Device10::CreateCommittedResource3", depthResult,
+-                                                 "Failed to create a Chapter 14 Starter depth resource."));
++                                                 "Failed to create a Chapter 14 Solution depth resource."));
+         }
+ 
+         D3D12_DEPTH_STENCIL_VIEW_DESC writeDsv{};
+@@ -511,7 +511,7 @@ lgp::framework::Status Renderer::CreateSizeDependentResources(lgp::framework::Ex
+         auto lights =
+             gpu::CreateBuffer(*deviceResources_->device(),
+                               static_cast<std::uint64_t>(gpu::kMaximumLightCount) * sizeof(gpu::PointLightData),
+-                              D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_FLAG_NONE, L"Ch14 Starter per-slot lights", true);
++                              D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_FLAG_NONE, L"Ch14 Solution per-slot lights", true);
+         auto counts = gpu::CreateBuffer(
+             *deviceResources_->device(), static_cast<std::uint64_t>(*allocatedCellCount) * sizeof(std::uint32_t),
+             D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, L"Ch14 per-cell attempted counts");
+@@ -638,8 +638,8 @@ lgp::framework::Status Renderer::CreateSizeDependentResources(lgp::framework::Ex
+ gpu::LabConfiguration Renderer::ActiveConfiguration() const noexcept
+ {
+     gpu::LabConfiguration configuration{};
+-    configuration.mode = gpu::LightingMode::Clustered;
+-    configuration.debugView = gpu::DebugView::Final;
++    configuration.mode = interactiveMode_;
++    configuration.debugView = interactiveDebugView_;
+     if (headless_ && headlessConfiguration_.has_value())
+     {
+         configuration.mode = headlessConfiguration_->mode;
+@@ -664,7 +664,7 @@ lgp::framework::Status Renderer::Initialize(lgp::framework::ApplicationInitConte
+     }
+     auto dsvHeap = lgp::framework::CreateDescriptorHeap(*deviceResources_->device(), D3D12_DESCRIPTOR_HEAP_TYPE_DSV,
+                                                         deviceResources_->back_buffer_count() * 2U, false,
+-                                                        L"Ch14 Starter DSV heap");
++                                                        L"Ch14 Solution DSV heap");
+     if (!dsvHeap)
+     {
+         return std::unexpected(std::move(dsvHeap.error()));
+@@ -698,7 +698,34 @@ lgp::framework::Status Renderer::OnResize(lgp::framework::DeviceResources &devic
+ 
+ lgp::framework::Status Renderer::Update(lgp::framework::UpdateContext const &context)
+ {
+-    (void)context;
++    if (!headless_)
++    {
++        if (context.input.WasKeyPressed('1'))
++        {
++            interactiveMode_ = gpu::LightingMode::BruteForce;
++        }
++        if (context.input.WasKeyPressed('2'))
++        {
++            interactiveMode_ = gpu::LightingMode::Tiled;
++        }
++        if (context.input.WasKeyPressed('3'))
++        {
++            interactiveMode_ = gpu::LightingMode::Clustered;
++        }
++        if (context.input.WasKeyPressed('O'))
++        {
++            interactiveDebugView_ = gpu::DebugView::Occupancy;
++        }
++        if (context.input.WasKeyPressed('V'))
++        {
++            interactiveDebugView_ = gpu::DebugView::Overflow;
++        }
++        if (context.input.WasKeyPressed('F'))
++        {
++            interactiveDebugView_ = gpu::DebugView::Final;
++        }
++    }
++
+     gpu::LabConfiguration const configuration = ActiveConfiguration();
+     currentScene_ = gpu::BuildScene(configuration.scene);
+     currentLights_ = gpu::BuildLights(configuration.lights, configuration.lightCount);
+@@ -710,7 +737,7 @@ lgp::framework::Status Renderer::Render(lgp::framework::FrameContext const &fram
+     if (frameContext.commandList == nullptr || frameContext.renderTarget == nullptr ||
+         frameContext.frameSlot >= frameSlots_.size())
+     {
+-        return std::unexpected(lgp::framework::MakeError("Render", "The Chapter 14 Starter frame is invalid."));
++        return std::unexpected(lgp::framework::MakeError("Render", "The Chapter 14 Solution frame is invalid."));
+     }
+ 
+     gpu::LabConfiguration configuration = ActiveConfiguration();
+@@ -724,7 +751,7 @@ lgp::framework::Status Renderer::Render(lgp::framework::FrameContext const &fram
+     if (!cellCount || !tiles)
+     {
+         return std::unexpected(
+-            lgp::framework::MakeError("Render", "The Chapter 14 Starter grid configuration is invalid."));
++            lgp::framework::MakeError("Render", "The Chapter 14 Solution grid configuration is invalid."));
+     }
+ 
+     FrameSlotResources &slot = frameSlots_[frameContext.frameSlot];
+@@ -743,7 +770,7 @@ lgp::framework::Status Renderer::Render(lgp::framework::FrameContext const &fram
+     auto const coefficients = MakeDeviceDepthCoefficients(projection);
+     if (!coefficients)
+     {
+-        return std::unexpected(lgp::framework::MakeError("Render", "The Chapter 14 Starter projection is invalid."));
++        return std::unexpected(lgp::framework::MakeError("Render", "The Chapter 14 Solution projection is invalid."));
+     }
+ 
+     FrameConstants constants{};
+@@ -968,7 +995,7 @@ std::expected<Renderer::ReadbackOutputs, lgp::framework::Error> Renderer::ReadBa
+     if (frameSlots_.empty() || lastRenderedCellCount_ == 0U)
+     {
+         return std::unexpected(
+-            lgp::framework::MakeError("ReadBackOutputs", "No Chapter 14 Starter frame has been rendered."));
++            lgp::framework::MakeError("ReadBackOutputs", "No Chapter 14 Solution frame has been rendered."));
+     }
+     auto const idle = deviceResources_->WaitForGpuIdle();
+     if (!idle)
+@@ -1052,4 +1079,4 @@ std::expected<Renderer::ReadbackOutputs, lgp::framework::Error> Renderer::ReadBa
+     return outputs;
+ }
+ 
+-} // namespace ch14::clustered_lighting::starter
++} // namespace ch14::clustered_lighting::solution
+diff --git a/chapters/tiled-forward-plus-and-clustered-lighting/Starter/Renderer.hpp b/chapters/tiled-forward-plus-and-clustered-lighting/Starter/Renderer.hpp
+index 0ee08f4..dcae906 100644
+--- a/chapters/tiled-forward-plus-and-clustered-lighting/Starter/Renderer.hpp
++++ b/chapters/tiled-forward-plus-and-clustered-lighting/Starter/Renderer.hpp
+@@ -13,7 +13,7 @@
+ #include <optional>
+ #include <vector>
+ 
+-namespace ch14::clustered_lighting::starter
++namespace ch14::clustered_lighting::solution
+ {
+ 
+ struct HeadlessTestConfiguration final
+@@ -120,6 +120,8 @@ class Renderer final : public lgp::framework::IChapterRenderer
+     std::vector<gpu::SceneObject> currentScene_{};
+     std::vector<gpu::PointLightData> currentLights_{};
+     std::optional<HeadlessTestConfiguration> headlessConfiguration_{};
++    gpu::LightingMode interactiveMode_{gpu::LightingMode::Clustered};
++    gpu::DebugView interactiveDebugView_{gpu::DebugView::Final};
+     std::uint32_t lastRenderedFrameSlot_{};
+     std::uint32_t lastRenderedCellCount_{};
+     PerspectiveProjection lastProjection_{};
+@@ -127,4 +129,4 @@ class Renderer final : public lgp::framework::IChapterRenderer
+     bool headless_{false};
+ };
+ 
+-} // namespace ch14::clustered_lighting::starter
++} // namespace ch14::clustered_lighting::solution

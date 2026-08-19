@@ -1,0 +1,34 @@
+diff --git a/chapters/surface-frames-material-textures-and-normal-mapping/Starter/SurfaceBaseline.hlsl b/chapters/surface-frames-material-textures-and-normal-mapping/Starter/SurfaceBaseline.hlsl
+index 54064af..3b9eec0 100644
+--- a/chapters/surface-frames-material-textures-and-normal-mapping/Starter/SurfaceBaseline.hlsl
++++ b/chapters/surface-frames-material-textures-and-normal-mapping/Starter/SurfaceBaseline.hlsl
+@@ -120,12 +120,17 @@ float4 LightingPS(LitVertex input, bool frontFace : SV_IsFrontFace) : SV_Target
+     float checker = fmod(floor(input.uv.x) + floor(input.uv.y), 2.0);
+     float3 encodedBaseColor = lerp(float3(0.045, 0.28, 0.78), float3(0.78, 0.16, 0.055), checker);
+     float3 baseColor = SrgbToLinear(encodedBaseColor);
++    float2 wave = float2(sin(input.uv.x * Pi), cos(input.uv.y * Pi)) * 0.45;
++    float3 encodedNormal = float3((wave * 0.5) + 0.5, 1.0);
++    float3 tangentNormal = normalize(encodedNormal * 2.0 - 1.0);
++    float3 mappedNormal = normalize((tangent * tangentNormal.x) + (bitangent * tangentNormal.y) +
++                                    (normal * tangentNormal.z));
+     float3 viewDirection = normalize(lighting.cameraPosition - input.worldPosition);
+     float3 lightDirection = normalize(lighting.directionToLight);
+-    float nDotL = saturate(dot(normal, lightDirection));
+-    float nDotV = saturate(dot(normal, viewDirection));
++    float nDotL = saturate(dot(mappedNormal, lightDirection));
++    float nDotV = saturate(dot(mappedNormal, viewDirection));
+     float3 halfVector = normalize(viewDirection + lightDirection);
+-    float nDotH = saturate(dot(normal, halfVector));
++    float nDotH = saturate(dot(mappedNormal, halfVector));
+     float vDotH = saturate(dot(viewDirection, halfVector));
+     float3 f0 = lerp(objectData.dielectricF0, baseColor, objectData.metalness);
+     float3 fresnel = SchlickFresnel(f0, vDotH);
+@@ -139,7 +144,7 @@ float4 LightingPS(LitVertex input, bool frontFace : SV_IsFrontFace) : SV_Target
+         (1.0 - SchlickFresnel(f0, nDotV)) * (1.0 - SchlickFresnel(f0, nDotL)) * (1.0 - objectData.metalness);
+     float3 diffuseBrdf = diffuseWeight * baseColor / Pi;
+     float3 irradiance = lighting.lightColor * lighting.intensity * nDotL;
+-    return float4(handedness < 0.0 ? float3(1.0, 0.12, 0.05) : float3(0.05, 0.35, 1.0), 1.0);
++    return float4(irradiance * (diffuseBrdf + specularBrdf), 1.0);
+ }
+
+ FullscreenVertex FullscreenVS(uint vertexId : SV_VertexID)

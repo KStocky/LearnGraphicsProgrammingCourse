@@ -1,0 +1,46 @@
+diff --git a/chapters/graphics-math-coordinate-transforms/Starter/DemoLogic.cpp b/chapters/graphics-math-coordinate-transforms/Starter/DemoLogic.cpp
+--- a/chapters/graphics-math-coordinate-transforms/Starter/DemoLogic.cpp
++++ b/chapters/graphics-math-coordinate-transforms/Starter/DemoLogic.cpp
+@@ -29,7 +29,7 @@ class StarterLogic final : public IChapterLogic
+         controls.showWorldAxes = true;
+         controls.showCameraAxes = false;
+         controls.showFrustum = false;
+-        controls.showWrongOrder = false;
++        controls.showWrongOrder = true;
+         controls.showComparisonOrientation = false;
+         controls.showNormalVectors = false;
+         controls.demonstrateIncorrectNormal = false;
+diff --git a/chapters/graphics-math-coordinate-transforms/Starter/Scene.cpp b/chapters/graphics-math-coordinate-transforms/Starter/Scene.cpp
+--- a/chapters/graphics-math-coordinate-transforms/Starter/Scene.cpp
++++ b/chapters/graphics-math-coordinate-transforms/Starter/Scene.cpp
+@@ -92,17 +92,18 @@ lgp::framework::Result<ChapterDerivedScene> BuildScene(ChapterControls const &co
+     DirectX::XMMATRIX const modelMatrix =
+         ComposeModelMatrix(sanitizedControls.translation, sanitizedControls.scale, activeRotationMatrix);
+     DirectX::XMMATRIX const comparisonModelMatrix = modelMatrix;
+-    DirectX::XMMATRIX const wrongOrderModelMatrix = modelMatrix;
++    DirectX::XMMATRIX const wrongOrderModelMatrix =
++        ComposeWrongOrderModelMatrix(sanitizedControls.translation, sanitizedControls.scale, activeRotationMatrix);
+     DirectX::XMMATRIX const viewProjectionMatrix = viewMatrix * projectionMatrix;
+     DirectX::XMMATRIX const normalMatrix = modelMatrix;
+     DirectX::XMMATRIX const incorrectNormalMatrix = modelMatrix;
+
+     ChapterDerivedScene scene{};
+     scene.capabilities = {
+-        true, false, false, false, false, false, false, false, false, false,
++        true, false, false, false, false, false, false, false, false, true,
+     };
+     scene.implementationNote =
+-        "Step 2: translation, Euler rotation, and scale now compose the model transform from the UI state.";
++        "Step 3: the composed model matrix can now be compared against an intentionally wrong multiplication order.";
+     scene.model = StoreMatrix(modelMatrix);
+     scene.comparisonModel = StoreMatrix(comparisonModelMatrix);
+     scene.wrongOrderModel = StoreMatrix(wrongOrderModelMatrix);
+@@ -117,7 +118,7 @@ lgp::framework::Result<ChapterDerivedScene> BuildScene(ChapterControls const &co
+     scene.cameraUp = cameraFrame.up;
+     scene.cameraForward = cameraFrame.forward;
+     scene.hasComparisonModel = false;
+-    scene.hasWrongOrderModel = false;
++    scene.hasWrongOrderModel = sanitizedControls.showWrongOrder;
+
+     std::span<XMFLOAT3 const> const objectVertices = ObjectVertices();
+     DirectX::XMMATRIX const modelViewMatrix = modelMatrix * viewMatrix;

@@ -1,0 +1,34 @@
+diff --git a/chapters/graphics-math-coordinate-transforms/Starter/Scene.cpp b/chapters/graphics-math-coordinate-transforms/Starter/Scene.cpp
+--- a/chapters/graphics-math-coordinate-transforms/Starter/Scene.cpp
++++ b/chapters/graphics-math-coordinate-transforms/Starter/Scene.cpp
+@@ -89,6 +89,8 @@ lgp::framework::Result<ChapterDerivedScene> BuildScene(ChapterControls const &co
+     DirectX::XMMATRIX const eulerRotationMatrix = BuildEulerRotationMatrixFromDegrees(sanitizedControls.eulerDegrees);
+     DirectX::XMMATRIX const quaternionRotationMatrix =
+         BuildQuaternionRotationMatrixFromDegrees(sanitizedControls.quaternionDegrees);
++    DirectX::XMMATRIX const slerpRotationMatrix = BuildSlerpRotationMatrixFromDegrees(
++        sanitizedControls.slerpStartDegrees, sanitizedControls.slerpEndDegrees, sanitizedControls.slerpT);
+
+     DirectX::XMMATRIX activeRotationMatrix = eulerRotationMatrix;
+     switch (sanitizedControls.orientationMode)
+@@ -100,7 +102,7 @@ lgp::framework::Result<ChapterDerivedScene> BuildScene(ChapterControls const &co
+         activeRotationMatrix = quaternionRotationMatrix;
+         break;
+     case OrientationMode::Slerp:
+-        activeRotationMatrix = quaternionRotationMatrix;
++        activeRotationMatrix = slerpRotationMatrix;
+         break;
+     }
+
+@@ -115,10 +117,10 @@ lgp::framework::Result<ChapterDerivedScene> BuildScene(ChapterControls const &co
+
+     ChapterDerivedScene scene{};
+     scene.capabilities = {
+-        true, true, true, true, true, true, true, false, false, true,
++        true, true, true, true, true, true, true, true, false, true,
+     };
+     scene.implementationNote =
+-        "Step 11: Euler and quaternion orientations can now be compared with matching model and comparison transforms.";
++        "Step 12: spherical quaternion interpolation now drives the Slerp orientation mode between two rotations.";
+     scene.model = StoreMatrix(modelMatrix);
+     scene.comparisonModel = StoreMatrix(comparisonModelMatrix);
+     scene.wrongOrderModel = StoreMatrix(wrongOrderModelMatrix);

@@ -1,0 +1,132 @@
+diff --git a/chapters/tiled-forward-plus-and-clustered-lighting/Starter/ClusteredLightingLab.hlsl b/chapters/tiled-forward-plus-and-clustered-lighting/Starter/ClusteredLightingLab.hlsl
+index 4e8886c..89de1eb 100644
+--- a/chapters/tiled-forward-plus-and-clustered-lighting/Starter/ClusteredLightingLab.hlsl
++++ b/chapters/tiled-forward-plus-and-clustered-lighting/Starter/ClusteredLightingLab.hlsl
+@@ -224,13 +224,31 @@ ForwardVertexOutput ForwardVS(VertexInput input)
+ 
+ float4 ForwardPS(ForwardVertexOutput input) : SV_Target0
+ {
++    uint2 pixel = uint2(input.position.xy);
++    uint2 tile = min(pixel / uint2(16u, 16u), gFrame.dimensions.zw - 1u);
++    uint cellIndex = tile.y * gFrame.dimensions.z + tile.x;
++
+     float3 normal = normalize(input.viewNormal);
+     float3 linearColor = gObject.baseColor * 0.018;
+-    [loop]
+-    for (uint lightIndex = 0u; lightIndex < gFrame.counts.x; ++lightIndex)
++    if (gFrame.options.x == 0u)
++    {
++        [loop]
++        for (uint lightIndex = 0u; lightIndex < gFrame.counts.x; ++lightIndex)
++        {
++            linearColor += ShadePointLight(gLights[lightIndex], input.viewPosition, normal, gObject.baseColor,
++                                           gObject.roughness, gObject.metalness);
++        }
++    }
++    else
+     {
+-        linearColor += ShadePointLight(gLights[lightIndex], input.viewPosition, normal, gObject.baseColor,
+-                                       gObject.roughness, gObject.metalness);
++        CellLightRange range = gCells[cellIndex];
++        [loop]
++        for (uint listOffset = 0u; listOffset < range.count; ++listOffset)
++        {
++            uint lightIndex = gLightIndices[range.offset + listOffset];
++            linearColor += ShadePointLight(gLights[lightIndex], input.viewPosition, normal, gObject.baseColor,
++                                           gObject.roughness, gObject.metalness);
++        }
+     }
+     return float4(DisplayEncode(linearColor), 1.0);
+ }
+@@ -323,4 +341,34 @@ void PrefixCellsCS(uint3 dispatchThreadId : SV_DispatchThreadID)
+ [numthreads(ThreadCount, 1, 1)]
+ void FillLightsCS(uint3 dispatchThreadId : SV_DispatchThreadID)
+ {
++    uint cellIndex = dispatchThreadId.x;
++    if (cellIndex >= gFrame.counts.z)
++    {
++        return;
++    }
++
++    uint tileIndex = cellIndex % gFrame.counts.y;
++    float tileMinimumDepth;
++    float tileMaximumDepth;
++    uint foregroundCount;
++    ReduceTileDepth(tileIndex, tileMinimumDepth, tileMaximumDepth, foregroundCount);
++    CellLightRange range = gCellsUav[cellIndex];
++    uint localOffset = 0u;
++    [loop]
++    for (uint lightIndex = 0u; lightIndex < gFrame.counts.x; ++lightIndex)
++    {
++        if (!LightOverlapsCell(cellIndex, gLights[lightIndex], tileMinimumDepth, tileMaximumDepth, foregroundCount))
++        {
++            continue;
++        }
++        if (localOffset < range.count)
++        {
++            uint destination = range.offset + localOffset;
++            if (destination < gFrame.counts.w)
++            {
++                gLightIndicesUav[destination] = lightIndex;
++            }
++        }
++        ++localOffset;
++    }
+ }
+diff --git a/chapters/tiled-forward-plus-and-clustered-lighting/Starter/Renderer.cpp b/chapters/tiled-forward-plus-and-clustered-lighting/Starter/Renderer.cpp
+index b4c44cf..43817b5 100644
+--- a/chapters/tiled-forward-plus-and-clustered-lighting/Starter/Renderer.cpp
++++ b/chapters/tiled-forward-plus-and-clustered-lighting/Starter/Renderer.cpp
+@@ -635,7 +635,7 @@ lgp::framework::Status Renderer::CreateSizeDependentResources(lgp::framework::Ex
+ gpu::LabConfiguration Renderer::ActiveConfiguration() const noexcept
+ {
+     gpu::LabConfiguration configuration{};
+-    configuration.mode = gpu::LightingMode::BruteForce;
++    configuration.mode = gpu::LightingMode::Tiled;
+     if (headless_ && headlessConfiguration_.has_value())
+     {
+         configuration.scene = headlessConfiguration_->scene;
+@@ -745,7 +745,7 @@ lgp::framework::Status Renderer::Render(lgp::framework::FrameContext const &fram
+         gpu::kMaximumLightIndexCapacity,
+     };
+     constants.options = {
+-        static_cast<std::uint32_t>(gpu::LightingMode::BruteForce),
++        static_cast<std::uint32_t>(configuration.mode),
+         DepthModeFlag(configuration.depthConvention),
+         static_cast<std::uint32_t>(gpu::DebugView::Final),
+         slot.allocatedCellCount,
+@@ -832,6 +832,20 @@ lgp::framework::Status Renderer::Render(lgp::framework::FrameContext const &fram
+     commandList.SetPipelineState(prefixPipeline_.Get());
+     commandList.Dispatch(1U, 1U, 1U);
+ 
++    bufferBarriers = {
++        gpu::MakeBufferBarrier(*slot.cells.Get(), gpu::ComputeUnorderedAccessState(),
++                               gpu::ComputeUnorderedAccessState()),
++    };
++    gpu::SubmitBufferBarriers(commandList, bufferBarriers);
++    commandList.SetPipelineState(fillPipeline_.Get());
++    commandList.Dispatch((tiles->tileCount + 63U) / 64U, 1U, 1U);
++
++    bufferBarriers = {
++        gpu::MakeBufferBarrier(*slot.cells.Get(), gpu::ComputeUnorderedAccessState(), gpu::PixelShaderResourceState()),
++        gpu::MakeBufferBarrier(*slot.indices.Get(), gpu::ComputeUnorderedAccessState(),
++                               gpu::PixelShaderResourceState()),
++    };
++    gpu::SubmitBufferBarriers(commandList, bufferBarriers);
+     textureBarriers = {
+         gpu::MakeTextureBarrier(*slot.depth.Get(), gpu::ComputeShaderResourceState(), gpu::DepthReadState()),
+     };
+@@ -853,6 +867,13 @@ lgp::framework::Status Renderer::Render(lgp::framework::FrameContext const &fram
+         commandList.DrawIndexedInstanced(quad_.indexCount, 1U, 0U, 0, 0U);
+     }
+ 
++    bufferBarriers = {
++        gpu::MakeBufferBarrier(*slot.cells.Get(), gpu::PixelShaderResourceState(),
++                               gpu::ComputeUnorderedAccessState()),
++        gpu::MakeBufferBarrier(*slot.indices.Get(), gpu::PixelShaderResourceState(),
++                               gpu::ComputeUnorderedAccessState()),
++    };
++    gpu::SubmitBufferBarriers(commandList, bufferBarriers);
+     textureBarriers = {
+         gpu::MakeTextureBarrier(*slot.depth.Get(), gpu::DepthReadState(), gpu::CommonState()),
+         gpu::MakeTextureBarrier(*frameContext.renderTarget, gpu::RenderTargetState(), gpu::FrameEndState(frameContext)),

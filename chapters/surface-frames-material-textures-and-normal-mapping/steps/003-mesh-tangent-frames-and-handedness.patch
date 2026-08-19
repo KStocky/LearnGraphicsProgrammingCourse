@@ -1,0 +1,29 @@
+diff --git a/chapters/surface-frames-material-textures-and-normal-mapping/Starter/SurfaceBaseline.hlsl b/chapters/surface-frames-material-textures-and-normal-mapping/Starter/SurfaceBaseline.hlsl
+index 869916b..54064af 100644
+--- a/chapters/surface-frames-material-textures-and-normal-mapping/Starter/SurfaceBaseline.hlsl
++++ b/chapters/surface-frames-material-textures-and-normal-mapping/Starter/SurfaceBaseline.hlsl
+@@ -111,10 +111,12 @@ float3 SrgbToLinear(float3 encoded)
+     return lerp(high, low, encoded <= 0.04045);
+ }
+
+-float4 LightingPS(LitVertex input) : SV_Target
++float4 LightingPS(LitVertex input, bool frontFace : SV_IsFrontFace) : SV_Target
+ {
+-    float3 normal = normalize(input.worldNormal);
+-    float3 tangent = normalize(input.worldTangent.xyz);
++    float3 normal = normalize(input.worldNormal) * (frontFace ? 1.0 : -1.0);
++    float3 tangent = normalize(input.worldTangent.xyz - normal * dot(input.worldTangent.xyz, normal));
++    float handedness = input.worldTangent.w < 0.0 ? -1.0 : 1.0;
++    float3 bitangent = normalize(cross(normal, tangent)) * handedness;
+     float checker = fmod(floor(input.uv.x) + floor(input.uv.y), 2.0);
+     float3 encodedBaseColor = lerp(float3(0.045, 0.28, 0.78), float3(0.78, 0.16, 0.055), checker);
+     float3 baseColor = SrgbToLinear(encodedBaseColor);
+@@ -137,7 +139,7 @@ float4 LightingPS(LitVertex input) : SV_Target
+         (1.0 - SchlickFresnel(f0, nDotV)) * (1.0 - SchlickFresnel(f0, nDotL)) * (1.0 - objectData.metalness);
+     float3 diffuseBrdf = diffuseWeight * baseColor / Pi;
+     float3 irradiance = lighting.lightColor * lighting.intensity * nDotL;
+-    return float4((tangent * 0.5) + 0.5, 1.0);
++    return float4(handedness < 0.0 ? float3(1.0, 0.12, 0.05) : float3(0.05, 0.35, 1.0), 1.0);
+ }
+
+ FullscreenVertex FullscreenVS(uint vertexId : SV_VertexID)

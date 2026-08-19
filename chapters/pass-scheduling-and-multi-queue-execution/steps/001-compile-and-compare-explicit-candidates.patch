@@ -1,0 +1,61 @@
+diff --git a/chapters/pass-scheduling-and-multi-queue-execution/Starter/Renderer.cpp b/chapters/pass-scheduling-and-multi-queue-execution/Starter/Renderer.cpp
+index 66cf449ba18f0f24bd89a0d98ea23207baa7199e..b1e16725ccdfc683b38a487d636079cbe3567ca7 100644
+--- a/chapters/pass-scheduling-and-multi-queue-execution/Starter/Renderer.cpp
++++ b/chapters/pass-scheduling-and-multi-queue-execution/Starter/Renderer.cpp
+@@ -62,6 +62,7 @@ void Renderer::ReleaseSizeDependentResources() noexcept
+     graph_.reset();
+     physicalByteSizes_.reset();
+     serialSchedule_.reset();
++    asyncSchedule_.reset();
+ }
+ 
+ lgp::framework::Status Renderer::CreateSizeDependentResources(lgp::framework::Extent2D size)
+@@ -179,6 +180,7 @@ lgp::framework::Status Renderer::CreateSizeDependentResources(lgp::framework::Ex
+     graph_ = std::move(*graphResult);
+     physicalByteSizes_ = *sizesResult;
+     serialSchedule_ = std::move(schedulesResult->serial);
++    asyncSchedule_ = std::move(schedulesResult->async);
+     return {};
+ }
+ 
+@@ -229,7 +231,7 @@ lgp::framework::Status Renderer::Render(lgp::framework::FrameContext const &fram
+         return std::unexpected(lgp::framework::MakeError("Starter::Renderer::Render",
+                                                          "The frame context does not provide a render target."));
+     }
+-    if (!graph_ || !serialSchedule_ || !physicalByteSizes_)
++    if (!graph_ || !serialSchedule_ || !asyncSchedule_ || !physicalByteSizes_)
+     {
+         return std::unexpected(lgp::framework::MakeError(
+             "Starter::Renderer::Render",
+@@ -336,6 +338,11 @@ SchedulePlan const *Renderer::SerialSchedule() const noexcept
+     return serialSchedule_ ? &*serialSchedule_ : nullptr;
+ }
+ 
++SchedulePlan const *Renderer::AsyncSchedule() const noexcept
++{
++    return asyncSchedule_ ? &*asyncSchedule_ : nullptr;
++}
++
+ gpu::PhysicalTextureByteSizes const *Renderer::PhysicalByteSizes() const noexcept
+ {
+     return physicalByteSizes_ ? &*physicalByteSizes_ : nullptr;
+diff --git a/chapters/pass-scheduling-and-multi-queue-execution/Starter/Renderer.hpp b/chapters/pass-scheduling-and-multi-queue-execution/Starter/Renderer.hpp
+index 8592ea3639a4e1aefca32b31f797c646ba3695cd..7734494388c95e99865a293386fd136e314a61e5 100644
+--- a/chapters/pass-scheduling-and-multi-queue-execution/Starter/Renderer.hpp
++++ b/chapters/pass-scheduling-and-multi-queue-execution/Starter/Renderer.hpp
+@@ -26,6 +26,7 @@ class Renderer final : public lgp::framework::IChapterRenderer
+ 
+     [[nodiscard]] gpu::LabGraph const *CompiledGraph() const noexcept;
+     [[nodiscard]] SchedulePlan const *SerialSchedule() const noexcept;
++    [[nodiscard]] SchedulePlan const *AsyncSchedule() const noexcept;
+     [[nodiscard]] gpu::PhysicalTextureByteSizes const *PhysicalByteSizes() const noexcept;
+     [[nodiscard]] std::vector<gpu::QueueExecutionTraceRecord> const &LastExecutionTrace() const noexcept;
+ 
+@@ -56,6 +57,7 @@ class Renderer final : public lgp::framework::IChapterRenderer
+     std::optional<gpu::LabGraph> graph_{};
+     std::optional<gpu::PhysicalTextureByteSizes> physicalByteSizes_{};
+     std::optional<SchedulePlan> serialSchedule_{};
++    std::optional<SchedulePlan> asyncSchedule_{};
+     std::vector<gpu::QueueExecutionTraceRecord> emptyExecutionTrace_{};
+ };
+ 

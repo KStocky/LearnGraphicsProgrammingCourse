@@ -1,0 +1,95 @@
+diff --git a/chapters/texture-sampling-mipmapping-and-reconstruction/Starter/Main.cpp b/chapters/texture-sampling-mipmapping-and-reconstruction/Starter/Main.cpp
+index 998fe79..974ee06 100644
+--- a/chapters/texture-sampling-mipmapping-and-reconstruction/Starter/Main.cpp
++++ b/chapters/texture-sampling-mipmapping-and-reconstruction/Starter/Main.cpp
+@@ -4,10 +4,10 @@
+
+ int wmain(int argc, wchar_t **argv)
+ {
+-    ch03::texture::starter::Renderer renderer{};
++    ch03::texture::solution::Renderer renderer{};
+
+     lgp::framework::ApplicationConfiguration configuration{};
+-    configuration.title = L"Ch03 Texture Sampling Starter";
++    configuration.title = L"Ch03 Texture Sampling Solution";
+     configuration.width = 1280U;
+     configuration.height = 720U;
+     configuration.rtvDescriptorCount = 8U;
+diff --git a/chapters/texture-sampling-mipmapping-and-reconstruction/Starter/Renderer.cpp b/chapters/texture-sampling-mipmapping-and-reconstruction/Starter/Renderer.cpp
+index bf79ed9..4c635d8 100644
+--- a/chapters/texture-sampling-mipmapping-and-reconstruction/Starter/Renderer.cpp
++++ b/chapters/texture-sampling-mipmapping-and-reconstruction/Starter/Renderer.cpp
+@@ -23,7 +23,7 @@
+ #include <lgp/framework/descriptors.hpp>
+ #include <lgp/framework/shader_compiler.hpp>
+
+-namespace ch03::texture::starter
++namespace ch03::texture::solution
+ {
+ namespace
+ {
+@@ -742,4 +742,4 @@ void Renderer::Shutdown(lgp::framework::DeviceResources &) noexcept
+     impl_->Shutdown();
+ }
+
+-} // namespace ch03::texture::starter
++} // namespace ch03::texture::solution
+diff --git a/chapters/texture-sampling-mipmapping-and-reconstruction/Starter/Renderer.hpp b/chapters/texture-sampling-mipmapping-and-reconstruction/Starter/Renderer.hpp
+index 93c25fd..4deacc1 100644
+--- a/chapters/texture-sampling-mipmapping-and-reconstruction/Starter/Renderer.hpp
++++ b/chapters/texture-sampling-mipmapping-and-reconstruction/Starter/Renderer.hpp
+@@ -5,7 +5,7 @@
+ #include <cstdint>
+ #include <memory>
+
+-namespace ch03::texture::starter
++namespace ch03::texture::solution
+ {
+
+ enum class SamplerMode : std::uint32_t
+@@ -44,4 +44,4 @@ class Renderer final : public lgp::framework::IChapterRenderer
+     std::unique_ptr<Impl> impl_;
+ };
+
+-} // namespace ch03::texture::starter
++} // namespace ch03::texture::solution
+diff --git a/chapters/texture-sampling-mipmapping-and-reconstruction/Starter/TextureSamplingMath.cpp b/chapters/texture-sampling-mipmapping-and-reconstruction/Starter/TextureSamplingMath.cpp
+index b55cd35..cdd4a4c 100644
+--- a/chapters/texture-sampling-mipmapping-and-reconstruction/Starter/TextureSamplingMath.cpp
++++ b/chapters/texture-sampling-mipmapping-and-reconstruction/Starter/TextureSamplingMath.cpp
+@@ -4,7 +4,7 @@
+ #include <cmath>
+ #include <cstdint>
+
+-namespace ch03::texture::starter
++namespace ch03::texture::solution
+ {
+ namespace
+ {
+@@ -357,6 +357,4 @@ std::expected<AnisotropyResult, TextureSamplingError> ComputeAnisotropy(TextureF
+     return AnisotropyResult{major, minor, ratio, std::clamp(ratio, 1.0F, maximumAnisotropy)};
+ }
+
+-} // namespace ch03::texture::starter
+-
+-// Starter keeps the namespace until the final alignment patch.
++} // namespace ch03::texture::solution
+diff --git a/chapters/texture-sampling-mipmapping-and-reconstruction/Starter/TextureSamplingMath.hpp b/chapters/texture-sampling-mipmapping-and-reconstruction/Starter/TextureSamplingMath.hpp
+index 7427bbb..74384e0 100644
+--- a/chapters/texture-sampling-mipmapping-and-reconstruction/Starter/TextureSamplingMath.hpp
++++ b/chapters/texture-sampling-mipmapping-and-reconstruction/Starter/TextureSamplingMath.hpp
+@@ -2,7 +2,7 @@
+
+ #include "../Common/ChapterTypes.hpp"
+
+-namespace ch03::texture::starter
++namespace ch03::texture::solution
+ {
+
+ [[nodiscard]] std::expected<float, TextureSamplingError> AddressNormalized(float coordinate, AddressMode mode) noexcept;
+@@ -31,4 +31,4 @@ namespace ch03::texture::starter
+     TextureFootprint footprint, float maximumAnisotropy,
+     float epsilon = kSamplingConventions.anisotropyEpsilon) noexcept;
+
+-} // namespace ch03::texture::starter
++} // namespace ch03::texture::solution

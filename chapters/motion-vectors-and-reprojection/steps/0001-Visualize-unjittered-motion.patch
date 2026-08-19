@@ -1,0 +1,70 @@
+From 6ba0cc2df425188e16e0f42aa3ca3b5ce624533c Mon Sep 17 00:00:00 2001
+From: Patch Author <patch-author@example.invalid>
+Date: Sun, 16 Aug 2026 21:36:10 +0100
+Subject: [PATCH 1/5] Visualize unjittered motion
+
+---
+ .../motion-vectors-and-reprojection/Starter/Renderer.cpp    | 5 ++++-
+ .../Starter/ReprojectionLab.hlsl                            | 6 +++++-
+ 2 files changed, 9 insertions(+), 2 deletions(-)
+
+diff --git a/chapters/motion-vectors-and-reprojection/Starter/Renderer.cpp b/chapters/motion-vectors-and-reprojection/Starter/Renderer.cpp
+index 4c47f26..1275526 100644
+--- a/chapters/motion-vectors-and-reprojection/Starter/Renderer.cpp
++++ b/chapters/motion-vectors-and-reprojection/Starter/Renderer.cpp
+@@ -268,7 +268,7 @@ D3D12_GPU_VIRTUAL_ADDRESS Renderer::WriteFrameConstants(UINT frameSlot, lgp::fra
+ {
+     FrameConstants constants{};
+     constants.header0 = {size.width, size.height, gpu::kMaxSurfaces, 0U};
+-    gpu::ScenarioState const scenario = gpu::MakeScenarioState(gpu::Scenario::Static);
++    gpu::ScenarioState const scenario = gpu::MakeScenarioState(gpu::Scenario::MotionCurrent);
+     constants.header0.z = scenario.surfaceCount;
+     constants.currentJitterExposure = {scenario.currentJitterUv.x, scenario.currentJitterUv.y,
+                                        scenario.currentPreExposure, 0.0F};
+@@ -464,6 +464,8 @@ lgp::framework::Status Renderer::Render(lgp::framework::FrameContext const &fram
+     barriers.clear();
+     barriers.push_back(gpu::MakeTextureBarrier(*slot.textures[static_cast<UINT>(TextureIndex::CurrentColor)].Get(),
+                                                gpu::ComputeUnorderedAccessState(), gpu::PixelShaderResourceState()));
++    barriers.push_back(gpu::MakeTextureBarrier(*slot.textures[static_cast<UINT>(TextureIndex::MotionClipDepth)].Get(),
++                                               gpu::ComputeUnorderedAccessState(), gpu::PixelShaderResourceState()));
+     barriers.push_back(
+         gpu::MakeTextureBarrier(*slot.textures[static_cast<UINT>(TextureIndex::ReprojectedHistoryColor)].Get(),
+                                 gpu::ComputeUnorderedAccessState(), gpu::PixelShaderResourceState()));
+@@ -488,6 +490,7 @@ lgp::framework::Status Renderer::Render(lgp::framework::FrameContext const &fram
+     {
+         lgp::framework::TextureBarrierState before = gpu::ComputeUnorderedAccessState();
+         if (textureIndex == static_cast<UINT>(TextureIndex::CurrentColor) ||
++            textureIndex == static_cast<UINT>(TextureIndex::MotionClipDepth) ||
+             textureIndex == static_cast<UINT>(TextureIndex::ReprojectedHistoryColor) ||
+             textureIndex == static_cast<UINT>(TextureIndex::RejectionReasons) ||
+             textureIndex == static_cast<UINT>(TextureIndex::ExposureScale))
+diff --git a/chapters/motion-vectors-and-reprojection/Starter/ReprojectionLab.hlsl b/chapters/motion-vectors-and-reprojection/Starter/ReprojectionLab.hlsl
+index 0b6443d..47ad7ac 100644
+--- a/chapters/motion-vectors-and-reprojection/Starter/ReprojectionLab.hlsl
++++ b/chapters/motion-vectors-and-reprojection/Starter/ReprojectionLab.hlsl
+@@ -18,6 +18,7 @@ cbuffer FrameConstants : register(b0)
+ };
+ 
+ Texture2D<float4> gCurrentColor : register(t0);
++Texture2D<float4> gMotionClipDepth : register(t3);
+ Texture2D<float4> gReprojectedHistoryColor : register(t5);
+ Texture2D<uint> gRejectionReasons : register(t6);
+ Texture2D<float> gExposureScale : register(t7);
+@@ -214,6 +215,7 @@ float4 CompositePS(FullscreenVertexOutput input) : SV_Target0
+ {
+     int2 pixel = int2(input.position.xy);
+     float4 currentColor = gCurrentColor.Load(int3(pixel, 0));
++    float2 motion = gMotionClipDepth.Load(int3(pixel, 0)).xy;
+     float4 historyColor = gReprojectedHistoryColor.Load(int3(pixel, 0));
+     uint reasons = gRejectionReasons.Load(int3(pixel, 0));
+ 
+@@ -223,6 +225,8 @@ float4 CompositePS(FullscreenVertexOutput input) : SV_Target0
+                                1.0f));
+     }
+ 
+-    float3 tint = RejectTint(reasons);
++    float3 tint = (reasons == kRejectNoHistory)
++        ? float3(0.5f + (4.0f * motion.x), 0.5f + (4.0f * motion.y), 0.5f)
++        : RejectTint(reasons);
+     return saturate(float4((0.25f * currentColor.rgb) + (0.75f * tint), 1.0f));
+ }

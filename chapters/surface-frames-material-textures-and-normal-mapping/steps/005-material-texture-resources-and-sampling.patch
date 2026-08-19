@@ -1,0 +1,698 @@
+diff --git a/chapters/surface-frames-material-textures-and-normal-mapping/Starter/Renderer.cpp b/chapters/surface-frames-material-textures-and-normal-mapping/Starter/Renderer.cpp
+index ae24352..3dcfb55 100644
+--- a/chapters/surface-frames-material-textures-and-normal-mapping/Starter/Renderer.cpp
++++ b/chapters/surface-frames-material-textures-and-normal-mapping/Starter/Renderer.cpp
+@@ -20,11 +20,13 @@
+ #include <cmath>
+ #include <cstddef>
+ #include <cstdint>
++#include <cstring>
+ #include <filesystem>
+ #include <memory>
+ #include <span>
+ #include <string>
+ #include <utility>
++#include <vector>
+
+ #include <lgp/framework/buffer.hpp>
+ #include <lgp/framework/descriptors.hpp>
+@@ -39,46 +41,56 @@ using Microsoft::WRL::ComPtr;
+
+ inline constexpr DXGI_FORMAT kHdrFormat = DXGI_FORMAT_R16G16B16A16_FLOAT;
+ inline constexpr DXGI_FORMAT kDepthFormat = DXGI_FORMAT_D32_FLOAT;
++inline constexpr DXGI_FORMAT kTextureFormat = DXGI_FORMAT_R8G8B8A8_TYPELESS;
++inline constexpr std::uint32_t kTextureSize = 128U;
+
+ enum RootParameter : UINT
+ {
+     LightingRootConstants = 0U,
+     ObjectRootConstants = 1U,
+     OutputRootConstants = 2U,
+-    HdrTexture = 3U,
++    MaterialTextures = 3U,
++    HdrTexture = 4U,
+ };
+
+ struct LightingConstants final
+ {
+     DirectX::XMFLOAT4X4 viewProjection{};
+     DirectX::XMFLOAT3 cameraPosition{};
+-    std::uint32_t lightType{};
++    std::uint32_t visualization{};
+     DirectX::XMFLOAT3 lightPosition{};
+     float intensity{};
+     DirectX::XMFLOAT3 directionToLight{};
+-    std::uint32_t padding0{};
++    std::uint32_t lightType{};
+     DirectX::XMFLOAT3 lightColor{1.0F, 1.0F, 1.0F};
+-    std::uint32_t padding1{};
++    std::uint32_t materialFlags{7U};
+     DirectX::XMFLOAT3 overrideBaseColor{0.72F, 0.18F, 0.08F};
+     float overrideRoughness{0.45F};
+     float overrideMetalness{};
+-    DirectX::XMFLOAT3 padding{};
++    float normalStrength{1.0F};
++    std::uint32_t invertNormalGreen{};
++    std::uint32_t overrideNormalSample{};
++    std::uint32_t padding{};
++    DirectX::XMFLOAT3 overrideNormal{0.5F, 0.5F, 1.0F};
++    std::uint32_t padding2{};
+ };
+
+ struct ObjectConstants final
+ {
+     DirectX::XMFLOAT3 translation{};
+-    float padding0{};
++    float uvScale{1.0F};
+     DirectX::XMFLOAT3 baseColor{};
+     float roughness{};
+     float metalness{};
+     DirectX::XMFLOAT3 dielectricF0{0.04F, 0.04F, 0.04F};
++    std::uint32_t objectId{};
+ };
+
+ struct OutputConstants final
+ {
+     float exposure{-4.0F};
+-    DirectX::XMFLOAT3 padding{};
++    std::uint32_t applyHdrDisplayTransform{1U};
++    DirectX::XMFLOAT2 padding{};
+ };
+
+ struct MeshBuffers final
+@@ -90,6 +102,13 @@ struct MeshBuffers final
+     UINT indexCount{};
+ };
+
++struct TexturePixels final
++{
++    std::vector<std::uint8_t> baseColor;
++    std::vector<std::uint8_t> packedMaterial;
++    std::vector<std::uint8_t> normal;
++};
++
+ static_assert(sizeof(LightingConstants) % sizeof(std::uint32_t) == 0U);
+ static_assert(sizeof(ObjectConstants) % sizeof(std::uint32_t) == 0U);
+ static_assert(sizeof(OutputConstants) % sizeof(std::uint32_t) == 0U);
+@@ -118,6 +137,11 @@ lgp::framework::TextureBarrierState constexpr kShaderResourceState{
+     D3D12_BARRIER_ACCESS_SHADER_RESOURCE,
+     D3D12_BARRIER_LAYOUT_SHADER_RESOURCE,
+ };
++lgp::framework::TextureBarrierState constexpr kCopyDestinationState{
++    D3D12_BARRIER_SYNC_COPY,
++    D3D12_BARRIER_ACCESS_COPY_DEST,
++    D3D12_BARRIER_LAYOUT_COPY_DEST,
++};
+
+ [[nodiscard]] lgp::framework::TextureBarrierState FrameStartState(
+     lgp::framework::FrameContext const &frameContext) noexcept
+@@ -149,6 +173,77 @@ lgp::framework::TextureBarrierState constexpr kShaderResourceState{
+     return result;
+ }
+
++[[nodiscard]] std::uint8_t EncodeUnit(float value) noexcept
++{
++    return static_cast<std::uint8_t>(std::clamp(std::lround(value * 255.0F), 0L, 255L));
++}
++
++[[nodiscard]] TexturePixels GenerateMaterialTextures()
++{
++    std::size_t const byteCount = static_cast<std::size_t>(kTextureSize) * kTextureSize * 4U;
++    TexturePixels pixels{
++        std::vector<std::uint8_t>(byteCount),
++        std::vector<std::uint8_t>(byteCount),
++        std::vector<std::uint8_t>(byteCount),
++    };
++    for (std::uint32_t y = 0U; y < kTextureSize; ++y)
++    {
++        for (std::uint32_t x = 0U; x < kTextureSize; ++x)
++        {
++            float const u = (static_cast<float>(x) + 0.5F) / static_cast<float>(kTextureSize);
++            float const v = (static_cast<float>(y) + 0.5F) / static_cast<float>(kTextureSize);
++            bool const checker = (((x / 16U) + (y / 16U)) & 1U) != 0U;
++            bool const seamBand = x < 4U || x >= kTextureSize - 4U || std::abs(static_cast<int>(x) - 64) < 3;
++            bool const arrow =
++                std::abs(v - 0.5F) < (0.035F + 0.22F * std::max(0.0F, u - 0.62F)) && u > 0.14F && u < 0.92F;
++            DirectX::XMFLOAT3 color =
++                checker ? DirectX::XMFLOAT3{0.78F, 0.16F, 0.055F} : DirectX::XMFLOAT3{0.045F, 0.28F, 0.78F};
++            if (arrow)
++            {
++                color = {0.95F, 0.82F, 0.08F};
++            }
++            if (seamBand)
++            {
++                color = {0.05F, 0.9F, 0.28F};
++            }
++            std::size_t const offset = (static_cast<std::size_t>(y) * kTextureSize + x) * 4U;
++            pixels.baseColor[offset + 0U] = EncodeUnit(color.x);
++            pixels.baseColor[offset + 1U] = EncodeUnit(color.y);
++            pixels.baseColor[offset + 2U] = EncodeUnit(color.z);
++            pixels.baseColor[offset + 3U] = 255U;
++
++            float const roughness = 0.08F + (0.84F * u);
++            float metalness = 0.5F;
++            if (v < 0.48F)
++            {
++                metalness = 0.0F;
++            }
++            else if (v > 0.52F)
++            {
++                metalness = 1.0F;
++            }
++            pixels.packedMaterial[offset + 0U] = EncodeUnit(roughness);
++            pixels.packedMaterial[offset + 1U] = EncodeUnit(metalness);
++            pixels.packedMaterial[offset + 2U] = checker ? 255U : 0U;
++            pixels.packedMaterial[offset + 3U] = 255U;
++
++            float nx = 0.58F * std::sin(u * 6.28318530718F);
++            float ny = 0.52F * std::cos(v * 12.56637061436F);
++            if (u > 0.46F && u < 0.54F)
++            {
++                nx = u < 0.5F ? -0.72F : 0.72F;
++            }
++            float const nz = std::sqrt(std::max(1.0F - (nx * nx) - (ny * ny), 0.02F));
++            float const inverseLength = 1.0F / std::sqrt((nx * nx) + (ny * ny) + (nz * nz));
++            pixels.normal[offset + 0U] = EncodeUnit((nx * inverseLength * 0.5F) + 0.5F);
++            pixels.normal[offset + 1U] = EncodeUnit((ny * inverseLength * 0.5F) + 0.5F);
++            pixels.normal[offset + 2U] = EncodeUnit((nz * inverseLength * 0.5F) + 0.5F);
++            pixels.normal[offset + 3U] = 255U;
++        }
++    }
++    return pixels;
++}
++
+ } // namespace
+
+ class Renderer::Impl final
+@@ -168,11 +263,16 @@ class Renderer::Impl final
+     lgp::framework::DescriptorAllocation depthView{};
+     lgp::framework::DescriptorAllocation hdrRtv{};
+     lgp::framework::DescriptorAllocation hdrSrv{};
++    lgp::framework::DescriptorAllocation materialSrvs{};
+     ComPtr<ID3D12Resource> depthTarget{};
+     ComPtr<ID3D12Resource> hdrTarget{};
++    std::array<ComPtr<ID3D12Resource>, 3U> materialTextures{};
+     LightingConstants lighting{};
+     OutputConstants output{};
+     DirectX::XMFLOAT3 lightDirection{-0.45F, 0.82F, -0.35F};
++    float directionalLux{1200.0F};
++    float pointCandela{1800.0F};
++    float lightDistance{7.0F};
+     float orbitAzimuth{};
+     float orbitElevation{0.28F};
+     float orbitRadius{15.5F};
+@@ -183,6 +283,7 @@ class Renderer::Impl final
+     [[nodiscard]] lgp::framework::Status CreatePipelineStates();
+     [[nodiscard]] lgp::framework::Status CreateMeshBuffers(GeometryMesh const &mesh, std::wstring_view name,
+                                                            MeshBuffers &buffers);
++    [[nodiscard]] lgp::framework::Status CreateMaterialTextures();
+     [[nodiscard]] lgp::framework::Status CreateSizeDependentTargets(lgp::framework::Extent2D size);
+     [[nodiscard]] lgp::framework::Status Update(lgp::framework::UpdateContext const &context);
+     [[nodiscard]] lgp::framework::Status Render(lgp::framework::FrameContext const &frameContext);
+@@ -246,7 +347,7 @@ lgp::framework::Status Renderer::Impl::CreateShaders()
+
+ lgp::framework::Status Renderer::Impl::CreateRootSignature()
+ {
+-    D3D12_ROOT_PARAMETER parameters[4]{};
++    D3D12_ROOT_PARAMETER parameters[5]{};
+     parameters[LightingRootConstants].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+     parameters[LightingRootConstants].Constants.ShaderRegister = 0U;
+     parameters[LightingRootConstants].Constants.Num32BitValues = sizeof(LightingConstants) / sizeof(std::uint32_t);
+@@ -260,29 +361,43 @@ lgp::framework::Status Renderer::Impl::CreateRootSignature()
+     parameters[OutputRootConstants].Constants.Num32BitValues = sizeof(OutputConstants) / sizeof(std::uint32_t);
+     parameters[OutputRootConstants].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+
+-    D3D12_DESCRIPTOR_RANGE range{};
+-    range.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
+-    range.NumDescriptors = 1U;
+-    range.BaseShaderRegister = 0U;
+-    range.OffsetInDescriptorsFromTableStart = D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND;
++    D3D12_DESCRIPTOR_RANGE materialRange{};
++    materialRange.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
++    materialRange.NumDescriptors = 4U;
++    materialRange.BaseShaderRegister = 0U;
++    materialRange.OffsetInDescriptorsFromTableStart = D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND;
++    parameters[MaterialTextures].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
++    parameters[MaterialTextures].DescriptorTable.NumDescriptorRanges = 1U;
++    parameters[MaterialTextures].DescriptorTable.pDescriptorRanges = &materialRange;
++    parameters[MaterialTextures].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
++    D3D12_DESCRIPTOR_RANGE hdrRange{};
++    hdrRange.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
++    hdrRange.NumDescriptors = 1U;
++    hdrRange.BaseShaderRegister = 4U;
++    hdrRange.OffsetInDescriptorsFromTableStart = D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND;
+     parameters[HdrTexture].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+     parameters[HdrTexture].DescriptorTable.NumDescriptorRanges = 1U;
+-    parameters[HdrTexture].DescriptorTable.pDescriptorRanges = &range;
++    parameters[HdrTexture].DescriptorTable.pDescriptorRanges = &hdrRange;
+     parameters[HdrTexture].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+
+-    D3D12_STATIC_SAMPLER_DESC sampler{};
+-    sampler.Filter = D3D12_FILTER_MIN_MAG_MIP_LINEAR;
+-    sampler.AddressU = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
+-    sampler.AddressV = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
+-    sampler.AddressW = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
+-    sampler.ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+-    sampler.MaxLOD = D3D12_FLOAT32_MAX;
++    std::array<D3D12_STATIC_SAMPLER_DESC, 2U> samplers{};
++    samplers[0].Filter = D3D12_FILTER_MIN_MAG_MIP_LINEAR;
++    samplers[0].AddressU = D3D12_TEXTURE_ADDRESS_MODE_WRAP;
++    samplers[0].AddressV = D3D12_TEXTURE_ADDRESS_MODE_WRAP;
++    samplers[0].AddressW = D3D12_TEXTURE_ADDRESS_MODE_WRAP;
++    samplers[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
++    samplers[0].MaxLOD = D3D12_FLOAT32_MAX;
++    samplers[1] = samplers[0];
++    samplers[1].ShaderRegister = 1U;
++    samplers[1].AddressU = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
++    samplers[1].AddressV = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
++    samplers[1].AddressW = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
+
+     D3D12_ROOT_SIGNATURE_DESC description{};
+     description.NumParameters = static_cast<UINT>(std::size(parameters));
+     description.pParameters = parameters;
+-    description.NumStaticSamplers = 1U;
+-    description.pStaticSamplers = &sampler;
++    description.NumStaticSamplers = static_cast<UINT>(samplers.size());
++    description.pStaticSamplers = samplers.data();
+     description.Flags = D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT |
+                         D3D12_ROOT_SIGNATURE_FLAG_DENY_HULL_SHADER_ROOT_ACCESS |
+                         D3D12_ROOT_SIGNATURE_FLAG_DENY_DOMAIN_SHADER_ROOT_ACCESS |
+@@ -411,6 +526,125 @@ lgp::framework::Status Renderer::Impl::CreateMeshBuffers(GeometryMesh const &mes
+     return {};
+ }
+
++lgp::framework::Status Renderer::Impl::CreateMaterialTextures()
++{
++    TexturePixels const pixels = GenerateMaterialTextures();
++    std::array<std::vector<std::uint8_t> const *, 3U> const sources{
++        &pixels.baseColor,
++        &pixels.packedMaterial,
++        &pixels.normal,
++    };
++    std::array<wchar_t const *, 3U> const names{
++        L"Ch06 generated base color",
++        L"Ch06 generated roughness metalness",
++        L"Ch06 generated tangent-space normal",
++    };
++    std::array<lgp::framework::Buffer, 3U> uploads{};
++    std::array<D3D12_PLACED_SUBRESOURCE_FOOTPRINT, 3U> footprints{};
++
++    ID3D12Device10 *const device = deviceResources->device();
++    D3D12_HEAP_PROPERTIES defaultHeap{};
++    defaultHeap.Type = D3D12_HEAP_TYPE_DEFAULT;
++    D3D12_RESOURCE_DESC1 textureDescription{};
++    textureDescription.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
++    textureDescription.Width = kTextureSize;
++    textureDescription.Height = kTextureSize;
++    textureDescription.DepthOrArraySize = 1U;
++    textureDescription.MipLevels = 1U;
++    textureDescription.Format = kTextureFormat;
++    textureDescription.SampleDesc.Count = 1U;
++    textureDescription.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
++
++    for (std::size_t textureIndex = 0U; textureIndex < materialTextures.size(); ++textureIndex)
++    {
++        HRESULT const textureResult = device->CreateCommittedResource3(
++            &defaultHeap, D3D12_HEAP_FLAG_NONE, &textureDescription, D3D12_BARRIER_LAYOUT_COPY_DEST, nullptr, nullptr,
++            0U, nullptr, IID_PPV_ARGS(materialTextures[textureIndex].ReleaseAndGetAddressOf()));
++        if (FAILED(textureResult))
++        {
++            return std::unexpected(lgp::framework::MakeHResultError("ID3D12Device10::CreateCommittedResource3",
++                                                                    textureResult,
++                                                                    "Failed to create a generated material texture."));
++        }
++        materialTextures[textureIndex]->SetName(names[textureIndex]);
++        UINT rowCount{};
++        UINT64 rowSize{};
++        UINT64 uploadSize{};
++        device->GetCopyableFootprints1(&textureDescription, 0U, 1U, 0U, &footprints[textureIndex], &rowCount, &rowSize,
++                                       &uploadSize);
++        auto uploadResult = lgp::framework::CreateUploadBuffer(*device, uploadSize, L"Ch06 material texture upload");
++        if (!uploadResult)
++        {
++            return std::unexpected(std::move(uploadResult.error()));
++        }
++        uploads[textureIndex] = std::move(uploadResult.value());
++        std::size_t const sourceRowBytes = static_cast<std::size_t>(kTextureSize) * 4U;
++        for (std::uint32_t row = 0U; row < kTextureSize; ++row)
++        {
++            std::byte *const destination =
++                uploads[textureIndex].mapped_data() + footprints[textureIndex].Offset +
++                (static_cast<std::size_t>(row) * footprints[textureIndex].Footprint.RowPitch);
++            std::uint8_t const *const source =
++                sources[textureIndex]->data() + (static_cast<std::size_t>(row) * sourceRowBytes);
++            std::memcpy(destination, source, sourceRowBytes);
++        }
++    }
++
++    ComPtr<ID3D12CommandAllocator> allocator;
++    HRESULT const allocatorResult = device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT,
++                                                                   IID_PPV_ARGS(allocator.ReleaseAndGetAddressOf()));
++    if (FAILED(allocatorResult))
++    {
++        return std::unexpected(lgp::framework::MakeHResultError("ID3D12Device::CreateCommandAllocator", allocatorResult,
++                                                                "Failed to create the material upload allocator."));
++    }
++    ComPtr<ID3D12GraphicsCommandList7> commandList;
++    HRESULT const listResult = device->CreateCommandList(0U, D3D12_COMMAND_LIST_TYPE_DIRECT, allocator.Get(), nullptr,
++                                                         IID_PPV_ARGS(commandList.ReleaseAndGetAddressOf()));
++    if (FAILED(listResult))
++    {
++        return std::unexpected(lgp::framework::MakeHResultError("ID3D12Device::CreateCommandList", listResult,
++                                                                "Failed to create the material upload command list."));
++    }
++    for (std::size_t textureIndex = 0U; textureIndex < materialTextures.size(); ++textureIndex)
++    {
++        D3D12_TEXTURE_COPY_LOCATION destination{};
++        destination.pResource = materialTextures[textureIndex].Get();
++        destination.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
++        D3D12_TEXTURE_COPY_LOCATION source{};
++        source.pResource = uploads[textureIndex].resource();
++        source.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
++        source.PlacedFootprint = footprints[textureIndex];
++        commandList->CopyTextureRegion(&destination, 0U, 0U, 0U, &source, nullptr);
++        lgp::framework::TransitionTexture(*commandList.Get(), *materialTextures[textureIndex].Get(), kCopyDestinationState,
++                                          kShaderResourceState);
++    }
++    HRESULT const closeResult = commandList->Close();
++    if (FAILED(closeResult))
++    {
++        return std::unexpected(lgp::framework::MakeHResultError("ID3D12GraphicsCommandList::Close", closeResult,
++                                                                "Failed to close the material upload command list."));
++    }
++    ID3D12CommandList *const lists[]{commandList.Get()};
++    deviceResources->graphics_queue()->ExecuteCommandLists(1U, lists);
++    if (auto idleStatus = deviceResources->WaitForGpuIdle(); !idleStatus)
++    {
++        return idleStatus;
++    }
++
++    D3D12_SHADER_RESOURCE_VIEW_DESC srv{};
++    srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
++    srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
++    srv.Texture2D.MipLevels = 1U;
++    srv.Format = DXGI_FORMAT_R8G8B8A8_UNORM_SRGB;
++    device->CreateShaderResourceView(materialTextures[0].Get(), &srv, materialSrvs.CpuHandle(0U));
++    srv.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
++    device->CreateShaderResourceView(materialTextures[1].Get(), &srv, materialSrvs.CpuHandle(1U));
++    device->CreateShaderResourceView(materialTextures[2].Get(), &srv, materialSrvs.CpuHandle(2U));
++    device->CreateShaderResourceView(materialTextures[0].Get(), &srv, materialSrvs.CpuHandle(3U));
++    return {};
++}
++
+ lgp::framework::Status Renderer::Impl::CreateSizeDependentTargets(lgp::framework::Extent2D size)
+ {
+     depthTarget.Reset();
+@@ -508,6 +742,12 @@ lgp::framework::Status Renderer::Impl::Initialize(lgp::framework::ApplicationIni
+         return std::unexpected(std::move(srvAllocation.error()));
+     }
+     hdrSrv = srvAllocation.value();
++    auto materialAllocation = deviceResources->shader_visible_cbv_srv_uav_heap().Allocate(4U);
++    if (!materialAllocation)
++    {
++        return std::unexpected(std::move(materialAllocation.error()));
++    }
++    materialSrvs = materialAllocation.value();
+
+     if (auto status = CreateShaders(); !status)
+     {
+@@ -529,6 +769,10 @@ lgp::framework::Status Renderer::Impl::Initialize(lgp::framework::ApplicationIni
+     {
+         return status;
+     }
++    if (auto status = CreateMaterialTextures(); !status)
++    {
++        return status;
++    }
+     if (auto status = CreateSizeDependentTargets(context.drawableSize); !status)
+     {
+         return status;
+@@ -562,12 +806,13 @@ lgp::framework::Status Renderer::Impl::Update(lgp::framework::UpdateContext cons
+     lighting.cameraPosition = cameraPosition;
+     lighting.lightType = 0U;
+     lighting.directionToLight = NormalizeDirection(lightDirection);
+-    lighting.intensity = 1200.0F;
++    lighting.intensity = directionalLux;
+     lighting.lightPosition = {
+-        lighting.directionToLight.x * 7.0F,
+-        1.2F + (lighting.directionToLight.y * 7.0F),
+-        lighting.directionToLight.z * 7.0F,
++        lighting.directionToLight.x * lightDistance,
++        1.2F + (lighting.directionToLight.y * lightDistance),
++        lighting.directionToLight.z * lightDistance,
+     };
++    lighting.materialFlags = 3U;
+     return {};
+ }
+
+@@ -589,6 +834,8 @@ lgp::framework::Status Renderer::Impl::Render(lgp::framework::FrameContext const
+         return {};
+     }
+     ID3D12GraphicsCommandList7 &commandList = *frameContext.commandList;
++    ID3D12DescriptorHeap *const heaps[]{frameContext.shaderVisibleCbvSrvUavHeap};
++    commandList.SetDescriptorHeaps(1U, heaps);
+     commandList.RSSetViewports(1U, &frameContext.viewport);
+     commandList.RSSetScissorRects(1U, &frameContext.scissorRect);
+     commandList.IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+@@ -602,30 +849,37 @@ lgp::framework::Status Renderer::Impl::Render(lgp::framework::FrameContext const
+     commandList.SetPipelineState(lightingPipeline.Get());
+     commandList.SetGraphicsRoot32BitConstants(LightingRootConstants, sizeof(LightingConstants) / sizeof(std::uint32_t),
+                                               &lighting, 0U);
++    commandList.SetGraphicsRootDescriptorTable(MaterialTextures, materialSrvs.gpuHandle);
+
+     ObjectConstants object{};
+     object.translation = {0.0F, 0.0F, 0.5F};
++    object.uvScale = 2.0F;
+     object.baseColor = {0.32F, 0.34F, 0.38F};
+     object.roughness = 0.62F;
+     object.metalness = 0.0F;
+     object.dielectricF0 = {0.04F, 0.04F, 0.04F};
++    object.objectId = 1U;
+     DrawMesh(commandList, plane, object);
+     object.translation = {-1.9F, 0.75F, 0.5F};
++    object.uvScale = 1.0F;
+     object.baseColor = {0.72F, 0.12F, 0.055F};
+     object.roughness = 0.28F;
+     object.metalness = 0.0F;
++    object.objectId = 2U;
+     DrawMesh(commandList, sphere, object);
+
+     object.translation = {0.0F, 0.75F, 0.5F};
+     object.baseColor = {0.95F, 0.64F, 0.18F};
+     object.roughness = 0.22F;
+     object.metalness = 1.0F;
++    object.objectId = 3U;
+     DrawMesh(commandList, sphere, object);
+
+     object.translation = {1.9F, 0.75F, 0.5F};
+     object.baseColor = {0.08F, 0.32F, 0.82F};
+     object.roughness = 0.68F;
+     object.metalness = 0.0F;
++    object.objectId = 4U;
+     DrawMesh(commandList, sphere, object);
+
+     lgp::framework::TransitionTexture(commandList, *hdrTarget.Get(), kRenderTargetState, kShaderResourceState);
+@@ -635,9 +889,8 @@ lgp::framework::Status Renderer::Impl::Render(lgp::framework::FrameContext const
+     float const displayClear[]{0.0F, 0.0F, 0.0F, 1.0F};
+     commandList.OMSetRenderTargets(1U, &frameContext.renderTargetView, FALSE, nullptr);
+     commandList.ClearRenderTargetView(frameContext.renderTargetView, displayClear, 0U, nullptr);
+-    ID3D12DescriptorHeap *const heaps[]{frameContext.shaderVisibleCbvSrvUavHeap};
+-    commandList.SetDescriptorHeaps(1U, heaps);
+     commandList.SetPipelineState(displayPipeline.Get());
++    output.applyHdrDisplayTransform = 1U;
+     commandList.SetGraphicsRoot32BitConstants(OutputRootConstants, sizeof(OutputConstants) / sizeof(std::uint32_t),
+                                               &output, 0U);
+     commandList.SetGraphicsRootDescriptorTable(HdrTexture, hdrSrv.gpuHandle);
+@@ -651,6 +904,10 @@ void Renderer::Impl::Shutdown() noexcept
+ {
+     depthTarget.Reset();
+     hdrTarget.Reset();
++    for (ComPtr<ID3D12Resource> &texture : materialTextures)
++    {
++        texture.Reset();
++    }
+     if (depthView)
+     {
+         dsvHeap.Free(depthView);
+@@ -663,9 +920,14 @@ void Renderer::Impl::Shutdown() noexcept
+     {
+         deviceResources->shader_visible_cbv_srv_uav_heap().Free(hdrSrv);
+     }
++    if (deviceResources != nullptr && materialSrvs)
++    {
++        deviceResources->shader_visible_cbv_srv_uav_heap().Free(materialSrvs);
++    }
+     depthView = {};
+     hdrRtv = {};
+     hdrSrv = {};
++    materialSrvs = {};
+     dsvHeap = {};
+     sphere = {};
+     plane = {};
+diff --git a/chapters/surface-frames-material-textures-and-normal-mapping/Starter/SurfaceBaseline.hlsl b/chapters/surface-frames-material-textures-and-normal-mapping/Starter/SurfaceBaseline.hlsl
+index 3b9eec0..c34d9fa 100644
+--- a/chapters/surface-frames-material-textures-and-normal-mapping/Starter/SurfaceBaseline.hlsl
++++ b/chapters/surface-frames-material-textures-and-normal-mapping/Starter/SurfaceBaseline.hlsl
+@@ -2,40 +2,52 @@ struct LightingConstants
+ {
+     row_major float4x4 viewProjection;
+     float3 cameraPosition;
+-    uint lightType;
++    uint visualization;
+     float3 lightPosition;
+     float intensity;
+     float3 directionToLight;
+-    uint padding0;
++    uint lightType;
+     float3 lightColor;
+-    uint padding1;
+-    float3 unusedBaseColor;
+-    float unusedRoughness;
+-    float unusedMetalness;
+-    float3 padding2;
++    uint materialFlags;
++    float3 overrideBaseColor;
++    float overrideRoughness;
++    float overrideMetalness;
++    float normalStrength;
++    uint invertNormalGreen;
++    uint overrideNormalSample;
++    uint padding;
++    float3 overrideNormal;
++    uint padding2;
+ };
+
+ struct ObjectConstants
+ {
+     float3 translation;
+-    float padding0;
++    float uvScale;
+     float3 baseColor;
+     float roughness;
+     float metalness;
+     float3 dielectricF0;
++    uint objectId;
+ };
+
+ struct OutputConstants
+ {
+     float exposure;
+-    float3 padding;
++    uint applyHdrDisplayTransform;
++    float2 padding;
+ };
+
+ ConstantBuffer<LightingConstants> lighting : register(b0);
+ ConstantBuffer<ObjectConstants> objectData : register(b1);
+ ConstantBuffer<OutputConstants> outputData : register(b2);
+-Texture2D<float4> hdrInput : register(t0);
+-SamplerState linearClampSampler : register(s0);
++Texture2D<float4> baseColorTexture : register(t0);
++Texture2D<float4> packedMaterialTexture : register(t1);
++Texture2D<float4> normalTexture : register(t2);
++Texture2D<float4> baseColorLinearTexture : register(t3);
++Texture2D<float4> hdrInput : register(t4);
++SamplerState materialSampler : register(s0);
++SamplerState linearClampSampler : register(s1);
+
+ struct MeshVertex
+ {
+@@ -70,7 +82,7 @@ LitVertex LightingVS(MeshVertex input)
+     output.position = mul(worldPosition, lighting.viewProjection);
+     output.worldPosition = worldPosition.xyz;
+     output.worldNormal = input.normal;
+-    output.uv = input.uv * 8.0;
++    output.uv = input.uv * objectData.uvScale;
+     output.worldTangent = input.tangent;
+     return output;
+ }
+@@ -104,47 +116,65 @@ float SmithG1(float nDotDirection, float roughness)
+     return (2.0 * cosine) / max(cosine + root, 1.0e-7);
+ }
+
+-float3 SrgbToLinear(float3 encoded)
+-{
+-    float3 low = encoded / 12.92;
+-    float3 high = pow((encoded + 0.055) / 1.055, 2.4);
+-    return lerp(high, low, encoded <= 0.04045);
+-}
+-
+ float4 LightingPS(LitVertex input, bool frontFace : SV_IsFrontFace) : SV_Target
+ {
+-    float3 normal = normalize(input.worldNormal) * (frontFace ? 1.0 : -1.0);
+-    float3 tangent = normalize(input.worldTangent.xyz - normal * dot(input.worldTangent.xyz, normal));
++    float3 interpolatedNormal = normalize(input.worldNormal) * (frontFace ? 1.0 : -1.0);
++    float3 tangent = normalize(input.worldTangent.xyz - interpolatedNormal *
++                               dot(input.worldTangent.xyz, interpolatedNormal));
+     float handedness = input.worldTangent.w < 0.0 ? -1.0 : 1.0;
+-    float3 bitangent = normalize(cross(normal, tangent)) * handedness;
+-    float checker = fmod(floor(input.uv.x) + floor(input.uv.y), 2.0);
+-    float3 encodedBaseColor = lerp(float3(0.045, 0.28, 0.78), float3(0.78, 0.16, 0.055), checker);
+-    float3 baseColor = SrgbToLinear(encodedBaseColor);
+-    float2 wave = float2(sin(input.uv.x * Pi), cos(input.uv.y * Pi)) * 0.45;
+-    float3 encodedNormal = float3((wave * 0.5) + 0.5, 1.0);
+-    float3 tangentNormal = normalize(encodedNormal * 2.0 - 1.0);
+-    float3 mappedNormal = normalize((tangent * tangentNormal.x) + (bitangent * tangentNormal.y) +
+-                                    (normal * tangentNormal.z));
++    float3 bitangent = normalize(cross(interpolatedNormal, tangent)) * handedness;
++    float3 geometricNormal = normalize(cross(ddx(input.worldPosition), ddy(input.worldPosition)));
++    geometricNormal *= frontFace ? 1.0 : -1.0;
++
++    float4 encodedBaseColor = (lighting.materialFlags & 8U) != 0U
++        ? baseColorLinearTexture.Sample(materialSampler, input.uv)
++        : baseColorTexture.Sample(materialSampler, input.uv);
++    float2 packedMaterial = packedMaterialTexture.Sample(materialSampler, input.uv).rg;
++    float3 baseColor = (lighting.materialFlags & 1U) != 0U ? encodedBaseColor.rgb : objectData.baseColor;
++    float roughness = (lighting.materialFlags & 2U) != 0U ? packedMaterial.r : objectData.roughness;
++    float metalness = (lighting.materialFlags & 2U) != 0U ? packedMaterial.g : objectData.metalness;
++    if ((lighting.materialFlags & 16U) != 0U)
++    {
++        baseColor = lighting.overrideBaseColor;
++        roughness = lighting.overrideRoughness;
++        metalness = lighting.overrideMetalness;
++    }
++
++    float3 mappedNormal = interpolatedNormal;
++
+     float3 viewDirection = normalize(lighting.cameraPosition - input.worldPosition);
+     float3 lightDirection = normalize(lighting.directionToLight);
++    float normalIlluminance = lighting.intensity;
++    if (lighting.lightType != 0U)
++    {
++        float3 offset = lighting.lightPosition - input.worldPosition;
++        float distanceSquared = max(dot(offset, offset), 1.0e-4);
++        lightDirection = offset * rsqrt(distanceSquared);
++        normalIlluminance = lighting.intensity / distanceSquared;
++    }
++
+     float nDotL = saturate(dot(mappedNormal, lightDirection));
+     float nDotV = saturate(dot(mappedNormal, viewDirection));
+     float3 halfVector = normalize(viewDirection + lightDirection);
+     float nDotH = saturate(dot(mappedNormal, halfVector));
+     float vDotH = saturate(dot(viewDirection, halfVector));
+-    float3 f0 = lerp(objectData.dielectricF0, baseColor, objectData.metalness);
++    float3 f0 = lerp(objectData.dielectricF0, baseColor, metalness);
+     float3 fresnel = SchlickFresnel(f0, vDotH);
+-    float distribution = GgxDistribution(nDotH, objectData.roughness);
+-    float geometry = SmithG1(nDotV, objectData.roughness) * SmithG1(nDotL, objectData.roughness);
++    float distribution = GgxDistribution(nDotH, roughness);
++    float geometry = SmithG1(nDotV, roughness) * SmithG1(nDotL, roughness);
+     float denominator = max(4.0 * nDotV * nDotL, 1.0e-6);
+     float3 specularBrdf = nDotL > 0.0 && nDotV > 0.0
+         ? fresnel * distribution * geometry / denominator
+         : 0.0;
+     float3 diffuseWeight =
+-        (1.0 - SchlickFresnel(f0, nDotV)) * (1.0 - SchlickFresnel(f0, nDotL)) * (1.0 - objectData.metalness);
++        (1.0 - SchlickFresnel(f0, nDotV)) * (1.0 - SchlickFresnel(f0, nDotL)) * (1.0 - metalness);
+     float3 diffuseBrdf = diffuseWeight * baseColor / Pi;
+-    float3 irradiance = lighting.lightColor * lighting.intensity * nDotL;
+-    return float4(irradiance * (diffuseBrdf + specularBrdf), 1.0);
++    float3 irradiance = lighting.lightColor * normalIlluminance * nDotL;
++    float3 diffuse = irradiance * diffuseBrdf;
++    float3 specular = irradiance * specularBrdf;
++    float3 color = diffuse + specular;
++
++    return float4(color, 1.0);
+ }
+
+ FullscreenVertex FullscreenVS(uint vertexId : SV_VertexID)

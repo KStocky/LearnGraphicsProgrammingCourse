@@ -1,0 +1,28 @@
+diff --git a/chapters/gpu-work-distribution-and-indirect-execution/Starter/Renderer.cpp b/chapters/gpu-work-distribution-and-indirect-execution/Starter/Renderer.cpp
+index c6dad9a..c3e5a40 100644
+--- a/chapters/gpu-work-distribution-and-indirect-execution/Starter/Renderer.cpp
++++ b/chapters/gpu-work-distribution-and-indirect-execution/Starter/Renderer.cpp
+@@ -636,14 +636,18 @@ lgp::framework::Status Renderer::Render(lgp::framework::FrameContext const &fram
+     commandList.SetPipelineState(graphicsPipeline_.Get());
+     commandList.SetGraphicsRootDescriptorTable(CandidateSrvTable, slot.descriptors.GpuHandle(CandidateSrv));
+ 
+-    for (IndirectDrawCommand const &command : currentReference_.indirectCommands)
+-    {
+-        commandList.SetGraphicsRoot32BitConstant(CandidateRootConstant, command.candidateIndex, 0U);
+-        commandList.DrawInstanced(command.draw.vertexCountPerInstance, command.draw.instanceCount, command.draw.startVertexLocation, command.draw.startInstanceLocation);
+-    }
++    bufferBarriers = {
++        gpu::MakeBufferBarrier(*slot.indirectCommands.Get(), gpu::ComputeUnorderedAccessState(), gpu::ExecuteIndirectState()),
++        gpu::MakeBufferBarrier(*slot.indirectCount.Get(), gpu::ComputeUnorderedAccessState(), gpu::ExecuteIndirectState()),
++    };
++    gpu::SubmitBufferBarriers(commandList, bufferBarriers);
++
++    commandList.ExecuteIndirect(commandSignature_.Get(), configuration.capacity, slot.indirectCommands.Get(), 0U, slot.indirectCount.Get(), 0U);
+ 
+     bufferBarriers = {
+         gpu::MakeBufferBarrier(*slot.flags.Get(), gpu::ComputeShaderResourceState(), gpu::ComputeUnorderedAccessState()),
++        gpu::MakeBufferBarrier(*slot.indirectCommands.Get(), gpu::ExecuteIndirectState(), gpu::ComputeUnorderedAccessState()),
++        gpu::MakeBufferBarrier(*slot.indirectCount.Get(), gpu::ExecuteIndirectState(), gpu::ComputeUnorderedAccessState()),
+     };
+     gpu::SubmitBufferBarriers(commandList, bufferBarriers);
+ 

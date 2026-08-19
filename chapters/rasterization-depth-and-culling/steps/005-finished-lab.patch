@@ -1,0 +1,88 @@
+diff --git a/chapters/rasterization-depth-and-culling/Starter/RasterizationMath.cpp b/chapters/rasterization-depth-and-culling/Starter/RasterizationMath.cpp
+--- a/chapters/rasterization-depth-and-culling/Starter/RasterizationMath.cpp
++++ b/chapters/rasterization-depth-and-culling/Starter/RasterizationMath.cpp
+@@ -3,7 +3,7 @@
+ #include <algorithm>
+ #include <cmath>
+ 
+-namespace ch02::rasterization::starter
++namespace ch02::rasterization::solution
+ {
+ namespace
+ {
+@@ -223,4 +223,4 @@
+     return false;
+ }
+ 
+-} // namespace ch02::rasterization::starter
++} // namespace ch02::rasterization::solution
+diff --git a/chapters/rasterization-depth-and-culling/Starter/Renderer.cpp b/chapters/rasterization-depth-and-culling/Starter/Renderer.cpp
+--- a/chapters/rasterization-depth-and-culling/Starter/Renderer.cpp
++++ b/chapters/rasterization-depth-and-culling/Starter/Renderer.cpp
+@@ -28,7 +28,7 @@
+ #include <lgp/framework/descriptors.hpp>
+ #include <lgp/framework/shader_compiler.hpp>
+ 
+-namespace ch02::rasterization::starter
++namespace ch02::rasterization::solution
+ {
+ namespace
+ {
+@@ -691,4 +691,4 @@
+     impl_->Shutdown();
+ }
+ 
+-} // namespace ch02::rasterization::starter
++} // namespace ch02::rasterization::solution
+diff --git a/chapters/rasterization-depth-and-culling/Starter/Renderer.hpp b/chapters/rasterization-depth-and-culling/Starter/Renderer.hpp
+--- a/chapters/rasterization-depth-and-culling/Starter/Renderer.hpp
++++ b/chapters/rasterization-depth-and-culling/Starter/Renderer.hpp
+@@ -4,7 +4,7 @@
+ 
+ #include <lgp/framework/application.hpp>
+ 
+-namespace ch02::rasterization::starter
++namespace ch02::rasterization::solution
+ {
+ 
+ class Renderer final : public lgp::framework::IChapterRenderer
+@@ -31,4 +31,4 @@
+     std::unique_ptr<Impl> impl_;
+ };
+ 
+-} // namespace ch02::rasterization::starter
++} // namespace ch02::rasterization::solution
+diff --git a/chapters/rasterization-depth-and-culling/Starter/Main.cpp b/chapters/rasterization-depth-and-culling/Starter/Main.cpp
+--- a/chapters/rasterization-depth-and-culling/Starter/Main.cpp
++++ b/chapters/rasterization-depth-and-culling/Starter/Main.cpp
+@@ -4,10 +4,10 @@
+ 
+ int wmain(int argc, wchar_t **argv)
+ {
+-    ch02::rasterization::starter::Renderer renderer{};
++    ch02::rasterization::solution::Renderer renderer{};
+ 
+     lgp::framework::ApplicationConfiguration configuration{};
+-    configuration.title = L"Ch02 Rasterization Starter";
++    configuration.title = L"Ch02 Rasterization Solution";
+     configuration.width = 1600U;
+     configuration.height = 900U;
+     configuration.rtvDescriptorCount = 32U;
+diff --git a/chapters/rasterization-depth-and-culling/Starter/RasterizationMath.hpp b/chapters/rasterization-depth-and-culling/Starter/RasterizationMath.hpp
+--- a/chapters/rasterization-depth-and-culling/Starter/RasterizationMath.hpp
++++ b/chapters/rasterization-depth-and-culling/Starter/RasterizationMath.hpp
+@@ -6,7 +6,7 @@
+ #include <optional>
+ #include <vector>
+ 
+-namespace ch02::rasterization::starter
++namespace ch02::rasterization::solution
+ {
+ 
+ [[nodiscard]] float SignedTwiceArea(ScreenTriangle const &triangle) noexcept;
+@@ -27,4 +27,4 @@
+ [[nodiscard]] std::optional<float> NormalizedDepth(XMFLOAT4 clipPosition, float epsilon = 1.0e-6F) noexcept;
+ [[nodiscard]] bool DepthPasses(float incomingDepth, float storedDepth, DepthComparison comparison) noexcept;
+ 
+-} // namespace ch02::rasterization::starter
++} // namespace ch02::rasterization::solution

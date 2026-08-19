@@ -1,0 +1,233 @@
+diff --git a/chapters/graphics-math-coordinate-transforms/Starter/Camera.cpp b/chapters/graphics-math-coordinate-transforms/Starter/Camera.cpp
+--- a/chapters/graphics-math-coordinate-transforms/Starter/Camera.cpp
++++ b/chapters/graphics-math-coordinate-transforms/Starter/Camera.cpp
+@@ -8,7 +8,7 @@
+
+ #include <cmath>
+
+-namespace ch01::graphics_math::starter
++namespace ch01::graphics_math::solution
+ {
+ namespace
+ {
+@@ -94,4 +94,4 @@ CameraFrame BuildCameraFrame(ChapterControls const &controls) noexcept
+     return frame;
+ }
+
+-} // namespace ch01::graphics_math::starter
++} // namespace ch01::graphics_math::solution
+diff --git a/chapters/graphics-math-coordinate-transforms/Starter/Camera.hpp b/chapters/graphics-math-coordinate-transforms/Starter/Camera.hpp
+--- a/chapters/graphics-math-coordinate-transforms/Starter/Camera.hpp
++++ b/chapters/graphics-math-coordinate-transforms/Starter/Camera.hpp
+@@ -4,7 +4,7 @@
+
+ #include <DirectXMath.h>
+
+-namespace ch01::graphics_math::starter
++namespace ch01::graphics_math::solution
+ {
+
+ struct CameraFrame final
+@@ -19,4 +19,4 @@ struct CameraFrame final
+
+ [[nodiscard]] CameraFrame BuildCameraFrame(ChapterControls const &controls) noexcept;
+
+-} // namespace ch01::graphics_math::starter
++} // namespace ch01::graphics_math::solution
+diff --git a/chapters/graphics-math-coordinate-transforms/Starter/DemoLogic.cpp b/chapters/graphics-math-coordinate-transforms/Starter/DemoLogic.cpp
+--- a/chapters/graphics-math-coordinate-transforms/Starter/DemoLogic.cpp
++++ b/chapters/graphics-math-coordinate-transforms/Starter/DemoLogic.cpp
+@@ -4,33 +4,31 @@
+
+ #include <filesystem>
+
+-namespace ch01::graphics_math::starter
++namespace ch01::graphics_math::solution
+ {
+ namespace
+ {
+
+-class StarterLogic final : public IChapterLogic
++class SolutionLogic final : public IChapterLogic
+ {
+   public:
+     std::wstring_view VariantName() const noexcept override
+     {
+-        return L"Starter";
++        return L"Solution";
+     }
+
+     bool IsStarterVariant() const noexcept override
+     {
+-        return true;
++        return false;
+     }
+
+     void InitializeControls(ChapterControls &controls) const noexcept override
+     {
+         controls = ChapterControls{};
+-        controls.showObjectAxes = true;
+-        controls.showWorldAxes = true;
+-        controls.showCameraAxes = true;
+-        controls.showFrustum = false;
+-        controls.showWrongOrder = true;
++        controls.orientationMode = OrientationMode::Euler;
+         controls.showComparisonOrientation = true;
++        controls.showWrongOrder = true;
++        controls.showFrustum = true;
+         controls.showNormalVectors = true;
+         controls.demonstrateIncorrectNormal = true;
+         controls.omitPerspectiveDivide = true;
+@@ -45,7 +43,7 @@ class StarterLogic final : public IChapterLogic
+                                                            lgp::framework::Extent2D viewport,
+                                                            double elapsedSeconds) const override
+     {
+-        return starter::BuildScene(controls, viewport, elapsedSeconds);
++        return solution::BuildScene(controls, viewport, elapsedSeconds);
+     }
+ };
+
+@@ -53,7 +51,7 @@ class StarterLogic final : public IChapterLogic
+
+ std::unique_ptr<IChapterLogic> CreateLogic()
+ {
+-    return std::make_unique<StarterLogic>();
++    return std::make_unique<SolutionLogic>();
+ }
+
+-} // namespace ch01::graphics_math::starter
++} // namespace ch01::graphics_math::solution
+diff --git a/chapters/graphics-math-coordinate-transforms/Starter/DemoLogic.hpp b/chapters/graphics-math-coordinate-transforms/Starter/DemoLogic.hpp
+--- a/chapters/graphics-math-coordinate-transforms/Starter/DemoLogic.hpp
++++ b/chapters/graphics-math-coordinate-transforms/Starter/DemoLogic.hpp
+@@ -4,9 +4,9 @@
+
+ #include <memory>
+
+-namespace ch01::graphics_math::starter
++namespace ch01::graphics_math::solution
+ {
+
+ [[nodiscard]] std::unique_ptr<IChapterLogic> CreateLogic();
+
+-} // namespace ch01::graphics_math::starter
++} // namespace ch01::graphics_math::solution
+diff --git a/chapters/graphics-math-coordinate-transforms/Starter/Main.cpp b/chapters/graphics-math-coordinate-transforms/Starter/Main.cpp
+--- a/chapters/graphics-math-coordinate-transforms/Starter/Main.cpp
++++ b/chapters/graphics-math-coordinate-transforms/Starter/Main.cpp
+@@ -6,10 +6,10 @@
+
+ int wmain(int argc, wchar_t **argv)
+ {
+-    ch01::graphics_math::ChapterRenderer renderer{ch01::graphics_math::starter::CreateLogic()};
++    ch01::graphics_math::ChapterRenderer renderer{ch01::graphics_math::solution::CreateLogic()};
+
+     lgp::framework::ApplicationConfiguration configuration{};
+-    configuration.title = L"Ch01 Graphics Math Starter";
++    configuration.title = L"Ch01 Graphics Math Solution";
+     configuration.width = 1600U;
+     configuration.height = 900U;
+     configuration.shaderVisibleDescriptorCount = 1024U;
+diff --git a/chapters/graphics-math-coordinate-transforms/Starter/MathTransforms.cpp b/chapters/graphics-math-coordinate-transforms/Starter/MathTransforms.cpp
+--- a/chapters/graphics-math-coordinate-transforms/Starter/MathTransforms.cpp
++++ b/chapters/graphics-math-coordinate-transforms/Starter/MathTransforms.cpp
+@@ -3,7 +3,7 @@
+ #include <algorithm>
+ #include <cmath>
+
+-namespace ch01::graphics_math::starter
++namespace ch01::graphics_math::solution
+ {
+ namespace
+ {
+@@ -152,4 +152,4 @@ DirectX::XMFLOAT4X4 StoreMatrix(DirectX::XMMATRIX matrix) noexcept
+     return storedMatrix;
+ }
+
+-} // namespace ch01::graphics_math::starter
++} // namespace ch01::graphics_math::solution
+diff --git a/chapters/graphics-math-coordinate-transforms/Starter/MathTransforms.hpp b/chapters/graphics-math-coordinate-transforms/Starter/MathTransforms.hpp
+--- a/chapters/graphics-math-coordinate-transforms/Starter/MathTransforms.hpp
++++ b/chapters/graphics-math-coordinate-transforms/Starter/MathTransforms.hpp
+@@ -4,7 +4,7 @@
+
+ #include <DirectXMath.h>
+
+-namespace ch01::graphics_math::starter
++namespace ch01::graphics_math::solution
+ {
+
+ [[nodiscard]] DirectX::XMFLOAT3 DegreesVectorToRadians(DirectX::XMFLOAT3 degrees) noexcept;
+@@ -32,4 +32,4 @@ namespace ch01::graphics_math::starter
+ [[nodiscard]] DirectX::XMMATRIX BuildNormalMatrix(DirectX::XMMATRIX modelMatrix) noexcept;
+ [[nodiscard]] DirectX::XMFLOAT4X4 StoreMatrix(DirectX::XMMATRIX matrix) noexcept;
+
+-} // namespace ch01::graphics_math::starter
++} // namespace ch01::graphics_math::solution
+diff --git a/chapters/graphics-math-coordinate-transforms/Starter/Scene.cpp b/chapters/graphics-math-coordinate-transforms/Starter/Scene.cpp
+--- a/chapters/graphics-math-coordinate-transforms/Starter/Scene.cpp
++++ b/chapters/graphics-math-coordinate-transforms/Starter/Scene.cpp
+@@ -10,7 +10,7 @@
+ #include <algorithm>
+ #include <string>
+
+-namespace ch01::graphics_math::starter
++namespace ch01::graphics_math::solution
+ {
+ namespace
+ {
+@@ -78,6 +78,7 @@ lgp::framework::Result<ChapterDerivedScene> BuildScene(ChapterControls const &co
+ {
+     ChapterControls sanitizedControls = controls;
+     sanitizedControls.selectedVertex = ClampVertexIndex(controls.selectedVertex);
++    sanitizedControls.scale = ClampScale(controls.scale);
+
+     CameraFrame const cameraFrame = BuildCameraFrame(sanitizedControls);
+     DirectX::XMMATRIX const viewMatrix = XMLoadFloat4x4(&cameraFrame.viewMatrix);
+@@ -108,19 +109,20 @@ lgp::framework::Result<ChapterDerivedScene> BuildScene(ChapterControls const &co
+
+     DirectX::XMMATRIX const modelMatrix =
+         ComposeModelMatrix(sanitizedControls.translation, sanitizedControls.scale, activeRotationMatrix);
+-    DirectX::XMMATRIX const comparisonModelMatrix = BuildComparisonModelMatrix(sanitizedControls);
+     DirectX::XMMATRIX const wrongOrderModelMatrix =
+         ComposeWrongOrderModelMatrix(sanitizedControls.translation, sanitizedControls.scale, activeRotationMatrix);
++    DirectX::XMMATRIX const comparisonModelMatrix = BuildComparisonModelMatrix(sanitizedControls);
+     DirectX::XMMATRIX const viewProjectionMatrix = viewMatrix * projectionMatrix;
+     DirectX::XMMATRIX const normalMatrix = BuildNormalMatrix(modelMatrix);
+     DirectX::XMMATRIX const incorrectNormalMatrix = BuildIncorrectNormalMatrix(modelMatrix);
+
+     ChapterDerivedScene scene{};
+     scene.capabilities = {
+-        true, true, true, true, true, true, true, true, false, true,
++        true, true, true, true, true, true, true, true, true, true,
+     };
+     scene.implementationNote =
+-        "Step 12: spherical quaternion interpolation now drives the Slerp orientation mode between two rotations.";
++        "Solution: full CPU-side transform chain, camera basis, projection modes, quaternion comparison, slerp, "
++        "normal inverse-transpose, frustum overlay, and perspective-divide diagnostics are active.";
+     scene.model = StoreMatrix(modelMatrix);
+     scene.comparisonModel = StoreMatrix(comparisonModelMatrix);
+     scene.wrongOrderModel = StoreMatrix(wrongOrderModelMatrix);
+@@ -191,4 +193,4 @@ lgp::framework::Result<ChapterDerivedScene> BuildScene(ChapterControls const &co
+     return scene;
+ }
+
+-} // namespace ch01::graphics_math::starter
++} // namespace ch01::graphics_math::solution
+diff --git a/chapters/graphics-math-coordinate-transforms/Starter/Scene.hpp b/chapters/graphics-math-coordinate-transforms/Starter/Scene.hpp
+--- a/chapters/graphics-math-coordinate-transforms/Starter/Scene.hpp
++++ b/chapters/graphics-math-coordinate-transforms/Starter/Scene.hpp
+@@ -4,11 +4,11 @@
+
+ #include <lgp/framework/error.hpp>
+
+-namespace ch01::graphics_math::starter
++namespace ch01::graphics_math::solution
+ {
+
+ [[nodiscard]] lgp::framework::Result<ChapterDerivedScene> BuildScene(ChapterControls const &controls,
+                                                                      lgp::framework::Extent2D viewport,
+                                                                      double elapsedSeconds);
+
+-} // namespace ch01::graphics_math::starter
++} // namespace ch01::graphics_math::solution

@@ -1,0 +1,1000 @@
+diff --git a/chapters/shadow-map-fundamentals-and-bias/CMakeLists.txt b/chapters/shadow-map-fundamentals-and-bias/CMakeLists.txt
+index aae468a..2e06b5b 100644
+--- a/chapters/shadow-map-fundamentals-and-bias/CMakeLists.txt
++++ b/chapters/shadow-map-fundamentals-and-bias/CMakeLists.txt
+@@ -40,20 +40,27 @@ if(CMAKE_CXX_COMPILER MATCHES "clang-cl")
+ elseif(MSVC)
+     set_source_files_properties("${LGP_CH07_IMGUI_DX12_BACKEND}" PROPERTIES COMPILE_FLAGS "/wd4189")
+ endif()
+-set(LGP_CH07_STARTER_STAGE 0)
++set(LGP_CH07_STARTER_STAGE 3)
+ set_source_files_properties(
+     "${CMAKE_CURRENT_SOURCE_DIR}/Starter/DirectionalBaseline.hlsl"
+     "${CMAKE_CURRENT_SOURCE_DIR}/Solution/DirectionalBaseline.hlsl"
+     PROPERTIES HEADER_FILE_ONLY TRUE)
+
+-add_library(ch07_shadows_starter_logic STATIC ${LGP_CH07_STARTER_SOURCES})
++add_library(ch07_shadows_starter_logic STATIC ${LGP_CH07_STARTER_SOURCES} "${LGP_CH07_IMGUI_DX12_BACKEND}")
+ target_link_libraries(
+     ch07_shadows_starter_logic
+     PUBLIC
++        DearImGui::DearImGui
+         LGP::Ch07ShadowContracts
+         LGP::Framework
+         Microsoft::DirectXMath)
+-target_include_directories(ch07_shadows_starter_logic PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}")
++target_include_directories(
++    ch07_shadows_starter_logic
++    PUBLIC
++        "${CMAKE_CURRENT_SOURCE_DIR}"
++        "${LGP_CH07_IMGUI_ROOT}"
++        "${LGP_CH07_IMGUI_ROOT}/backends")
++target_compile_definitions(ch07_shadows_starter_logic PRIVATE IMGUI_IMPL_WIN32_DISABLE_GAMEPAD)
+
+ add_library(ch07_shadows_solution_logic STATIC ${LGP_CH07_SOLUTION_SOURCES} "${LGP_CH07_IMGUI_DX12_BACKEND}")
+ target_link_libraries(
+diff --git a/chapters/shadow-map-fundamentals-and-bias/Starter/DirectionalBaseline.hlsl b/chapters/shadow-map-fundamentals-and-bias/Starter/DirectionalBaseline.hlsl
+index 3bc406b..0918b9b 100644
+--- a/chapters/shadow-map-fundamentals-and-bias/Starter/DirectionalBaseline.hlsl
++++ b/chapters/shadow-map-fundamentals-and-bias/Starter/DirectionalBaseline.hlsl
+@@ -6,20 +6,27 @@ struct LightingConstants
+     float exposure;
+     float3 directionToLight;
+     float intensity;
++    float receiverDepthBias;
++    float receiverNormalOffsetWorld;
++    float configuredConstantBiasEstimateDepth;
++    float configuredSlopeBias;
++    float configuredBiasClamp;
++    uint visualization;
+ };
+
+ struct ObjectConstants
+ {
+     row_major float4x4 world;
+-    float3 baseColor;
+-    float roughness;
+-    float metalness;
++    uint objectId;
+ };
+
+ ConstantBuffer<LightingConstants> lighting : register(b0);
+ ConstantBuffer<ObjectConstants> objectData : register(b1);
+ Texture2D<float4> hdrInput : register(t0);
++Texture2D<float> shadowMap : register(t1);
+ SamplerState linearClampSampler : register(s0);
++SamplerComparisonState shadowComparisonSampler : register(s1);
++SamplerState shadowPointSampler : register(s2);
+
+ struct MeshVertex
+ {
+@@ -27,6 +34,11 @@ struct MeshVertex
+     float3 normal : NORMAL;
+ };
+
++struct LightVertex
++{
++    float4 position : SV_Position;
++};
++
+ struct LitVertex
+ {
+     float4 position : SV_Position;
+@@ -43,27 +55,12 @@ struct FullscreenVertex
+ static const float Pi = 3.14159265358979323846;
+ static const float MinimumRoughness = 0.045;
+
+-struct ShadowCoordinate
+-{
+-    float4 clip;
+-    float3 ndc;
+-    float2 uv;
+-    float depth;
+-};
+-
+-ShadowCoordinate BuildShadowCoordinate(float3 worldPosition, row_major float4x4 worldToShadow)
++LightVertex ShadowVS(MeshVertex input)
+ {
+-    ShadowCoordinate result;
+-    result.clip = mul(float4(worldPosition, 1.0), worldToShadow);
+-    result.ndc = result.clip.xyz / result.clip.w;
+-    result.uv = float2((result.ndc.x * 0.5) + 0.5, 0.5 - (result.ndc.y * 0.5));
+-    result.depth = result.ndc.z;
+-    return result;
+-}
+-
+-float BinaryVisibility(bool occluded)
+-{
+-    return occluded ? 0.0 : 1.0;
++    LightVertex output;
++    float4 worldPosition = mul(float4(input.position, 1.0), objectData.world);
++    output.position = mul(worldPosition, lighting.lightViewProjection);
++    return output;
+ }
+
+ LitVertex LightingVS(MeshVertex input)
+@@ -109,35 +106,40 @@ float SmithG1(float nDotDirection, float roughness)
+     return (2.0 * cosine) / max(cosine + root, 1.0e-7);
+ }
+
++bool IsInShadowFrustum(float3 shadowNdc)
++{
++    return shadowNdc.x >= -1.0 && shadowNdc.x <= 1.0 &&
++           shadowNdc.y >= -1.0 && shadowNdc.y <= 1.0 &&
++           shadowNdc.z >= 0.0 && shadowNdc.z <= 1.0;
++}
++
++void ObjectMaterial(out float3 baseColor, out float roughness, out float metalness)
++{
++    static const float3 colors[] = {
++        float3(0.0, 0.0, 0.0), float3(0.32, 0.34, 0.38), float3(0.72, 0.12, 0.055),
++        float3(0.95, 0.64, 0.18), float3(0.08, 0.32, 0.82), float3(0.16, 0.68, 0.24),
++        float3(0.62, 0.18, 0.72), float3(0.72, 0.65, 0.18), float3(0.08, 0.62, 0.68)};
++    static const float roughnesses[] = {1.0, 0.72, 0.38, 0.22, 0.68, 0.5, 0.58, 0.84, 0.42};
++    uint id = min(objectData.objectId, 8U);
++    baseColor = colors[id];
++    roughness = roughnesses[id];
++    metalness = id == 3U ? 1.0 : 0.0;
++}
++
+ float4 LightingPS(LitVertex input) : SV_Target
+ {
+     float3 normal = normalize(input.worldNormal);
+-    float3 viewDirection = normalize(lighting.cameraPosition - input.worldPosition);
++    float3 baseColor;
++    float roughness;
++    float metalness;
++    ObjectMaterial(baseColor, roughness, metalness);
+     float3 lightDirection = normalize(lighting.directionToLight);
+-    float nDotL = saturate(dot(normal, lightDirection));
+-    float nDotV = saturate(dot(normal, viewDirection));
+-    float3 halfVector = normalize(viewDirection + lightDirection);
+-    float nDotH = saturate(dot(normal, halfVector));
+-    float vDotH = saturate(dot(viewDirection, halfVector));
+-    float3 f0 = lerp(float3(0.04, 0.04, 0.04), objectData.baseColor, objectData.metalness);
+-    float3 fresnel = SchlickFresnel(f0, vDotH);
+-    float distribution = GgxDistribution(nDotH, objectData.roughness);
+-    float geometry = SmithG1(nDotV, objectData.roughness) * SmithG1(nDotL, objectData.roughness);
+-    float denominator = max(4.0 * nDotV * nDotL, 1.0e-6);
+-    float3 specularBrdf = nDotL > 0.0 && nDotV > 0.0
+-        ? fresnel * distribution * geometry / denominator
+-        : 0.0;
+-    float3 diffuseWeight =
+-        (1.0 - SchlickFresnel(f0, nDotV)) * (1.0 - SchlickFresnel(f0, nDotL)) * (1.0 - objectData.metalness);
+-    float3 diffuseBrdf = diffuseWeight * objectData.baseColor / Pi;
+-    float3 irradiance = lighting.intensity * nDotL;
+-    ShadowCoordinate shadow = BuildShadowCoordinate(input.worldPosition, lighting.lightViewProjection);
+-    bool inFrustum = shadow.ndc.x >= -1.0 && shadow.ndc.x <= 1.0 &&
+-                     shadow.ndc.y >= -1.0 && shadow.ndc.y <= 1.0 &&
+-                     shadow.depth >= 0.0 && shadow.depth <= 1.0;
+-    float visibility = BinaryVisibility(false);
+-    float projectionCheckpoint = inFrustum ? 1.0 : 0.999;
+-    return float4(projectionCheckpoint * visibility * irradiance * (diffuseBrdf + specularBrdf), 1.0);
++    float4 shadowClip = mul(float4(input.worldPosition, 1.0), lighting.lightViewProjection);
++    float3 shadowNdc = shadowClip.xyz / shadowClip.w;
++    float2 shadowUv = float2((shadowNdc.x * 0.5) + 0.5, 0.5 - (shadowNdc.y * 0.5));
++    bool inFrustum = IsInShadowFrustum(shadowNdc);
++    float storedDepth = inFrustum ? shadowMap.SampleLevel(shadowPointSampler, shadowUv, 0.0) : 1.0;
++    return float4(storedDepth.xxx, 1.0);
+ }
+
+ FullscreenVertex FullscreenVS(uint vertexId : SV_VertexID)
+@@ -164,6 +166,7 @@ float SrgbEncode(float value)
+ float4 DisplayPS(FullscreenVertex input) : SV_Target
+ {
+     float3 hdr = hdrInput.SampleLevel(linearClampSampler, input.uv, 0.0).rgb;
+-    float3 mapped = AcesFit(max(hdr * exp2(lighting.exposure), 0.0));
+-    return float4(saturate(float3(SrgbEncode(mapped.r), SrgbEncode(mapped.g), SrgbEncode(mapped.b))), 1.0);
++    float3 displayLinear = saturate(hdr);
++    return float4(saturate(float3(SrgbEncode(displayLinear.r), SrgbEncode(displayLinear.g),
++                                  SrgbEncode(displayLinear.b))), 1.0);
+ }
+diff --git a/chapters/shadow-map-fundamentals-and-bias/Starter/Renderer.cpp b/chapters/shadow-map-fundamentals-and-bias/Starter/Renderer.cpp
+index dd95d8b..1e238be 100644
+--- a/chapters/shadow-map-fundamentals-and-bias/Starter/Renderer.cpp
++++ b/chapters/shadow-map-fundamentals-and-bias/Starter/Renderer.cpp
+@@ -14,6 +14,8 @@
+
+ #include <DirectXMath.h>
+ #include <d3d12.h>
++#include <imgui.h>
++#include <imgui_impl_dx12.h>
+
+ #include <algorithm>
+ #include <array>
+@@ -45,7 +47,7 @@ enum RootParameter : UINT
+ {
+     LightingRootConstants = 0U,
+     ObjectRootConstants = 1U,
+-    HdrTexture = 2U,
++    SceneTextures = 2U,
+ };
+
+ struct LightingConstants final
+@@ -56,14 +58,18 @@ struct LightingConstants final
+     float exposure{-4.0F};
+     DirectX::XMFLOAT3 directionToLight{};
+     float intensity{1200.0F};
++    float receiverDepthBias{0.00035F};
++    float receiverNormalOffsetWorld{0.02F};
++    float configuredConstantBiasEstimateDepth{};
++    float configuredSlopeBias{1.5F};
++    float configuredBiasClamp{0.01F};
++    std::uint32_t visualization{};
+ };
+
+ struct ObjectConstants final
+ {
+     DirectX::XMFLOAT4X4 world{};
+-    DirectX::XMFLOAT3 baseColor{};
+-    float roughness{};
+-    float metalness{};
++    std::uint32_t objectId{};
+ };
+
+ struct MeshBuffers final
+@@ -138,17 +144,20 @@ lgp::framework::TextureBarrierState constexpr kDepthWriteState{
+     return result;
+ }
+
+-[[nodiscard]] ObjectConstants MakeObject(DirectX::XMMATRIX const &world, DirectX::XMFLOAT3 baseColor, float roughness,
+-                                         float metalness) noexcept
++[[nodiscard]] ObjectConstants MakeObject(DirectX::XMMATRIX const &world, std::uint32_t objectId) noexcept
+ {
+     ObjectConstants object{};
+     DirectX::XMStoreFloat4x4(&object.world, world);
+-    object.baseColor = baseColor;
+-    object.roughness = roughness;
+-    object.metalness = metalness;
++    object.objectId = objectId;
+     return object;
+ }
+
++struct SceneObject final
++{
++    MeshBuffers const *mesh{};
++    ObjectConstants constants{};
++};
++
+ } // namespace
+
+ class Renderer::Impl final
+@@ -157,39 +166,62 @@ class Renderer::Impl final
+     lgp::framework::DeviceResources *deviceResources{};
+     lgp::framework::CompiledShader lightingVertexShader{};
+     lgp::framework::CompiledShader lightingPixelShader{};
++    lgp::framework::CompiledShader shadowVertexShader{};
+     lgp::framework::CompiledShader fullscreenVertexShader{};
+     lgp::framework::CompiledShader displayPixelShader{};
+     ComPtr<ID3D12RootSignature> rootSignature{};
+     ComPtr<ID3D12PipelineState> lightingPipeline{};
++    ComPtr<ID3D12PipelineState> shadowPipeline{};
+     ComPtr<ID3D12PipelineState> displayPipeline{};
+     MeshBuffers sphere{};
+     MeshBuffers plane{};
+     MeshBuffers box{};
+     lgp::framework::DescriptorHeap dsvHeap{};
+     lgp::framework::DescriptorAllocation depthView{};
++    lgp::framework::DescriptorAllocation shadowDepthView{};
+     lgp::framework::DescriptorAllocation hdrRtv{};
+-    lgp::framework::DescriptorAllocation hdrSrv{};
++    lgp::framework::DescriptorAllocation textureSrvs{};
++    lgp::framework::DescriptorAllocation imguiFontDescriptor{};
+     ComPtr<ID3D12Resource> depthTarget{};
+     ComPtr<ID3D12Resource> hdrTarget{};
++    ComPtr<ID3D12Resource> shadowTarget{};
+     LightingConstants lighting{};
+     DirectX::XMFLOAT3 lightDirection{-0.45F, 0.82F, -0.35F};
++    DirectX::XMFLOAT3 lightTarget{0.0F, 0.0F, 0.0F};
++    OrthographicExtents orthographicExtents{-10.0F, 10.0F, -8.0F, 8.0F};
++    DepthRange lightDepthRange{0.1F, 40.0F};
++    float lightDistance{18.0F};
++    std::uint32_t shadowResolution{1024U};
++    std::int32_t rasterConstantBias{};
++    float rasterSlopeBias{};
++    float rasterBiasClamp{};
++    bool shadowEnabled{true};
++    ShadowVisualization visualization{ShadowVisualization::ShadowDepth};
+     float orbitAzimuth{};
+     float orbitElevation{0.34F};
+     float orbitRadius{20.0F};
+     bool headless{};
++    bool interactiveControlsEnabled{};
++    bool imguiInitialized{};
++    bool imguiFrameBegun{};
+     std::optional<HeadlessTestConfiguration> headlessTest{};
+
+     [[nodiscard]] lgp::framework::Status Initialize(lgp::framework::ApplicationInitContext const &context);
+     [[nodiscard]] lgp::framework::Status CreateShaders();
+     [[nodiscard]] lgp::framework::Status CreateRootSignature();
+     [[nodiscard]] lgp::framework::Status CreatePipelineStates();
++    [[nodiscard]] lgp::framework::Status CreateShadowPipeline();
+     [[nodiscard]] lgp::framework::Status CreateMeshBuffers(GeometryMesh const &mesh, std::wstring_view name,
+                                                            MeshBuffers &buffers);
+     [[nodiscard]] lgp::framework::Status CreateSizeDependentTargets(lgp::framework::Extent2D size);
++    [[nodiscard]] lgp::framework::Status CreateShadowTarget();
++    [[nodiscard]] lgp::framework::Status InitializeImGui();
++    [[nodiscard]] lgp::framework::Status BuildUi(lgp::framework::UpdateContext const &context);
+     [[nodiscard]] lgp::framework::Status Update(lgp::framework::UpdateContext const &context);
+     [[nodiscard]] lgp::framework::Status Render(lgp::framework::FrameContext const &frameContext);
+     void DrawMesh(ID3D12GraphicsCommandList &commandList, MeshBuffers const &mesh,
+                   ObjectConstants const &object) const noexcept;
++    [[nodiscard]] std::array<SceneObject, 8U> SceneObjects() const noexcept;
+     void Shutdown() noexcept;
+ };
+
+@@ -225,6 +257,12 @@ lgp::framework::Status Renderer::Impl::CreateShaders()
+         return std::unexpected(std::move(lightingVs.error()));
+     }
+     lightingVertexShader = std::move(lightingVs.value());
++    auto shadowVs = compile(L"ShadowVS", L"vs_6_0");
++    if (!shadowVs)
++    {
++        return std::unexpected(std::move(shadowVs.error()));
++    }
++    shadowVertexShader = std::move(shadowVs.value());
+     auto lightingPs = compile(L"LightingPS", L"ps_6_0");
+     if (!lightingPs)
+     {
+@@ -259,27 +297,42 @@ lgp::framework::Status Renderer::Impl::CreateRootSignature()
+     parameters[ObjectRootConstants].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+     D3D12_DESCRIPTOR_RANGE range{};
+     range.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
+-    range.NumDescriptors = 1U;
++    range.NumDescriptors = 2U;
+     range.BaseShaderRegister = 0U;
+     range.OffsetInDescriptorsFromTableStart = D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND;
+-    parameters[HdrTexture].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+-    parameters[HdrTexture].DescriptorTable.NumDescriptorRanges = 1U;
+-    parameters[HdrTexture].DescriptorTable.pDescriptorRanges = &range;
+-    parameters[HdrTexture].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+-
+-    D3D12_STATIC_SAMPLER_DESC sampler{};
+-    sampler.Filter = D3D12_FILTER_MIN_MAG_MIP_LINEAR;
+-    sampler.AddressU = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
+-    sampler.AddressV = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
+-    sampler.AddressW = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
+-    sampler.ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+-    sampler.MaxLOD = D3D12_FLOAT32_MAX;
++    parameters[SceneTextures].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
++    parameters[SceneTextures].DescriptorTable.NumDescriptorRanges = 1U;
++    parameters[SceneTextures].DescriptorTable.pDescriptorRanges = &range;
++    parameters[SceneTextures].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
++
++    D3D12_STATIC_SAMPLER_DESC samplers[3]{};
++    samplers[0].Filter = D3D12_FILTER_MIN_MAG_MIP_LINEAR;
++    samplers[0].AddressU = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
++    samplers[0].AddressV = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
++    samplers[0].AddressW = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
++    samplers[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
++    samplers[0].MaxLOD = D3D12_FLOAT32_MAX;
++    samplers[1].Filter = D3D12_FILTER_COMPARISON_MIN_MAG_MIP_POINT;
++    samplers[1].AddressU = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
++    samplers[1].AddressV = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
++    samplers[1].AddressW = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
++    samplers[1].ComparisonFunc = D3D12_COMPARISON_FUNC_LESS_EQUAL;
++    samplers[1].ShaderRegister = 1U;
++    samplers[1].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
++    samplers[1].MaxLOD = D3D12_FLOAT32_MAX;
++    samplers[2].Filter = D3D12_FILTER_MIN_MAG_MIP_POINT;
++    samplers[2].AddressU = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
++    samplers[2].AddressV = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
++    samplers[2].AddressW = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
++    samplers[2].ShaderRegister = 2U;
++    samplers[2].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
++    samplers[2].MaxLOD = D3D12_FLOAT32_MAX;
+
+     D3D12_ROOT_SIGNATURE_DESC description{};
+     description.NumParameters = static_cast<UINT>(std::size(parameters));
+     description.pParameters = parameters;
+-    description.NumStaticSamplers = 1U;
+-    description.pStaticSamplers = &sampler;
++    description.NumStaticSamplers = static_cast<UINT>(std::size(samplers));
++    description.pStaticSamplers = samplers;
+     description.Flags = D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT |
+                         D3D12_ROOT_SIGNATURE_FLAG_DENY_HULL_SHADER_ROOT_ACCESS |
+                         D3D12_ROOT_SIGNATURE_FLAG_DENY_DOMAIN_SHADER_ROOT_ACCESS |
+@@ -367,6 +420,49 @@ lgp::framework::Status Renderer::Impl::CreatePipelineStates()
+     return {};
+ }
+
++lgp::framework::Status Renderer::Impl::CreateShadowPipeline()
++{
++    D3D12_BLEND_DESC blend{};
++    blend.RenderTarget[0].RenderTargetWriteMask = 0U;
++    D3D12_RASTERIZER_DESC rasterizer{};
++    rasterizer.FillMode = D3D12_FILL_MODE_SOLID;
++    rasterizer.CullMode = D3D12_CULL_MODE_NONE;
++    rasterizer.DepthBias = rasterConstantBias;
++    rasterizer.DepthBiasClamp = rasterBiasClamp;
++    rasterizer.SlopeScaledDepthBias = rasterSlopeBias;
++    rasterizer.DepthClipEnable = TRUE;
++    D3D12_DEPTH_STENCIL_DESC depth{};
++    depth.DepthEnable = TRUE;
++    depth.DepthWriteMask = D3D12_DEPTH_WRITE_MASK_ALL;
++    depth.DepthFunc = D3D12_COMPARISON_FUNC_LESS;
++    D3D12_INPUT_ELEMENT_DESC const inputLayout[]{
++        {"POSITION", 0U, DXGI_FORMAT_R32G32B32_FLOAT, 0U, 0U, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0U},
++        {"NORMAL", 0U, DXGI_FORMAT_R32G32B32_FLOAT, 0U, 12U, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0U},
++    };
++    D3D12_GRAPHICS_PIPELINE_STATE_DESC description{};
++    description.pRootSignature = rootSignature.Get();
++    description.VS = shadowVertexShader.Bytecode();
++    description.BlendState = blend;
++    description.SampleMask = UINT_MAX;
++    description.RasterizerState = rasterizer;
++    description.DepthStencilState = depth;
++    description.InputLayout = {inputLayout, static_cast<UINT>(std::size(inputLayout))};
++    description.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
++    description.NumRenderTargets = 0U;
++    description.DSVFormat = kDepthFormat;
++    description.SampleDesc.Count = 1U;
++    ComPtr<ID3D12PipelineState> pipeline;
++    HRESULT const result =
++        deviceResources->device()->CreateGraphicsPipelineState(&description, IID_PPV_ARGS(pipeline.GetAddressOf()));
++    if (FAILED(result))
++    {
++        return std::unexpected(lgp::framework::MakeHResultError("ID3D12Device::CreateGraphicsPipelineState", result,
++                                                                "Failed to create the shadow depth pipeline."));
++    }
++    shadowPipeline = std::move(pipeline);
++    return {};
++}
++
+ lgp::framework::Status Renderer::Impl::CreateMeshBuffers(GeometryMesh const &mesh, std::wstring_view name,
+                                                          MeshBuffers &buffers)
+ {
+@@ -447,7 +543,7 @@ lgp::framework::Status Renderer::Impl::CreateSizeDependentTargets(lgp::framework
+     srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+     srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+     srv.Texture2D.MipLevels = 1U;
+-    deviceResources->device()->CreateShaderResourceView(hdrTarget.Get(), &srv, hdrSrv.cpuHandle);
++    deviceResources->device()->CreateShaderResourceView(hdrTarget.Get(), &srv, textureSrvs.CpuHandle(0U));
+
+     D3D12_CLEAR_VALUE depthClear{};
+     depthClear.Format = kDepthFormat;
+@@ -469,6 +565,74 @@ lgp::framework::Status Renderer::Impl::CreateSizeDependentTargets(lgp::framework
+     return {};
+ }
+
++lgp::framework::Status Renderer::Impl::CreateShadowTarget()
++{
++    shadowTarget.Reset();
++    D3D12_HEAP_PROPERTIES heap{};
++    heap.Type = D3D12_HEAP_TYPE_DEFAULT;
++    D3D12_RESOURCE_DESC1 texture{};
++    texture.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
++    texture.Width = shadowResolution;
++    texture.Height = shadowResolution;
++    texture.DepthOrArraySize = 1U;
++    texture.MipLevels = 1U;
++    texture.Format = DXGI_FORMAT_R32_TYPELESS;
++    texture.SampleDesc.Count = 1U;
++    texture.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
++    texture.Flags = D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL;
++    D3D12_CLEAR_VALUE clear{};
++    clear.Format = DXGI_FORMAT_D32_FLOAT;
++    clear.DepthStencil.Depth = 1.0F;
++    HRESULT const result = deviceResources->device()->CreateCommittedResource3(
++        &heap, D3D12_HEAP_FLAG_NONE, &texture, D3D12_BARRIER_LAYOUT_SHADER_RESOURCE, &clear, nullptr, 0U, nullptr,
++        IID_PPV_ARGS(shadowTarget.ReleaseAndGetAddressOf()));
++    if (FAILED(result))
++    {
++        return std::unexpected(lgp::framework::MakeHResultError("ID3D12Device10::CreateCommittedResource3", result,
++                                                                "Failed to create the typeless shadow map."));
++    }
++    D3D12_DEPTH_STENCIL_VIEW_DESC dsv{};
++    dsv.Format = DXGI_FORMAT_D32_FLOAT;
++    dsv.ViewDimension = D3D12_DSV_DIMENSION_TEXTURE2D;
++    deviceResources->device()->CreateDepthStencilView(shadowTarget.Get(), &dsv, shadowDepthView.cpuHandle);
++    D3D12_SHADER_RESOURCE_VIEW_DESC srv{};
++    srv.Format = DXGI_FORMAT_R32_FLOAT;
++    srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
++    srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
++    srv.Texture2D.MipLevels = 1U;
++    deviceResources->device()->CreateShaderResourceView(shadowTarget.Get(), &srv, textureSrvs.CpuHandle(1U));
++    return {};
++}
++
++lgp::framework::Status Renderer::Impl::InitializeImGui()
++{
++    auto descriptorResult = deviceResources->shader_visible_cbv_srv_uav_heap().Allocate(1U);
++    if (!descriptorResult)
++    {
++        return std::unexpected(std::move(descriptorResult.error()));
++    }
++    imguiFontDescriptor = descriptorResult.value();
++    IMGUI_CHECKVERSION();
++    ImGui::CreateContext();
++    ImGui::StyleColorsDark();
++    ImGui::GetIO().BackendPlatformName = "LGP.ManualInput";
++    ImGui_ImplDX12_InitInfo info{};
++    info.Device = deviceResources->device();
++    info.CommandQueue = deviceResources->graphics_queue();
++    info.NumFramesInFlight = static_cast<int>(deviceResources->back_buffer_count());
++    info.RTVFormat = deviceResources->back_buffer_format();
++    info.DSVFormat = kDepthFormat;
++    info.SrvDescriptorHeap = deviceResources->shader_visible_cbv_srv_uav_heap().Get();
++    info.LegacySingleSrvCpuDescriptor = imguiFontDescriptor.cpuHandle;
++    info.LegacySingleSrvGpuDescriptor = imguiFontDescriptor.gpuHandle;
++    if (!ImGui_ImplDX12_Init(&info))
++    {
++        return std::unexpected(lgp::framework::MakeError("ImGui_ImplDX12_Init", "Failed to initialize the shadow UI."));
++    }
++    imguiInitialized = true;
++    return {};
++}
++
+ lgp::framework::Status Renderer::Impl::Initialize(lgp::framework::ApplicationInitContext const &context)
+ {
+     deviceResources = &context.deviceResources;
+@@ -481,30 +645,34 @@ lgp::framework::Status Renderer::Impl::Initialize(lgp::framework::ApplicationIni
+         return std::unexpected(lgp::framework::MakeError("GenerateGeometry", "Could not create chapter geometry."));
+     }
+     auto dsvResult = lgp::framework::CreateDescriptorHeap(*deviceResources->device(), D3D12_DESCRIPTOR_HEAP_TYPE_DSV,
+-                                                          1U, false, L"Ch07 depth descriptors");
++                                                          2U, false, L"Ch07 depth descriptors");
+     if (!dsvResult)
+     {
+         return std::unexpected(std::move(dsvResult.error()));
+     }
+     dsvHeap = std::move(dsvResult.value());
+-    auto depthAllocation = dsvHeap.Allocate(1U);
++    auto depthAllocation = dsvHeap.Allocate(2U);
+     if (!depthAllocation)
+     {
+         return std::unexpected(std::move(depthAllocation.error()));
+     }
+     depthView = depthAllocation.value();
++    shadowDepthView = depthView;
++    shadowDepthView.cpuHandle = depthView.CpuHandle(1U);
++    shadowDepthView.offset += 1U;
++    shadowDepthView.count = 1U;
+     auto rtvAllocation = deviceResources->rtv_heap().Allocate(1U);
+     if (!rtvAllocation)
+     {
+         return std::unexpected(std::move(rtvAllocation.error()));
+     }
+     hdrRtv = rtvAllocation.value();
+-    auto srvAllocation = deviceResources->shader_visible_cbv_srv_uav_heap().Allocate(1U);
++    auto srvAllocation = deviceResources->shader_visible_cbv_srv_uav_heap().Allocate(2U);
+     if (!srvAllocation)
+     {
+         return std::unexpected(std::move(srvAllocation.error()));
+     }
+-    hdrSrv = srvAllocation.value();
++    textureSrvs = srvAllocation.value();
+
+     if (auto status = CreateShaders(); !status)
+     {
+@@ -518,6 +686,10 @@ lgp::framework::Status Renderer::Impl::Initialize(lgp::framework::ApplicationIni
+     {
+         return status;
+     }
++    if (auto status = CreateShadowPipeline(); !status)
++    {
++        return status;
++    }
+     if (auto status = CreateMeshBuffers(*sphereResult, L"Ch07 sphere", sphere); !status)
+     {
+         return status;
+@@ -534,11 +706,101 @@ lgp::framework::Status Renderer::Impl::Initialize(lgp::framework::ApplicationIni
+     {
+         return status;
+     }
++    if (auto status = CreateShadowTarget(); !status)
++    {
++        return status;
++    }
++    if (interactiveControlsEnabled && !headless)
++    {
++        if (auto status = InitializeImGui(); !status)
++        {
++            return status;
++        }
++    }
++    return {};
++}
++
++lgp::framework::Status Renderer::Impl::BuildUi(lgp::framework::UpdateContext const &context)
++{
++    if (headless || !imguiInitialized)
++    {
++        return {};
++    }
++    ImGuiIO &io = ImGui::GetIO();
++    io.DisplaySize = {static_cast<float>(context.drawableSize.width), static_cast<float>(context.drawableSize.height)};
++    io.DeltaTime = static_cast<float>(std::max(context.deltaSeconds, 1.0 / 240.0));
++    io.AddMousePosEvent(static_cast<float>(context.input.mouse.x), static_cast<float>(context.input.mouse.y));
++    io.AddMouseButtonEvent(0, context.input.mouse.IsButtonDown(lgp::framework::MouseButton::Left));
++    io.AddMouseButtonEvent(1, context.input.mouse.IsButtonDown(lgp::framework::MouseButton::Right));
++    io.AddMouseWheelEvent(0.0F, context.input.mouse.wheelDelta);
++    ImGui_ImplDX12_NewFrame();
++    ImGui::NewFrame();
++    imguiFrameBegun = true;
++
++    ImGui::Begin("Directional hard-shadow map");
++    ImGui::Checkbox("Shadow enabled", &shadowEnabled);
++    int resolutionIndex = 2;
++    if (shadowResolution == 512U)
++    {
++        resolutionIndex = 0;
++    }
++    else if (shadowResolution == 1024U)
++    {
++        resolutionIndex = 1;
++    }
++    if (ImGui::Combo("Resolution", &resolutionIndex,
++                     "512 x 512\0"
++                     "1024 x 1024\0"
++                     "2048 x 2048\0"))
++    {
++        shadowResolution = std::array<std::uint32_t, 3U>{512U, 1024U, 2048U}[static_cast<std::size_t>(resolutionIndex)];
++    }
++    ImGui::SliderFloat3("Direction to light", &lightDirection.x, -1.0F, 1.0F);
++    ImGui::SliderFloat3("Light target (world m)", &lightTarget.x, -10.0F, 10.0F, "%.2f m");
++    ImGui::SliderFloat("Light distance (world m)", &lightDistance, 1.0F, 50.0F, "%.2f m");
++    ImGui::SliderFloat("Ortho left (light m)", &orthographicExtents.left, -30.0F, -0.1F, "%.2f");
++    ImGui::SliderFloat("Ortho right (light m)", &orthographicExtents.right, 0.1F, 30.0F, "%.2f");
++    ImGui::SliderFloat("Ortho bottom (light m)", &orthographicExtents.bottom, -30.0F, -0.1F, "%.2f");
++    ImGui::SliderFloat("Ortho top (light m)", &orthographicExtents.top, 0.1F, 30.0F, "%.2f");
++    ImGui::SliderFloat("Near plane (light m)", &lightDepthRange.nearPlane, 0.01F, 20.0F, "%.3f");
++    ImGui::SliderFloat("Far plane (light m)", &lightDepthRange.farPlane, 1.0F, 100.0F, "%.2f");
++    ImGui::SeparatorText("Hardware raster bias controls (shadow-map write)");
++    ImGui::SliderInt("DepthBias (integer units)", &rasterConstantBias, -10000, 10000);
++    ImGui::SliderFloat("SlopeScaledDepthBias", &rasterSlopeBias, -8.0F, 8.0F, "%.4f");
++    ImGui::SliderFloat("DepthBiasClamp", &rasterBiasClamp, -0.05F, 0.05F, "%.6f");
++    ImGui::TextWrapped("The configured-bias estimate view is educational, not a reconstruction of D32_FLOAT raster "
++                       "bias. It uses DepthBias * 2^-23 as a fixed upper-magnitude scale for normalized D32 values "
++                       "and a world-normal slope proxy; the hardware uses each shadow primitive's depth exponent and "
++                       "maximum raster depth slope, which the camera pass cannot recover.");
++    ImGui::SeparatorText("Receiver bias (camera-pass compare)");
++    ImGui::SliderFloat("Exact depth subtraction", &lighting.receiverDepthBias, -0.01F, 0.01F, "%.9f");
++    ImGui::SliderFloat("Normal offset (world m)", &lighting.receiverNormalOffsetWorld, -0.2F, 0.2F, "%.4f m");
++    ImGui::SliderFloat("Illuminance", &lighting.intensity, 0.0F, 10000.0F, "%.0f lux");
++    ImGui::SliderFloat("Exposure", &lighting.exposure, -10.0F, 4.0F, "%.2f EV");
++    int view = static_cast<int>(visualization);
++    ImGui::Combo(
++        "View", &view,
++        "Final\0Visibility\0Shadow depth (point texel)\0Receiver depth\0Stored minus receiver\0Configured bias "
++        "estimate (educational)\0Shadow UV\0Frustum coverage\0Normal-slope proxy\0Finite validation\0Object "
++        "ID\0Point-sample agreement\0");
++    visualization = static_cast<ShadowVisualization>(view);
++    ImGui::TextWrapped("Right-drag orbits the camera; the wheel dollies. The exact receiver comparison is "
++                       "receiverDepth - %.9g. Positive normal offset moves the receiver along its world normal.",
++                       lighting.receiverDepthBias);
++    ImGui::End();
+     return {};
+ }
+
+ lgp::framework::Status Renderer::Impl::Update(lgp::framework::UpdateContext const &context)
+ {
++    std::uint32_t const previousResolution = shadowResolution;
++    std::int32_t const previousConstantBias = rasterConstantBias;
++    float const previousSlopeBias = rasterSlopeBias;
++    float const previousBiasClamp = rasterBiasClamp;
++    if (auto status = BuildUi(context); !status)
++    {
++        return status;
++    }
+     if (!headless && context.input.mouse.IsButtonDown(lgp::framework::MouseButton::Right))
+     {
+         orbitAzimuth += static_cast<float>(context.input.mouse.deltaX) * 0.006F;
+@@ -563,25 +825,73 @@ lgp::framework::Status Renderer::Impl::Update(lgp::framework::UpdateContext cons
+                                                                  static_cast<float>(context.drawableSize.height);
+     DirectX::XMMATRIX const projection = DirectX::XMMatrixPerspectiveFovLH(0.78F, aspect, 0.1F, 100.0F);
+     DirectX::XMStoreFloat4x4(&lighting.viewProjection, view * projection);
+-    DirectX::XMFLOAT3 const normalizedLight = NormalizeDirection(lightDirection);
+-    DirectX::XMVECTOR const lightTarget = DirectX::XMVectorZero();
+-    DirectX::XMVECTOR const lightPosition = DirectX::XMVectorScale(DirectX::XMLoadFloat3(&normalizedLight), 18.0F);
+-    DirectX::XMVECTOR const lightUp = std::fabs(normalizedLight.y) > 0.98F
+-        ? DirectX::XMVectorSet(1.0F, 0.0F, 0.0F, 0.0F)
+-        : DirectX::XMVectorSet(0.0F, 1.0F, 0.0F, 0.0F);
+-    DirectX::XMMATRIX const lightView = DirectX::XMMatrixLookAtLH(lightPosition, lightTarget, lightUp);
+-    DirectX::XMMATRIX const lightProjection =
+-        DirectX::XMMatrixOrthographicOffCenterLH(-10.0F, 10.0F, -8.0F, 8.0F, 0.1F, 40.0F);
+-    DirectX::XMStoreFloat4x4(&lighting.lightViewProjection, lightView * lightProjection);
+     lighting.cameraPosition = cameraPosition;
+     lighting.directionToLight = NormalizeDirection(lightDirection);
+-    lighting.intensity = 1200.0F;
+     if (headlessTest)
+     {
+-        lighting.directionToLight = NormalizeDirection(
+-            {headlessTest->directionToLight.x, headlessTest->directionToLight.y, headlessTest->directionToLight.z});
+-        lighting.intensity = headlessTest->illuminanceLux;
+-        lighting.exposure = headlessTest->exposure;
++        HeadlessTestConfiguration const &test = *headlessTest;
++        lighting.directionToLight =
++            NormalizeDirection({test.directionToLight.x, test.directionToLight.y, test.directionToLight.z});
++        lighting.intensity = std::max(test.illuminanceLux, 0.0F);
++        lighting.exposure = test.exposure;
++        shadowResolution = std::clamp(test.shadowResolution, 128U, 4096U);
++        orthographicExtents = test.orthographicExtents;
++        lightTarget = {test.lightTarget.x, test.lightTarget.y, test.lightTarget.z};
++        lightDistance = std::max(test.lightDistance, 0.01F);
++        lightDepthRange = test.depthRange;
++        rasterConstantBias = test.rasterConstantBias;
++        rasterSlopeBias = test.rasterSlopeBias;
++        rasterBiasClamp = test.rasterBiasClamp;
++        lighting.receiverDepthBias = test.receiverDepthBias;
++        lighting.receiverNormalOffsetWorld = test.receiverNormalOffsetWorld;
++        shadowEnabled = test.shadowEnabled;
++        visualization = test.visualization;
++    }
++    lightDepthRange.nearPlane = std::max(lightDepthRange.nearPlane, 0.001F);
++    lightDepthRange.farPlane = std::max(lightDepthRange.farPlane, lightDepthRange.nearPlane + 0.001F);
++    orthographicExtents.right = std::max(orthographicExtents.right, orthographicExtents.left + 0.001F);
++    orthographicExtents.top = std::max(orthographicExtents.top, orthographicExtents.bottom + 0.001F);
++    DirectX::XMFLOAT3 const direction = lighting.directionToLight;
++    DirectX::XMVECTOR const lightTargetVector = DirectX::XMLoadFloat3(&lightTarget);
++    DirectX::XMVECTOR const directionVector = DirectX::XMLoadFloat3(&direction);
++    DirectX::XMVECTOR const lightPosition =
++        DirectX::XMVectorAdd(lightTargetVector, DirectX::XMVectorScale(directionVector, lightDistance));
++    DirectX::XMVECTOR up = std::fabs(direction.y) > 0.98F ? DirectX::XMVectorSet(1.0F, 0.0F, 0.0F, 0.0F)
++                                                          : DirectX::XMVectorSet(0.0F, 1.0F, 0.0F, 0.0F);
++    DirectX::XMMATRIX const lightView = DirectX::XMMatrixLookAtLH(lightPosition, lightTargetVector, up);
++    DirectX::XMMATRIX const lightProjection = DirectX::XMMatrixOrthographicOffCenterLH(
++        orthographicExtents.left, orthographicExtents.right, orthographicExtents.bottom, orthographicExtents.top,
++        lightDepthRange.nearPlane, lightDepthRange.farPlane);
++    DirectX::XMStoreFloat4x4(&lighting.lightViewProjection, lightView * lightProjection);
++    lighting.configuredConstantBiasEstimateDepth = static_cast<float>(rasterConstantBias) * std::exp2(-23.0F);
++    lighting.configuredSlopeBias = rasterSlopeBias;
++    lighting.configuredBiasClamp = rasterBiasClamp;
++    lighting.visualization =
++        static_cast<std::uint32_t>(visualization) | (shadowEnabled ? 0U : (std::uint32_t{1U} << 31U));
++
++    bool const recreateShadow = shadowResolution != previousResolution;
++    bool const recreatePipeline = rasterConstantBias != previousConstantBias || rasterSlopeBias != previousSlopeBias ||
++                                  rasterBiasClamp != previousBiasClamp;
++    if (recreateShadow || recreatePipeline)
++    {
++        if (auto status = deviceResources->WaitForGpuIdle(); !status)
++        {
++            return status;
++        }
++        if (recreateShadow)
++        {
++            if (auto status = CreateShadowTarget(); !status)
++            {
++                return status;
++            }
++        }
++        if (recreatePipeline)
++        {
++            if (auto status = CreateShadowPipeline(); !status)
++            {
++                return status;
++            }
++        }
+     }
+     return {};
+ }
+@@ -596,58 +906,76 @@ void Renderer::Impl::DrawMesh(ID3D12GraphicsCommandList &commandList, MeshBuffer
+     commandList.DrawIndexedInstanced(mesh.indexCount, 1U, 0U, 0, 0U);
+ }
+
++std::array<SceneObject, 8U> Renderer::Impl::SceneObjects() const noexcept
++{
++    return {{
++        {&plane, MakeObject(DirectX::XMMatrixIdentity(), 1U)},
++        {&box,
++         MakeObject(DirectX::XMMatrixScaling(2.2F, 1.5F, 2.0F) * DirectX::XMMatrixTranslation(-3.2F, 0.75F, 1.8F), 2U)},
++        {&sphere, MakeObject(DirectX::XMMatrixTranslation(-0.5F, 0.72F, 1.2F), 3U)},
++        {&sphere, MakeObject(DirectX::XMMatrixTranslation(2.1F, 0.72F, -1.1F), 4U)},
++        {&box,
++         MakeObject(DirectX::XMMatrixScaling(0.16F, 3.2F, 2.4F) * DirectX::XMMatrixTranslation(1.1F, 1.6F, 2.8F), 5U)},
++        {&box, MakeObject(DirectX::XMMatrixScaling(3.6F, 0.24F, 1.4F) * DirectX::XMMatrixRotationZ(0.42F) *
++                              DirectX::XMMatrixTranslation(-1.0F, 0.9F, -2.4F),
++                          6U)},
++        {&box, MakeObject(DirectX::XMMatrixScaling(2.8F, 0.12F, 2.2F) * DirectX::XMMatrixRotationX(0.16F) *
++                              DirectX::XMMatrixTranslation(3.4F, 0.34F, 3.7F),
++                          7U)},
++        {&box,
++         MakeObject(DirectX::XMMatrixScaling(1.0F, 1.6F, 1.0F) * DirectX::XMMatrixTranslation(7.7F, 0.8F, 0.4F), 8U)},
++    }};
++}
++
+ lgp::framework::Status Renderer::Impl::Render(lgp::framework::FrameContext const &frameContext)
+ {
+     if (frameContext.commandList == nullptr || frameContext.renderTarget == nullptr || hdrTarget == nullptr ||
+-        depthTarget == nullptr)
++        depthTarget == nullptr || shadowTarget == nullptr)
+     {
++        if (imguiFrameBegun)
++        {
++            ImGui::EndFrame();
++            imguiFrameBegun = false;
++        }
+         return {};
+     }
+     ID3D12GraphicsCommandList7 &commandList = *frameContext.commandList;
+-    commandList.RSSetViewports(1U, &frameContext.viewport);
+-    commandList.RSSetScissorRects(1U, &frameContext.scissorRect);
++    ID3D12DescriptorHeap *const heaps[]{frameContext.shaderVisibleCbvSrvUavHeap};
++    commandList.SetDescriptorHeaps(1U, heaps);
+     commandList.IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+     commandList.SetGraphicsRootSignature(rootSignature.Get());
++    commandList.SetGraphicsRoot32BitConstants(LightingRootConstants, sizeof(LightingConstants) / sizeof(std::uint32_t),
++                                              &lighting, 0U);
++    std::array<SceneObject, 8U> const objects = SceneObjects();
++
++    lgp::framework::TransitionTexture(commandList, *shadowTarget.Get(), kShaderResourceState, kDepthWriteState);
++    D3D12_VIEWPORT const shadowViewport{
++        0.0F, 0.0F, static_cast<float>(shadowResolution), static_cast<float>(shadowResolution), 0.0F, 1.0F};
++    D3D12_RECT const shadowScissor{0, 0, static_cast<LONG>(shadowResolution), static_cast<LONG>(shadowResolution)};
++    commandList.RSSetViewports(1U, &shadowViewport);
++    commandList.RSSetScissorRects(1U, &shadowScissor);
++    commandList.OMSetRenderTargets(0U, nullptr, FALSE, &shadowDepthView.cpuHandle);
++    commandList.ClearDepthStencilView(shadowDepthView.cpuHandle, D3D12_CLEAR_FLAG_DEPTH, 1.0F, 0U, 0U, nullptr);
++    commandList.SetPipelineState(shadowPipeline.Get());
++    for (SceneObject const &object : objects)
++    {
++        DrawMesh(commandList, *object.mesh, object.constants);
++    }
++    lgp::framework::TransitionTexture(commandList, *shadowTarget.Get(), kDepthWriteState, kShaderResourceState);
+
++    commandList.RSSetViewports(1U, &frameContext.viewport);
++    commandList.RSSetScissorRects(1U, &frameContext.scissorRect);
+     lgp::framework::TransitionTexture(commandList, *hdrTarget.Get(), kShaderResourceState, kRenderTargetState);
+     float const hdrClear[]{0.012F, 0.018F, 0.028F, 1.0F};
+     commandList.OMSetRenderTargets(1U, &hdrRtv.cpuHandle, FALSE, &depthView.cpuHandle);
+     commandList.ClearRenderTargetView(hdrRtv.cpuHandle, hdrClear, 0U, nullptr);
+     commandList.ClearDepthStencilView(depthView.cpuHandle, D3D12_CLEAR_FLAG_DEPTH, 1.0F, 0U, 0U, nullptr);
+     commandList.SetPipelineState(lightingPipeline.Get());
+-    commandList.SetGraphicsRoot32BitConstants(LightingRootConstants, sizeof(LightingConstants) / sizeof(std::uint32_t),
+-                                              &lighting, 0U);
+-
+-    ObjectConstants object = MakeObject(DirectX::XMMatrixIdentity(), {0.32F, 0.34F, 0.38F}, 0.72F, 0.0F);
+-    DrawMesh(commandList, plane, object);
+-
+-    object = MakeObject(DirectX::XMMatrixScaling(2.2F, 1.5F, 2.0F) * DirectX::XMMatrixTranslation(-3.2F, 0.75F, 1.8F),
+-                        {0.72F, 0.12F, 0.055F}, 0.38F, 0.0F);
+-    DrawMesh(commandList, box, object);
+-
+-    object = MakeObject(DirectX::XMMatrixTranslation(-0.5F, 0.72F, 1.2F), {0.95F, 0.64F, 0.18F}, 0.22F, 1.0F);
+-    DrawMesh(commandList, sphere, object);
+-
+-    object = MakeObject(DirectX::XMMatrixTranslation(2.1F, 0.72F, -1.1F), {0.08F, 0.32F, 0.82F}, 0.68F, 0.0F);
+-    DrawMesh(commandList, sphere, object);
+-
+-    object = MakeObject(DirectX::XMMatrixScaling(0.16F, 3.2F, 2.4F) * DirectX::XMMatrixTranslation(1.1F, 1.6F, 2.8F),
+-                        {0.16F, 0.68F, 0.24F}, 0.5F, 0.0F);
+-    DrawMesh(commandList, box, object);
+-
+-    object = MakeObject(DirectX::XMMatrixScaling(3.6F, 0.24F, 1.4F) * DirectX::XMMatrixRotationZ(0.42F) *
+-                            DirectX::XMMatrixTranslation(-1.0F, 0.9F, -2.4F),
+-                        {0.62F, 0.18F, 0.72F}, 0.58F, 0.0F);
+-    DrawMesh(commandList, box, object);
+-
+-    object = MakeObject(DirectX::XMMatrixScaling(2.8F, 0.12F, 2.2F) * DirectX::XMMatrixRotationX(0.16F) *
+-                            DirectX::XMMatrixTranslation(3.4F, 0.34F, 3.7F),
+-                        {0.72F, 0.65F, 0.18F}, 0.84F, 0.0F);
+-    DrawMesh(commandList, box, object);
+-
+-    object = MakeObject(DirectX::XMMatrixScaling(1.0F, 1.6F, 1.0F) * DirectX::XMMatrixTranslation(7.7F, 0.8F, 0.4F),
+-                        {0.08F, 0.62F, 0.68F}, 0.42F, 0.0F);
+-    DrawMesh(commandList, box, object);
++    commandList.SetGraphicsRootDescriptorTable(SceneTextures, textureSrvs.gpuHandle);
++    for (SceneObject const &object : objects)
++    {
++        DrawMesh(commandList, *object.mesh, object.constants);
++    }
+
+     lgp::framework::TransitionTexture(commandList, *hdrTarget.Get(), kRenderTargetState, kShaderResourceState);
+
+@@ -656,13 +984,17 @@ lgp::framework::Status Renderer::Impl::Render(lgp::framework::FrameContext const
+     float const displayClear[]{0.0F, 0.0F, 0.0F, 1.0F};
+     commandList.OMSetRenderTargets(1U, &frameContext.renderTargetView, FALSE, nullptr);
+     commandList.ClearRenderTargetView(frameContext.renderTargetView, displayClear, 0U, nullptr);
+-    ID3D12DescriptorHeap *const heaps[]{frameContext.shaderVisibleCbvSrvUavHeap};
+-    commandList.SetDescriptorHeaps(1U, heaps);
+     commandList.SetPipelineState(displayPipeline.Get());
+     commandList.SetGraphicsRoot32BitConstants(LightingRootConstants, sizeof(LightingConstants) / sizeof(std::uint32_t),
+                                               &lighting, 0U);
+-    commandList.SetGraphicsRootDescriptorTable(HdrTexture, hdrSrv.gpuHandle);
++    commandList.SetGraphicsRootDescriptorTable(SceneTextures, textureSrvs.gpuHandle);
+     commandList.DrawInstanced(3U, 1U, 0U, 0U);
++    if (imguiFrameBegun)
++    {
++        ImGui::Render();
++        ImGui_ImplDX12_RenderDrawData(ImGui::GetDrawData(), &commandList);
++        imguiFrameBegun = false;
++    }
+     lgp::framework::TransitionTexture(commandList, *frameContext.renderTarget, kRenderTargetState,
+                                       FrameEndState(frameContext));
+     return {};
+@@ -670,8 +1002,24 @@ lgp::framework::Status Renderer::Impl::Render(lgp::framework::FrameContext const
+
+ void Renderer::Impl::Shutdown() noexcept
+ {
++    if (imguiFrameBegun)
++    {
++        ImGui::EndFrame();
++        imguiFrameBegun = false;
++    }
++    if (imguiInitialized)
++    {
++        ImGui_ImplDX12_Shutdown();
++        ImGui::DestroyContext();
++        imguiInitialized = false;
++    }
++    if (deviceResources != nullptr && imguiFontDescriptor)
++    {
++        deviceResources->shader_visible_cbv_srv_uav_heap().Free(imguiFontDescriptor);
++    }
+     depthTarget.Reset();
+     hdrTarget.Reset();
++    shadowTarget.Reset();
+     if (depthView)
+     {
+         dsvHeap.Free(depthView);
+@@ -680,19 +1028,22 @@ void Renderer::Impl::Shutdown() noexcept
+     {
+         deviceResources->rtv_heap().Free(hdrRtv);
+     }
+-    if (deviceResources != nullptr && hdrSrv)
++    if (deviceResources != nullptr && textureSrvs)
+     {
+-        deviceResources->shader_visible_cbv_srv_uav_heap().Free(hdrSrv);
++        deviceResources->shader_visible_cbv_srv_uav_heap().Free(textureSrvs);
+     }
+     depthView = {};
++    shadowDepthView = {};
+     hdrRtv = {};
+-    hdrSrv = {};
++    textureSrvs = {};
++    imguiFontDescriptor = {};
+     dsvHeap = {};
+     sphere = {};
+     plane = {};
+     box = {};
+     displayPipeline.Reset();
+     lightingPipeline.Reset();
++    shadowPipeline.Reset();
+     rootSignature.Reset();
+     deviceResources = nullptr;
+ }
+diff --git a/chapters/shadow-map-fundamentals-and-bias/Starter/Renderer.hpp b/chapters/shadow-map-fundamentals-and-bias/Starter/Renderer.hpp
+index 3ed7fba..ddbe5df 100644
+--- a/chapters/shadow-map-fundamentals-and-bias/Starter/Renderer.hpp
++++ b/chapters/shadow-map-fundamentals-and-bias/Starter/Renderer.hpp
+@@ -10,11 +10,39 @@
+ namespace ch07::shadows::starter
+ {
+
++enum class ShadowVisualization : std::uint32_t
++{
++    Final = 0U,
++    Visibility,
++    ShadowDepth,
++    ReceiverDepth,
++    StoredMinusReceiver,
++    ConfiguredBiasEstimate,
++    ShadowUv,
++    FrustumCoverage,
++    Slope,
++    FiniteValidation,
++    ObjectId,
++    PointSampleAgreement,
++};
++
+ struct HeadlessTestConfiguration final
+ {
+     Float3 directionToLight{-0.45F, 0.82F, -0.35F};
+     float illuminanceLux{1200.0F};
+     float exposure{-4.0F};
++    std::uint32_t shadowResolution{1024U};
++    OrthographicExtents orthographicExtents{-10.0F, 10.0F, -8.0F, 8.0F};
++    Float3 lightTarget{0.0F, 0.0F, 0.0F};
++    float lightDistance{18.0F};
++    DepthRange depthRange{0.1F, 40.0F};
++    std::int32_t rasterConstantBias{};
++    float rasterSlopeBias{};
++    float rasterBiasClamp{};
++    float receiverDepthBias{};
++    float receiverNormalOffsetWorld{};
++    bool shadowEnabled{true};
++    ShadowVisualization visualization{ShadowVisualization::ShadowDepth};
+ };
+
+ class Renderer final : public lgp::framework::IChapterRenderer

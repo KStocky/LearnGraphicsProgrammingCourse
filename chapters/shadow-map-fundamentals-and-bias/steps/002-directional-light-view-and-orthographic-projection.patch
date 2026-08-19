@@ -1,0 +1,138 @@
+diff --git a/chapters/shadow-map-fundamentals-and-bias/Starter/DirectionalBaseline.hlsl b/chapters/shadow-map-fundamentals-and-bias/Starter/DirectionalBaseline.hlsl
+index 1659be0..3bc406b 100644
+--- a/chapters/shadow-map-fundamentals-and-bias/Starter/DirectionalBaseline.hlsl
++++ b/chapters/shadow-map-fundamentals-and-bias/Starter/DirectionalBaseline.hlsl
+@@ -1,6 +1,7 @@
+ struct LightingConstants
+ {
+     row_major float4x4 viewProjection;
++    row_major float4x4 lightViewProjection;
+     float3 cameraPosition;
+     float exposure;
+     float3 directionToLight;
+@@ -10,13 +11,9 @@ struct LightingConstants
+ struct ObjectConstants
+ {
+     row_major float4x4 world;
+-    float4 normalColumn0;
+-    float4 normalColumn1;
+-    float4 normalColumn2;
+     float3 baseColor;
+     float roughness;
+     float metalness;
+-    float3 dielectricF0;
+ };
+
+ ConstantBuffer<LightingConstants> lighting : register(b0);
+@@ -75,9 +72,11 @@ LitVertex LightingVS(MeshVertex input)
+     float4 worldPosition = mul(float4(input.position, 1.0), objectData.world);
+     output.position = mul(worldPosition, lighting.viewProjection);
+     output.worldPosition = worldPosition.xyz;
+-    output.worldNormal = float3(dot(input.normal, objectData.normalColumn0.xyz),
+-                                dot(input.normal, objectData.normalColumn1.xyz),
+-                                dot(input.normal, objectData.normalColumn2.xyz));
++    float3 row0 = objectData.world[0].xyz;
++    float3 row1 = objectData.world[1].xyz;
++    float3 row2 = objectData.world[2].xyz;
++    float3x3 inverseTranspose = float3x3(cross(row1, row2), cross(row2, row0), cross(row0, row1));
++    output.worldNormal = mul(input.normal, inverseTranspose);
+     return output;
+ }
+
+@@ -120,7 +119,7 @@ float4 LightingPS(LitVertex input) : SV_Target
+     float3 halfVector = normalize(viewDirection + lightDirection);
+     float nDotH = saturate(dot(normal, halfVector));
+     float vDotH = saturate(dot(viewDirection, halfVector));
+-    float3 f0 = lerp(objectData.dielectricF0, objectData.baseColor, objectData.metalness);
++    float3 f0 = lerp(float3(0.04, 0.04, 0.04), objectData.baseColor, objectData.metalness);
+     float3 fresnel = SchlickFresnel(f0, vDotH);
+     float distribution = GgxDistribution(nDotH, objectData.roughness);
+     float geometry = SmithG1(nDotV, objectData.roughness) * SmithG1(nDotL, objectData.roughness);
+@@ -132,8 +131,13 @@ float4 LightingPS(LitVertex input) : SV_Target
+         (1.0 - SchlickFresnel(f0, nDotV)) * (1.0 - SchlickFresnel(f0, nDotL)) * (1.0 - objectData.metalness);
+     float3 diffuseBrdf = diffuseWeight * objectData.baseColor / Pi;
+     float3 irradiance = lighting.intensity * nDotL;
++    ShadowCoordinate shadow = BuildShadowCoordinate(input.worldPosition, lighting.lightViewProjection);
++    bool inFrustum = shadow.ndc.x >= -1.0 && shadow.ndc.x <= 1.0 &&
++                     shadow.ndc.y >= -1.0 && shadow.ndc.y <= 1.0 &&
++                     shadow.depth >= 0.0 && shadow.depth <= 1.0;
+     float visibility = BinaryVisibility(false);
+-    return float4(visibility * irradiance * (diffuseBrdf + specularBrdf), 1.0);
++    float projectionCheckpoint = inFrustum ? 1.0 : 0.999;
++    return float4(projectionCheckpoint * visibility * irradiance * (diffuseBrdf + specularBrdf), 1.0);
+ }
+
+ FullscreenVertex FullscreenVS(uint vertexId : SV_VertexID)
+diff --git a/chapters/shadow-map-fundamentals-and-bias/Starter/Renderer.cpp b/chapters/shadow-map-fundamentals-and-bias/Starter/Renderer.cpp
+index 7b0c051..dd95d8b 100644
+--- a/chapters/shadow-map-fundamentals-and-bias/Starter/Renderer.cpp
++++ b/chapters/shadow-map-fundamentals-and-bias/Starter/Renderer.cpp
+@@ -51,6 +51,7 @@ enum RootParameter : UINT
+ struct LightingConstants final
+ {
+     DirectX::XMFLOAT4X4 viewProjection{};
++    DirectX::XMFLOAT4X4 lightViewProjection{};
+     DirectX::XMFLOAT3 cameraPosition{};
+     float exposure{-4.0F};
+     DirectX::XMFLOAT3 directionToLight{};
+@@ -60,11 +61,9 @@ struct LightingConstants final
+ struct ObjectConstants final
+ {
+     DirectX::XMFLOAT4X4 world{};
+-    std::array<DirectX::XMFLOAT4, 3U> normalColumns{};
+     DirectX::XMFLOAT3 baseColor{};
+     float roughness{};
+     float metalness{};
+-    DirectX::XMFLOAT3 dielectricF0{0.04F, 0.04F, 0.04F};
+ };
+
+ struct MeshBuffers final
+@@ -103,6 +102,11 @@ lgp::framework::TextureBarrierState constexpr kShaderResourceState{
+     D3D12_BARRIER_ACCESS_SHADER_RESOURCE,
+     D3D12_BARRIER_LAYOUT_SHADER_RESOURCE,
+ };
++lgp::framework::TextureBarrierState constexpr kDepthWriteState{
++    D3D12_BARRIER_SYNC_DEPTH_STENCIL,
++    D3D12_BARRIER_ACCESS_DEPTH_STENCIL_WRITE,
++    D3D12_BARRIER_LAYOUT_DEPTH_STENCIL_WRITE,
++};
+
+ [[nodiscard]] lgp::framework::TextureBarrierState FrameStartState(
+     lgp::framework::FrameContext const &frameContext) noexcept
+@@ -139,19 +143,9 @@ lgp::framework::TextureBarrierState constexpr kShaderResourceState{
+ {
+     ObjectConstants object{};
+     DirectX::XMStoreFloat4x4(&object.world, world);
+-    DirectX::XMVECTOR determinant{};
+-    DirectX::XMMATRIX const normalWorld = DirectX::XMMatrixTranspose(DirectX::XMMatrixInverse(&determinant, world));
+-    DirectX::XMFLOAT4X4 normalMatrix{};
+-    DirectX::XMStoreFloat4x4(&normalMatrix, normalWorld);
+-    object.normalColumns = {
+-        DirectX::XMFLOAT4{normalMatrix._11, normalMatrix._21, normalMatrix._31, 0.0F},
+-        DirectX::XMFLOAT4{normalMatrix._12, normalMatrix._22, normalMatrix._32, 0.0F},
+-        DirectX::XMFLOAT4{normalMatrix._13, normalMatrix._23, normalMatrix._33, 0.0F},
+-    };
+     object.baseColor = baseColor;
+     object.roughness = roughness;
+     object.metalness = metalness;
+-    object.dielectricF0 = {0.04F, 0.04F, 0.04F};
+     return object;
+ }
+
+@@ -569,6 +563,16 @@ lgp::framework::Status Renderer::Impl::Update(lgp::framework::UpdateContext cons
+                                                                  static_cast<float>(context.drawableSize.height);
+     DirectX::XMMATRIX const projection = DirectX::XMMatrixPerspectiveFovLH(0.78F, aspect, 0.1F, 100.0F);
+     DirectX::XMStoreFloat4x4(&lighting.viewProjection, view * projection);
++    DirectX::XMFLOAT3 const normalizedLight = NormalizeDirection(lightDirection);
++    DirectX::XMVECTOR const lightTarget = DirectX::XMVectorZero();
++    DirectX::XMVECTOR const lightPosition = DirectX::XMVectorScale(DirectX::XMLoadFloat3(&normalizedLight), 18.0F);
++    DirectX::XMVECTOR const lightUp = std::fabs(normalizedLight.y) > 0.98F
++        ? DirectX::XMVectorSet(1.0F, 0.0F, 0.0F, 0.0F)
++        : DirectX::XMVectorSet(0.0F, 1.0F, 0.0F, 0.0F);
++    DirectX::XMMATRIX const lightView = DirectX::XMMatrixLookAtLH(lightPosition, lightTarget, lightUp);
++    DirectX::XMMATRIX const lightProjection =
++        DirectX::XMMatrixOrthographicOffCenterLH(-10.0F, 10.0F, -8.0F, 8.0F, 0.1F, 40.0F);
++    DirectX::XMStoreFloat4x4(&lighting.lightViewProjection, lightView * lightProjection);
+     lighting.cameraPosition = cameraPosition;
+     lighting.directionToLight = NormalizeDirection(lightDirection);
+     lighting.intensity = 1200.0F;

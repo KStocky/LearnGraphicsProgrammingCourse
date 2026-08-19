@@ -1,0 +1,276 @@
+diff --git a/chapters/radiometry-light-units-and-brdfs/CMakeLists.txt b/chapters/radiometry-light-units-and-brdfs/CMakeLists.txt
+index 7ef9f97..7c808a8 100644
+--- a/chapters/radiometry-light-units-and-brdfs/CMakeLists.txt
++++ b/chapters/radiometry-light-units-and-brdfs/CMakeLists.txt
+@@ -52,12 +52,24 @@ set_source_files_properties(
+     PROPERTIES
+         HEADER_FILE_ONLY TRUE)
+
+-add_library(ch05_lighting_starter_logic STATIC ${LGP_CH05_STARTER_SOURCES})
++add_library(
++    ch05_lighting_starter_logic
++    STATIC
++        ${LGP_CH05_STARTER_SOURCES}
++        "${LGP_CH05_IMGUI_DX12_BACKEND}")
+ target_link_libraries(
+     ch05_lighting_starter_logic
+     PUBLIC
++        DearImGui::DearImGui
+         LGP::Ch05LightingContracts
+         LGP::Framework)
++target_include_directories(
++    ch05_lighting_starter_logic
++    PUBLIC
++        "${CMAKE_CURRENT_SOURCE_DIR}"
++        "${LGP_CH05_IMGUI_ROOT}"
++        "${LGP_CH05_IMGUI_ROOT}/backends")
++target_compile_definitions(ch05_lighting_starter_logic PRIVATE IMGUI_IMPL_WIN32_DISABLE_GAMEPAD)
+ target_include_directories(ch05_lighting_starter_logic PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}")
+ set_target_properties(
+     ch05_lighting_starter_logic
+diff --git a/chapters/radiometry-light-units-and-brdfs/Starter/Main.cpp b/chapters/radiometry-light-units-and-brdfs/Starter/Main.cpp
+index cc638c5..3084b3d 100644
+--- a/chapters/radiometry-light-units-and-brdfs/Starter/Main.cpp
++++ b/chapters/radiometry-light-units-and-brdfs/Starter/Main.cpp
+@@ -4,10 +4,10 @@
+
+ int wmain(int argc, wchar_t **argv)
+ {
+-    ch05::lighting::starter::Renderer renderer{};
++    ch05::lighting::solution::Renderer renderer{};
+
+     lgp::framework::ApplicationConfiguration configuration{};
+-    configuration.title = L"Ch05 Radiometry and BRDFs Starter";
++    configuration.title = L"Ch05 Radiometry and BRDFs Solution";
+     configuration.width = 1600U;
+     configuration.height = 900U;
+
+diff --git a/chapters/radiometry-light-units-and-brdfs/Starter/Renderer.cpp b/chapters/radiometry-light-units-and-brdfs/Starter/Renderer.cpp
+index 519c5f7..0952301 100644
+--- a/chapters/radiometry-light-units-and-brdfs/Starter/Renderer.cpp
++++ b/chapters/radiometry-light-units-and-brdfs/Starter/Renderer.cpp
+@@ -10,6 +10,8 @@
+
+ #include "../Common/ChapterGeometry.hpp"
+
++#include <imgui.h>
++#include <imgui_impl_dx12.h>
+ #include <wrl/client.h>
+
+ #include <DirectXMath.h>
+@@ -31,7 +33,7 @@
+ #include <lgp/framework/descriptors.hpp>
+ #include <lgp/framework/shader_compiler.hpp>
+
+-namespace ch05::lighting::starter
++namespace ch05::lighting::solution
+ {
+ namespace
+ {
+@@ -201,6 +203,7 @@ class Renderer::Impl final
+     lgp::framework::DescriptorAllocation depthView{};
+     lgp::framework::DescriptorAllocation hdrRtv{};
+     lgp::framework::DescriptorAllocation hdrSrv{};
++    lgp::framework::DescriptorAllocation imguiFontDescriptor{};
+     ComPtr<ID3D12Resource> depthTarget{};
+     ComPtr<ID3D12Resource> hdrTarget{};
+     LightingConstants lighting{};
+@@ -216,6 +219,8 @@ class Renderer::Impl final
+     float orbitRadius{15.5F};
+     bool materialOverride{};
+     bool headless{};
++    bool imguiInitialized{};
++    bool imguiFrameBegun{};
+     std::optional<HeadlessTestConfiguration> headlessTest{};
+
+     [[nodiscard]] lgp::framework::Status Initialize(lgp::framework::ApplicationInitContext const &context);
+@@ -225,6 +230,7 @@ class Renderer::Impl final
+     [[nodiscard]] lgp::framework::Status CreateMeshBuffers(GeometryMesh const &mesh, std::wstring_view name,
+                                                            MeshBuffers &buffers);
+     [[nodiscard]] lgp::framework::Status CreateSizeDependentTargets(lgp::framework::Extent2D size);
++    [[nodiscard]] lgp::framework::Status InitializeImGui();
+     [[nodiscard]] lgp::framework::Status Update(lgp::framework::UpdateContext const &context);
+     [[nodiscard]] lgp::framework::Status BuildUi(lgp::framework::UpdateContext const &context);
+     [[nodiscard]] lgp::framework::Status Render(lgp::framework::FrameContext const &frameContext);
+@@ -514,6 +520,35 @@ lgp::framework::Status Renderer::Impl::CreateSizeDependentTargets(lgp::framework
+     return {};
+ }
+
++lgp::framework::Status Renderer::Impl::InitializeImGui()
++{
++    auto descriptorResult = deviceResources->shader_visible_cbv_srv_uav_heap().Allocate(1U);
++    if (!descriptorResult)
++    {
++        return std::unexpected(std::move(descriptorResult.error()));
++    }
++    imguiFontDescriptor = descriptorResult.value();
++    IMGUI_CHECKVERSION();
++    ImGui::CreateContext();
++    ImGui::StyleColorsDark();
++    ImGui::GetIO().BackendPlatformName = "LGP.ManualInput";
++    ImGui_ImplDX12_InitInfo info{};
++    info.Device = deviceResources->device();
++    info.CommandQueue = deviceResources->graphics_queue();
++    info.NumFramesInFlight = static_cast<int>(deviceResources->back_buffer_count());
++    info.RTVFormat = deviceResources->back_buffer_format();
++    info.DSVFormat = kDepthFormat;
++    info.SrvDescriptorHeap = deviceResources->shader_visible_cbv_srv_uav_heap().Get();
++    info.LegacySingleSrvCpuDescriptor = imguiFontDescriptor.cpuHandle;
++    info.LegacySingleSrvGpuDescriptor = imguiFontDescriptor.gpuHandle;
++    if (!ImGui_ImplDX12_Init(&info))
++    {
++        return std::unexpected(lgp::framework::MakeError("ImGui_ImplDX12_Init", "Failed to initialize the lab UI."));
++    }
++    imguiInitialized = true;
++    return {};
++}
++
+ lgp::framework::Status Renderer::Impl::Initialize(lgp::framework::ApplicationInitContext const &context)
+ {
+     deviceResources = &context.deviceResources;
+@@ -574,6 +609,10 @@ lgp::framework::Status Renderer::Impl::Initialize(lgp::framework::ApplicationIni
+     {
+         return status;
+     }
++    if (!headless)
++    {
++        return InitializeImGui();
++    }
+     return {};
+ }
+
+@@ -633,8 +672,53 @@ lgp::framework::Status Renderer::Impl::Update(lgp::framework::UpdateContext cons
+     return {};
+ }
+
+-lgp::framework::Status Renderer::Impl::BuildUi(lgp::framework::UpdateContext const &)
++lgp::framework::Status Renderer::Impl::BuildUi(lgp::framework::UpdateContext const &context)
+ {
++    if (headless || !imguiInitialized)
++    {
++        return {};
++    }
++    ImGuiIO &io = ImGui::GetIO();
++    io.DisplaySize = {static_cast<float>(context.drawableSize.width), static_cast<float>(context.drawableSize.height)};
++    io.DeltaTime = static_cast<float>(std::max(context.deltaSeconds, 1.0 / 240.0));
++    io.AddMousePosEvent(static_cast<float>(context.input.mouse.x), static_cast<float>(context.input.mouse.y));
++    io.AddMouseButtonEvent(0, context.input.mouse.IsButtonDown(lgp::framework::MouseButton::Left));
++    io.AddMouseButtonEvent(1, context.input.mouse.IsButtonDown(lgp::framework::MouseButton::Right));
++    io.AddMouseWheelEvent(0.0F, context.input.mouse.wheelDelta);
++    ImGui_ImplDX12_NewFrame();
++    ImGui::NewFrame();
++    imguiFrameBegun = true;
++
++    ImGui::Begin("Direct-light BRDF laboratory");
++    int light = static_cast<int>(lightType);
++    ImGui::Combo("Light type", &light, "Directional\0Point\0");
++    lightType = static_cast<LightType>(light);
++    if (lightType == LightType::Directional)
++    {
++        ImGui::SliderFloat("Normal illuminance", &directionalLux, 0.0F, 10000.0F, "%.0f lux");
++    }
++    else
++    {
++        ImGui::SliderFloat("Luminous intensity", &pointCandela, 0.0F, 20000.0F, "%.0f cd");
++        ImGui::SliderFloat("Light distance", &lightDistance, 2.0F, 15.0F, "%.2f m");
++    }
++    ImGui::SliderFloat3("Direction to light", &lightDirection.x, -1.0F, 1.0F);
++    ImGui::ColorEdit3("Light tint", &lighting.lightColor.x);
++    ImGui::SliderFloat("Exposure", &output.exposure, -10.0F, 4.0F, "%.2f EV");
++    int mode = static_cast<int>(visualization);
++    ImGui::Combo("Visualization", &mode,
++                 "Final shading\0Irradiance\0N dot L\0Diffuse\0Specular\0Fresnel\0GGX distribution\0Smith "
++                 "geometry\0Energy warning\0");
++    visualization = static_cast<Visualization>(mode);
++    ImGui::Separator();
++    ImGui::Checkbox("Override every material", &materialOverride);
++    ImGui::ColorEdit3("Override base color", &lighting.overrideBaseColor.x);
++    ImGui::SliderFloat("Override roughness", &lighting.overrideRoughness, 0.0F, 1.0F);
++    ImGui::SliderFloat("Override metalness", &lighting.overrideMetalness, 0.0F, 1.0F);
++    ImGui::Separator();
++    ImGui::TextWrapped("Columns increase roughness. Rows change metalness and base color. Drag with the right mouse "
++                       "button to orbit; use the wheel to dolly.");
++    ImGui::End();
+     return {};
+ }
+
+@@ -653,6 +737,11 @@ lgp::framework::Status Renderer::Impl::Render(lgp::framework::FrameContext const
+     if (frameContext.commandList == nullptr || frameContext.renderTarget == nullptr || hdrTarget == nullptr ||
+         depthTarget == nullptr)
+     {
++        if (imguiFrameBegun)
++        {
++            ImGui::EndFrame();
++            imguiFrameBegun = false;
++        }
+         return {};
+     }
+     ID3D12GraphicsCommandList7 &commandList = *frameContext.commandList;
+@@ -722,6 +811,12 @@ lgp::framework::Status Renderer::Impl::Render(lgp::framework::FrameContext const
+                                               &output, 0U);
+     commandList.SetGraphicsRootDescriptorTable(HdrTexture, hdrSrv.gpuHandle);
+     commandList.DrawInstanced(3U, 1U, 0U, 0U);
++    if (imguiFrameBegun)
++    {
++        ImGui::Render();
++        ImGui_ImplDX12_RenderDrawData(ImGui::GetDrawData(), &commandList);
++        imguiFrameBegun = false;
++    }
+     lgp::framework::TransitionTexture(commandList, *frameContext.renderTarget, kRenderTargetState,
+                                       FrameEndState(frameContext));
+     return {};
+@@ -729,6 +824,21 @@ lgp::framework::Status Renderer::Impl::Render(lgp::framework::FrameContext const
+
+ void Renderer::Impl::Shutdown() noexcept
+ {
++    if (imguiFrameBegun)
++    {
++        ImGui::EndFrame();
++        imguiFrameBegun = false;
++    }
++    if (imguiInitialized)
++    {
++        ImGui_ImplDX12_Shutdown();
++        ImGui::DestroyContext();
++        imguiInitialized = false;
++    }
++    if (deviceResources != nullptr && imguiFontDescriptor)
++    {
++        deviceResources->shader_visible_cbv_srv_uav_heap().Free(imguiFontDescriptor);
++    }
+     depthTarget.Reset();
+     hdrTarget.Reset();
+     if (depthView)
+@@ -746,6 +856,7 @@ void Renderer::Impl::Shutdown() noexcept
+     depthView = {};
+     hdrRtv = {};
+     hdrSrv = {};
++    imguiFontDescriptor = {};
+     dsvHeap = {};
+     sphere = {};
+     plane = {};
+@@ -795,4 +906,4 @@ void Renderer::ConfigureHeadlessTest(HeadlessTestConfiguration const &configurat
+     impl_->headlessTest = configuration;
+ }
+
+-} // namespace ch05::lighting::starter
++} // namespace ch05::lighting::solution
+diff --git a/chapters/radiometry-light-units-and-brdfs/Starter/Renderer.hpp b/chapters/radiometry-light-units-and-brdfs/Starter/Renderer.hpp
+index 0f78ce7..61d2781 100644
+--- a/chapters/radiometry-light-units-and-brdfs/Starter/Renderer.hpp
++++ b/chapters/radiometry-light-units-and-brdfs/Starter/Renderer.hpp
+@@ -7,7 +7,7 @@
+ #include <cstdint>
+ #include <memory>
+
+-namespace ch05::lighting::starter
++namespace ch05::lighting::solution
+ {
+
+ enum class HeadlessLightType : std::uint32_t
+@@ -61,4 +61,4 @@ class Renderer final : public lgp::framework::IChapterRenderer
+     std::unique_ptr<Impl> impl_;
+ };
+
+-} // namespace ch05::lighting::starter
++} // namespace ch05::lighting::solution

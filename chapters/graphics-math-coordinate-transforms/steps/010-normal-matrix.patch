@@ -1,0 +1,57 @@
+diff --git a/chapters/graphics-math-coordinate-transforms/Starter/DemoLogic.cpp b/chapters/graphics-math-coordinate-transforms/Starter/DemoLogic.cpp
+--- a/chapters/graphics-math-coordinate-transforms/Starter/DemoLogic.cpp
++++ b/chapters/graphics-math-coordinate-transforms/Starter/DemoLogic.cpp
+@@ -31,8 +31,8 @@ class StarterLogic final : public IChapterLogic
+         controls.showFrustum = false;
+         controls.showWrongOrder = true;
+         controls.showComparisonOrientation = false;
+-        controls.showNormalVectors = false;
+-        controls.demonstrateIncorrectNormal = false;
++        controls.showNormalVectors = true;
++        controls.demonstrateIncorrectNormal = true;
+         controls.omitPerspectiveDivide = true;
+     }
+
+diff --git a/chapters/graphics-math-coordinate-transforms/Starter/Scene.cpp b/chapters/graphics-math-coordinate-transforms/Starter/Scene.cpp
+--- a/chapters/graphics-math-coordinate-transforms/Starter/Scene.cpp
++++ b/chapters/graphics-math-coordinate-transforms/Starter/Scene.cpp
+@@ -93,15 +93,15 @@ lgp::framework::Result<ChapterDerivedScene> BuildScene(ChapterControls const &co
+     DirectX::XMMATRIX const wrongOrderModelMatrix =
+         ComposeWrongOrderModelMatrix(sanitizedControls.translation, sanitizedControls.scale, activeRotationMatrix);
+     DirectX::XMMATRIX const viewProjectionMatrix = viewMatrix * projectionMatrix;
+-    DirectX::XMMATRIX const normalMatrix = modelMatrix;
+-    DirectX::XMMATRIX const incorrectNormalMatrix = modelMatrix;
++    DirectX::XMMATRIX const normalMatrix = BuildNormalMatrix(modelMatrix);
++    DirectX::XMMATRIX const incorrectNormalMatrix = BuildIncorrectNormalMatrix(modelMatrix);
+
+     ChapterDerivedScene scene{};
+     scene.capabilities = {
+-        true, true, true, true, true, false, false, false, false, true,
++        true, true, true, true, true, true, false, false, false, true,
+     };
+-    scene.implementationNote =
+-        "Step 9: normalized-device coordinates now map into viewport pixels for the screen-space preview.";
++    scene.implementationNote = "Step 10: normals now use the inverse-transpose path so non-uniform scale can be "
++                               "compared against the incorrect transform.";
+     scene.model = StoreMatrix(modelMatrix);
+     scene.comparisonModel = StoreMatrix(comparisonModelMatrix);
+     scene.wrongOrderModel = StoreMatrix(wrongOrderModelMatrix);
+@@ -158,8 +158,16 @@ lgp::framework::Result<ChapterDerivedScene> BuildScene(ChapterControls const &co
+         scene.inspection.world.z,
+     };
+
+-    scene.correctNormalWorld = TransformDirection(kReferenceNormalObject, modelMatrix);
+-    scene.incorrectNormalWorld = scene.correctNormalWorld;
++    DirectX::XMFLOAT3 correctNormal = TransformDirection(kReferenceNormalObject, normalMatrix);
++    DirectX::XMFLOAT3 incorrectNormal = TransformDirection(kReferenceNormalObject, incorrectNormalMatrix);
++
++    DirectX::XMVECTOR const correctNormalVector =
++        XMVector3Normalize(XMVectorSet(correctNormal.x, correctNormal.y, correctNormal.z, 0.0F));
++    DirectX::XMVECTOR const incorrectNormalVector =
++        XMVector3Normalize(XMVectorSet(incorrectNormal.x, incorrectNormal.y, incorrectNormal.z, 0.0F));
++
++    XMStoreFloat3(&scene.correctNormalWorld, XMVectorScale(correctNormalVector, 1.25F));
++    XMStoreFloat3(&scene.incorrectNormalWorld, XMVectorScale(incorrectNormalVector, 1.25F));
+
+     return scene;
+ }

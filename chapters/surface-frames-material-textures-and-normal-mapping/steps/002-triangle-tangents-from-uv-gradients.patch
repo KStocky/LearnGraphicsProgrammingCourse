@@ -1,0 +1,37 @@
+diff --git a/chapters/surface-frames-material-textures-and-normal-mapping/Starter/SurfaceBaseline.hlsl b/chapters/surface-frames-material-textures-and-normal-mapping/Starter/SurfaceBaseline.hlsl
+index 06838c9..869916b 100644
+--- a/chapters/surface-frames-material-textures-and-normal-mapping/Starter/SurfaceBaseline.hlsl
++++ b/chapters/surface-frames-material-textures-and-normal-mapping/Starter/SurfaceBaseline.hlsl
+@@ -51,6 +51,7 @@ struct LitVertex
+     float3 worldPosition : POSITION;
+     float3 worldNormal : NORMAL;
+     float2 uv : TEXCOORD0;
++    float4 worldTangent : TANGENT;
+ };
+
+ struct FullscreenVertex
+@@ -70,6 +71,7 @@ LitVertex LightingVS(MeshVertex input)
+     output.worldPosition = worldPosition.xyz;
+     output.worldNormal = input.normal;
+     output.uv = input.uv * 8.0;
++    output.worldTangent = input.tangent;
+     return output;
+ }
+
+@@ -112,6 +114,7 @@ float3 SrgbToLinear(float3 encoded)
+ float4 LightingPS(LitVertex input) : SV_Target
+ {
+     float3 normal = normalize(input.worldNormal);
++    float3 tangent = normalize(input.worldTangent.xyz);
+     float checker = fmod(floor(input.uv.x) + floor(input.uv.y), 2.0);
+     float3 encodedBaseColor = lerp(float3(0.045, 0.28, 0.78), float3(0.78, 0.16, 0.055), checker);
+     float3 baseColor = SrgbToLinear(encodedBaseColor);
+@@ -134,7 +137,7 @@ float4 LightingPS(LitVertex input) : SV_Target
+         (1.0 - SchlickFresnel(f0, nDotV)) * (1.0 - SchlickFresnel(f0, nDotL)) * (1.0 - objectData.metalness);
+     float3 diffuseBrdf = diffuseWeight * baseColor / Pi;
+     float3 irradiance = lighting.lightColor * lighting.intensity * nDotL;
+-    return float4(irradiance * (diffuseBrdf + specularBrdf), 1.0);
++    return float4((tangent * 0.5) + 0.5, 1.0);
+ }
+
+ FullscreenVertex FullscreenVS(uint vertexId : SV_VertexID)

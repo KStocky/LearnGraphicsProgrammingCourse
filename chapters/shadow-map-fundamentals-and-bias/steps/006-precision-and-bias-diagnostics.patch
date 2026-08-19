@@ -1,0 +1,209 @@
+diff --git a/chapters/shadow-map-fundamentals-and-bias/CMakeLists.txt b/chapters/shadow-map-fundamentals-and-bias/CMakeLists.txt
+--- a/chapters/shadow-map-fundamentals-and-bias/CMakeLists.txt
++++ b/chapters/shadow-map-fundamentals-and-bias/CMakeLists.txt
+@@ -43,2 +43,2 @@
+-set(LGP_CH07_STARTER_STAGE 5)
++set(LGP_CH07_STARTER_STAGE 6)
+ set_source_files_properties(
+diff --git a/chapters/shadow-map-fundamentals-and-bias/Starter/DirectionalBaseline.hlsl b/chapters/shadow-map-fundamentals-and-bias/Starter/DirectionalBaseline.hlsl
+index fba30af..78e9921 100644
+--- a/chapters/shadow-map-fundamentals-and-bias/Starter/DirectionalBaseline.hlsl
++++ b/chapters/shadow-map-fundamentals-and-bias/Starter/DirectionalBaseline.hlsl
+@@ -106,6 +106,36 @@ float SmithG1(float nDotDirection, float roughness)
+     return (2.0 * cosine) / max(cosine + root, 1.0e-7);
+ }
+ 
++float RasterSlope(float3 normal, float3 lightDirection)
++{
++    float cosine = max(abs(dot(normal, lightDirection)), 1.0e-4);
++    return min(sqrt(max(1.0 - (cosine * cosine), 0.0)) / cosine, 1.0e4);
++}
++
++float ConfiguredBiasEstimate(float normalSlopeEstimate)
++{
++    float estimate =
++        lighting.configuredConstantBiasEstimateDepth + (lighting.configuredSlopeBias * normalSlopeEstimate);
++    if (lighting.configuredBiasClamp > 0.0)
++    {
++        estimate = min(estimate, lighting.configuredBiasClamp);
++    }
++    else if (lighting.configuredBiasClamp < 0.0)
++    {
++        estimate = max(estimate, lighting.configuredBiasClamp);
++    }
++    return estimate;
++}
++
++float3 ObjectIdColor(uint objectId)
++{
++    static const float3 colors[] = {
++        float3(0.72, 0.72, 0.72), float3(0.9, 0.2, 0.1), float3(1.0, 0.65, 0.1),
++        float3(0.1, 0.35, 1.0), float3(0.1, 0.85, 0.25), float3(0.75, 0.15, 0.9),
++        float3(0.85, 0.75, 0.1), float3(0.1, 0.8, 0.85)};
++    return objectId >= 1U && objectId <= 8U ? colors[objectId - 1U] : float3(1.0, 0.0, 1.0);
++}
++
+ bool IsInShadowFrustum(float3 shadowNdc)
+ {
+     return shadowNdc.x >= -1.0 && shadowNdc.x <= 1.0 &&
+@@ -128,6 +158,8 @@ void ObjectMaterial(out float3 baseColor, out float roughness, out float metalne
+ 
+ float4 LightingPS(LitVertex input) : SV_Target
+ {
++    uint view = lighting.visualization & 0x7fffffffU;
++    bool shadowsEnabled = (lighting.visualization & 0x80000000U) == 0U;
+     float3 normal = normalize(input.worldNormal);
+     float3 baseColor;
+     float roughness;
+@@ -136,13 +168,90 @@ float4 LightingPS(LitVertex input) : SV_Target
+     float3 lightDirection = normalize(lighting.directionToLight);
+     float3 offsetWorldPosition = input.worldPosition + (normal * lighting.receiverNormalOffsetWorld);
+     float4 shadowClip = mul(float4(offsetWorldPosition, 1.0), lighting.lightViewProjection);
+-    float3 shadowNdc = shadowClip.xyz / shadowClip.w;
++    bool finiteProjection = all(isfinite(shadowClip)) && abs(shadowClip.w) > 1.0e-7;
++    float3 shadowNdc = finiteProjection ? shadowClip.xyz / shadowClip.w : 0.0;
+     float2 shadowUv = float2((shadowNdc.x * 0.5) + 0.5, 0.5 - (shadowNdc.y * 0.5));
+-    bool inFrustum = IsInShadowFrustum(shadowNdc);
+-    float comparisonDepth = shadowNdc.z - lighting.receiverDepthBias;
+-    float visibility = !inFrustum
++    float receiverDepth = shadowNdc.z;
++    bool inFrustum = finiteProjection && IsInShadowFrustum(shadowNdc);
++    float comparisonDepth = receiverDepth - lighting.receiverDepthBias;
++    float storedDepth = inFrustum ? shadowMap.SampleLevel(shadowPointSampler, shadowUv, 0.0) : 1.0;
++    float visibility = (!shadowsEnabled || !inFrustum)
+         ? 1.0
+         : shadowMap.SampleCmpLevelZero(shadowComparisonSampler, shadowUv, comparisonDepth);
++    float normalSlopeEstimate = RasterSlope(normal, lightDirection);
++    float configuredBiasEstimate = ConfiguredBiasEstimate(normalSlopeEstimate);
++    float diagnosticVisibility =
++        (!shadowsEnabled || !inFrustum || comparisonDepth <= storedDepth) ? 1.0 : 0.0;
++    bool finiteValues = finiteProjection && all(isfinite(normal)) && all(isfinite(shadowUv)) &&
++                        isfinite(receiverDepth) && isfinite(storedDepth) && isfinite(normalSlopeEstimate) &&
++                        isfinite(configuredBiasEstimate);
++
++    if (view == 1U)
++    {
++        return float4(visibility.xxx, 1.0);
++    }
++    if (view == 2U)
++    {
++        return float4(storedDepth.xxx, 1.0);
++    }
++    if (view == 3U)
++    {
++        return float4(saturate(receiverDepth).xxx, 1.0);
++    }
++    if (view == 4U)
++    {
++        float encodedDifference = saturate(0.5 + ((storedDepth - comparisonDepth) * 80.0));
++        return float4(encodedDifference, 1.0 - abs((encodedDifference * 2.0) - 1.0), 1.0 - encodedDifference, 1.0);
++    }
++    if (view == 5U)
++    {
++        float encodedBias = saturate(0.5 + (configuredBiasEstimate * 40.0));
++        return float4(encodedBias, 1.0 - abs((encodedBias * 2.0) - 1.0), 1.0 - encodedBias, 1.0);
++    }
++    if (view == 6U)
++    {
++        return float4(saturate(shadowUv), 0.0, 1.0);
++    }
++    if (view == 7U)
++    {
++        return float4(inFrustum ? float3(0.1, 0.9, 0.2) : float3(0.9, 0.1, 0.1), 1.0);
++    }
++    if (view == 8U)
++    {
++        return float4(saturate(normalSlopeEstimate / 8.0).xxx, 1.0);
++    }
++    if (view == 9U)
++    {
++        return float4(finiteValues ? float3(0.1, 0.9, 0.2) : float3(1.0, 0.0, 1.0), 1.0);
++    }
++    if (view == 10U)
++    {
++        return float4(ObjectIdColor(objectData.objectId), 1.0);
++    }
++    if (view == 11U)
++    {
++        bool agrees = visibility == diagnosticVisibility;
++        return float4(agrees ? float3(0.1, 0.9, 0.2) : float3(0.9, 0.1, 0.1), 1.0);
++    }
++    if (view == 12U)
++    {
++        if (!inFrustum)
++        {
++            return float4(0.0, 0.0, 0.0, 1.0);
++        }
++        if (comparisonDepth == storedDepth)
++        {
++            return float4(0.1, 0.9, 0.2, 1.0);
++        }
++        return float4(comparisonDepth < storedDepth ? float3(0.1, 0.25, 0.95) : float3(0.95, 0.15, 0.1), 1.0);
++    }
++    if (view == 13U)
++    {
++        float2 worldTexelSize =
++            float2(lighting.configuredConstantBiasEstimateDepth, lighting.configuredSlopeBias);
++        return float4(saturate(worldTexelSize * 16.0), 0.0, 1.0);
++    }
++
+     float3 viewDirection = normalize(lighting.cameraPosition - input.worldPosition);
+     float nDotL = saturate(dot(normal, lightDirection));
+     float nDotV = saturate(dot(normal, viewDirection));
+@@ -187,8 +296,23 @@ float SrgbEncode(float value)
+ 
+ float4 DisplayPS(FullscreenVertex input) : SV_Target
+ {
++    uint view = lighting.visualization & 0x7fffffffU;
++    if (view == 14U)
++    {
++        static const float3 probePositions[] = {
++            float3(-1.0, 0.0, 0.5), float3(1.0, 0.0, 0.5), float3(0.0, -1.0, 0.5),
++            float3(0.0, 1.0, 0.5), float3(0.0, 0.0, 0.0), float3(0.0, 0.0, 1.0),
++            float3(-1.0001, 0.0, 0.5), float3(1.0001, 0.0, 0.5), float3(0.0, -1.0001, 0.5),
++            float3(0.0, 1.0001, 0.5), float3(0.0, 0.0, -0.0001), float3(0.0, 0.0, 1.0001)};
++        uint probeIndex = min((uint)(input.uv.x * 12.0), 11U);
++        bool inFrustum = IsInShadowFrustum(probePositions[probeIndex]);
++        float3 probeColor = inFrustum ? float3(0.1, 0.9, 0.2) : float3(0.9, 0.1, 0.1);
++        return float4(SrgbEncode(probeColor.r), SrgbEncode(probeColor.g), SrgbEncode(probeColor.b), 1.0);
++    }
+     float3 hdr = hdrInput.SampleLevel(linearClampSampler, input.uv, 0.0).rgb;
+-    float3 displayLinear = AcesFit(max(hdr * exp2(lighting.exposure), 0.0));
++    float3 displayLinear = view == 0U
++        ? AcesFit(max(hdr * exp2(lighting.exposure), 0.0))
++        : saturate(hdr);
+     return float4(saturate(float3(SrgbEncode(displayLinear.r), SrgbEncode(displayLinear.g),
+                                   SrgbEncode(displayLinear.b))), 1.0);
+ }
+diff --git a/chapters/shadow-map-fundamentals-and-bias/Starter/Renderer.cpp b/chapters/shadow-map-fundamentals-and-bias/Starter/Renderer.cpp
+index 3fdd6f8..461e078 100644
+--- a/chapters/shadow-map-fundamentals-and-bias/Starter/Renderer.cpp
++++ b/chapters/shadow-map-fundamentals-and-bias/Starter/Renderer.cpp
+@@ -855,6 +855,13 @@ lgp::framework::Status Renderer::Impl::Update(lgp::framework::UpdateContext cons
+     lighting.configuredConstantBiasEstimateDepth = static_cast<float>(rasterConstantBias) * std::exp2(-23.0F);
+     lighting.configuredSlopeBias = rasterSlopeBias;
+     lighting.configuredBiasClamp = rasterBiasClamp;
++    if (visualization == ShadowVisualization::WorldTexelSize)
++    {
++        lighting.configuredConstantBiasEstimateDepth =
++            (orthographicExtents.right - orthographicExtents.left) / static_cast<float>(shadowResolution);
++        lighting.configuredSlopeBias =
++            (orthographicExtents.top - orthographicExtents.bottom) / static_cast<float>(shadowResolution);
++    }
+     lighting.visualization =
+         static_cast<std::uint32_t>(visualization) | (shadowEnabled ? 0U : (std::uint32_t{1U} << 31U));
+ 
+diff --git a/chapters/shadow-map-fundamentals-and-bias/Starter/Renderer.hpp b/chapters/shadow-map-fundamentals-and-bias/Starter/Renderer.hpp
+index 89fa1f0..b9fe5e3 100644
+--- a/chapters/shadow-map-fundamentals-and-bias/Starter/Renderer.hpp
++++ b/chapters/shadow-map-fundamentals-and-bias/Starter/Renderer.hpp
+@@ -24,6 +24,9 @@ enum class ShadowVisualization : std::uint32_t
+     FiniteValidation,
+     ObjectId,
+     PointSampleAgreement,
++    ComparisonRelation,
++    WorldTexelSize,
++    FrustumBoundaryProbe,
+ };
+ 
+ struct HeadlessTestConfiguration final

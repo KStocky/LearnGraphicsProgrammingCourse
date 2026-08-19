@@ -1,0 +1,32 @@
+diff --git a/chapters/graphics-math-coordinate-transforms/Starter/MathTransforms.cpp b/chapters/graphics-math-coordinate-transforms/Starter/MathTransforms.cpp
+--- a/chapters/graphics-math-coordinate-transforms/Starter/MathTransforms.cpp
++++ b/chapters/graphics-math-coordinate-transforms/Starter/MathTransforms.cpp
+@@ -85,10 +85,10 @@ DirectX::XMMATRIX BuildPerspectiveProjection(float verticalFieldOfViewDegrees, f
+                                              float farPlane) noexcept
+ {
+     float const clampedAspect = aspectRatio > 0.0F ? aspectRatio : 1.0F;
+-    float const clampedNear = std::max(nearPlane, 0.1F);
+-    float const clampedFar = std::max(farPlane, clampedNear + 0.1F);
+-    return XMMatrixPerspectiveFovLH(DegreesToRadians(verticalFieldOfViewDegrees), clampedAspect, clampedNear,
+-                                    clampedFar);
++    float const clampedNear = std::max(nearPlane, 0.001F);
++    float const clampedFar = std::max(farPlane, clampedNear + 0.001F);
++    float const clampedFieldOfView = std::clamp(verticalFieldOfViewDegrees, 5.0F, 160.0F);
++    return XMMatrixPerspectiveFovLH(DegreesToRadians(clampedFieldOfView), clampedAspect, clampedNear, clampedFar);
+ }
+
+ DirectX::XMMATRIX BuildOrthographicProjection(float height, float aspectRatio, float nearPlane, float farPlane) noexcept
+diff --git a/chapters/graphics-math-coordinate-transforms/Starter/Scene.cpp b/chapters/graphics-math-coordinate-transforms/Starter/Scene.cpp
+--- a/chapters/graphics-math-coordinate-transforms/Starter/Scene.cpp
++++ b/chapters/graphics-math-coordinate-transforms/Starter/Scene.cpp
+@@ -100,8 +100,8 @@ lgp::framework::Result<ChapterDerivedScene> BuildScene(ChapterControls const &co
+     scene.capabilities = {
+         true, true, true, false, false, false, false, false, false, true,
+     };
+-    scene.implementationNote = "Step 6: orthographic projection joins the explorer so preserved parallel lines can be "
+-                               "compared against perspective.";
++    scene.implementationNote =
++        "Step 7: perspective projection now clamps field of view, aspect ratio, and near/far planes consistently.";
+     scene.model = StoreMatrix(modelMatrix);
+     scene.comparisonModel = StoreMatrix(comparisonModelMatrix);
+     scene.wrongOrderModel = StoreMatrix(wrongOrderModelMatrix);

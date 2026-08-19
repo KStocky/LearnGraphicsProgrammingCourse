@@ -1,0 +1,14 @@
+diff --git a/chapters/rasterization-depth-and-culling/Starter/Renderer.cpp b/chapters/rasterization-depth-and-culling/Starter/Renderer.cpp
+--- a/chapters/rasterization-depth-and-culling/Starter/Renderer.cpp
++++ b/chapters/rasterization-depth-and-culling/Starter/Renderer.cpp
+@@ -81,8 +81,8 @@
+     Scene scene{Scene::Overlap};
+     Interpolation interpolation{Interpolation::PerspectiveCorrect};
+     Visualization visualization{Visualization::Attribute};
+-    D3D12_CULL_MODE cullMode{D3D12_CULL_MODE_NONE};
+-    DepthMode depthMode{DepthMode::Disabled};
++    D3D12_CULL_MODE cullMode{D3D12_CULL_MODE_BACK};
++    DepthMode depthMode{DepthMode::Less};
+     bool frontCounterClockwise{false};
+     bool reverseDrawOrder{false};
+ };

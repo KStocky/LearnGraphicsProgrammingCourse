@@ -1,0 +1,50 @@
+diff --git a/chapters/graphics-math-coordinate-transforms/Starter/DemoLogic.cpp b/chapters/graphics-math-coordinate-transforms/Starter/DemoLogic.cpp
+--- a/chapters/graphics-math-coordinate-transforms/Starter/DemoLogic.cpp
++++ b/chapters/graphics-math-coordinate-transforms/Starter/DemoLogic.cpp
+@@ -33,7 +33,7 @@ class StarterLogic final : public IChapterLogic
+         controls.showComparisonOrientation = false;
+         controls.showNormalVectors = false;
+         controls.demonstrateIncorrectNormal = false;
+-        controls.omitPerspectiveDivide = false;
++        controls.omitPerspectiveDivide = true;
+     }
+
+     std::filesystem::path ShaderPath() const override
+diff --git a/chapters/graphics-math-coordinate-transforms/Starter/Scene.cpp b/chapters/graphics-math-coordinate-transforms/Starter/Scene.cpp
+--- a/chapters/graphics-math-coordinate-transforms/Starter/Scene.cpp
++++ b/chapters/graphics-math-coordinate-transforms/Starter/Scene.cpp
+@@ -98,10 +98,10 @@ lgp::framework::Result<ChapterDerivedScene> BuildScene(ChapterControls const &co
+
+     ChapterDerivedScene scene{};
+     scene.capabilities = {
+-        true, true, true, false, false, false, false, false, false, true,
++        true, true, true, true, false, false, false, false, false, true,
+     };
+     scene.implementationNote =
+-        "Step 7: perspective projection now clamps field of view, aspect ratio, and near/far planes consistently.";
++        "Step 8: clip-space positions are carried through the homogeneous divide before later viewport mapping.";
+     scene.model = StoreMatrix(modelMatrix);
+     scene.comparisonModel = StoreMatrix(comparisonModelMatrix);
+     scene.wrongOrderModel = StoreMatrix(wrongOrderModelMatrix);
+@@ -131,11 +131,7 @@ lgp::framework::Result<ChapterDerivedScene> BuildScene(ChapterControls const &co
+                             scene.worldVertices[vertexIndex].z},
+                            viewMatrix);
+         scene.clipVertices[vertexIndex] = TransformPoint(objectVertex, modelViewProjectionMatrix);
+-        scene.ndcVertices[vertexIndex] = {
+-            scene.clipVertices[vertexIndex].x,
+-            scene.clipVertices[vertexIndex].y,
+-            scene.clipVertices[vertexIndex].z,
+-        };
++        scene.ndcVertices[vertexIndex] = HomogeneousDivide(scene.clipVertices[vertexIndex]);
+         scene.screenVertices[vertexIndex] = {scene.ndcVertices[vertexIndex].x, scene.ndcVertices[vertexIndex].y};
+     }
+
+@@ -148,7 +144,7 @@ lgp::framework::Result<ChapterDerivedScene> BuildScene(ChapterControls const &co
+     scene.inspection.clip = scene.clipVertices[static_cast<std::size_t>(selectedVertex)];
+     scene.inspection.ndc = scene.ndcVertices[static_cast<std::size_t>(selectedVertex)];
+     scene.inspection.screen = scene.screenVertices[static_cast<std::size_t>(selectedVertex)];
+-    scene.inspection.screenWithoutDivide = scene.inspection.screen;
++    scene.inspection.screenWithoutDivide = {scene.inspection.clip.x, scene.inspection.clip.y};
+
+     scene.normalOriginWorld = {
+         scene.inspection.world.x,

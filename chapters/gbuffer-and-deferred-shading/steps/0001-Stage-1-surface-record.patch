@@ -1,0 +1,176 @@
+From 192ce6db79aeb06ca05e9686e291abc168206438 Mon Sep 17 00:00:00 2001
+From: Copilot <copilot@example.com>
+Date: Mon, 17 Aug 2026 08:01:40 +0100
+Subject: [PATCH 1/5] Stage 1 surface record
+
+---
+ .../Starter/GBufferDeferredLab.hlsl           | 105 ++++++++++++------
+ 1 file changed, 72 insertions(+), 33 deletions(-)
+
+diff --git a/chapters/gbuffer-and-deferred-shading/Starter/GBufferDeferredLab.hlsl b/chapters/gbuffer-and-deferred-shading/Starter/GBufferDeferredLab.hlsl
+index 9371043..fd36f7b 100644
+--- a/chapters/gbuffer-and-deferred-shading/Starter/GBufferDeferredLab.hlsl
++++ b/chapters/gbuffer-and-deferred-shading/Starter/GBufferDeferredLab.hlsl
+@@ -18,6 +18,12 @@ struct ObjectConstants
+ 
+ ConstantBuffer<FrameConstants> frameData : register(b0);
+ ConstantBuffer<ObjectConstants> objectData : register(b1);
++Texture2D<float4> baseColorMetalnessTexture : register(t0);
++Texture2D<float2> octahedralNormalTexture : register(t1);
++Texture2D<float> roughnessTexture : register(t2);
++Texture2D<float> deviceDepthTexture : register(t3);
++Texture2D<float2> motionTexture : register(t4);
++Texture2D<uint> identityTexture : register(t5);
+ 
+ struct MeshVertex
+ {
+@@ -34,6 +40,17 @@ struct ForwardVertex
+     float3 viewNormal : NORMAL0;
+ };
+ 
++struct SurfaceRecord
++{
++    float3 baseColor;
++    float metalness;
++    float3 viewNormal;
++    float roughness;
++    float deviceDepth;
++    float2 motion;
++    uint identity;
++};
++
+ static const float Pi = 3.14159265358979323846;
+ static const float MinimumRoughness = 0.045;
+ 
+@@ -139,64 +156,63 @@ float3 DisplayEncode(float3 linearColor)
+     return float3(SrgbEncode(linearColor.r), SrgbEncode(linearColor.g), SrgbEncode(linearColor.b));
+ }
+ 
+-ForwardVertex ForwardVS(MeshVertex input)
+-{
+-    ForwardVertex output;
+-    float4 worldPosition = float4(input.position + objectData.translation, 1.0);
+-    float4 viewPosition = mul(worldPosition, frameData.viewMatrix);
+-    output.position = mul(worldPosition, frameData.viewProjection);
+-    output.viewPosition = viewPosition.xyz;
+-    output.viewNormal = mul(float4(input.normal, 0.0), frameData.viewMatrix).xyz;
+-    return output;
++SurfaceRecord BuildSurfaceRecord(ForwardVertex input, bool frontFace)
++{
++    SurfaceRecord surface;
++    surface.viewNormal = QuantizedNormal(normalize(input.viewNormal) * (frontFace ? 1.0 : -1.0));
++    surface.baseColor = QuantizedBaseColor(objectData.baseColor);
++    surface.roughness = QuantizeUnorm(objectData.roughness, 255.0);
++    surface.metalness = QuantizeUnorm(objectData.metalness, 255.0);
++    surface.deviceDepth = saturate(input.position.z);
++    surface.motion = 0.0.xx;
++    surface.identity = objectData.metadata.x;
++    return surface;
+ }
+ 
+-float4 ForwardPS(ForwardVertex input, bool frontFace : SV_IsFrontFace) : SV_Target
++float3 ShadeSurfaceRecord(SurfaceRecord surface, float3 viewPosition)
+ {
+-    float3 viewNormal = normalize(input.viewNormal) * (frontFace ? 1.0 : -1.0);
+-    float3 quantizedNormal = QuantizedNormal(viewNormal);
+-    float3 baseColor = QuantizedBaseColor(objectData.baseColor);
+-    float roughness = QuantizeUnorm(objectData.roughness, 255.0);
+-    float metalness = QuantizeUnorm(objectData.metalness, 255.0);
+-
+-    float3 viewDirection = normalize(-input.viewPosition);
++    float3 viewDirection = normalize(-viewPosition);
+     float3 lightDirection = normalize(frameData.lightDirectionIntensity.xyz);
+-    float nDotL = saturate(dot(quantizedNormal, lightDirection));
+-    float nDotV = saturate(dot(quantizedNormal, viewDirection));
++    float nDotL = saturate(dot(surface.viewNormal, lightDirection));
++    float nDotV = saturate(dot(surface.viewNormal, viewDirection));
+     float3 halfVector = normalize(viewDirection + lightDirection);
+-    float nDotH = saturate(dot(quantizedNormal, halfVector));
++    float nDotH = saturate(dot(surface.viewNormal, halfVector));
+     float vDotH = saturate(dot(viewDirection, halfVector));
+-    float3 f0 = lerp(float3(0.04, 0.04, 0.04), baseColor, metalness);
++    float3 f0 = lerp(float3(0.04, 0.04, 0.04), surface.baseColor, surface.metalness);
+     float3 fresnel = SchlickFresnel(f0, vDotH);
+-    float distribution = GgxDistribution(nDotH, roughness);
+-    float geometry = SmithG1(nDotV, roughness) * SmithG1(nDotL, roughness);
++    float distribution = GgxDistribution(nDotH, surface.roughness);
++    float geometry = SmithG1(nDotV, surface.roughness) * SmithG1(nDotL, surface.roughness);
+     float denominator = max(4.0 * nDotV * nDotL, 1.0e-6);
+     float3 specularBrdf = nDotL > 0.0 && nDotV > 0.0 ? fresnel * distribution * geometry / denominator : 0.0;
+     float3 diffuseWeight =
+-        (1.0 - SchlickFresnel(f0, nDotV)) * (1.0 - SchlickFresnel(f0, nDotL)) * (1.0 - metalness);
+-    float3 diffuseBrdf = diffuseWeight * baseColor / Pi;
+-    float3 linearColor = frameData.lightDirectionIntensity.w * nDotL * (diffuseBrdf + specularBrdf);
++        (1.0 - SchlickFresnel(f0, nDotV)) * (1.0 - SchlickFresnel(f0, nDotL)) * (1.0 - surface.metalness);
++    float3 diffuseBrdf = diffuseWeight * surface.baseColor / Pi;
++    return frameData.lightDirectionIntensity.w * nDotL * (diffuseBrdf + specularBrdf);
++}
+ 
+-    uint debugView = frameData.options.x;
++float4 VisualizeSurfaceRecord(SurfaceRecord surface, uint debugView)
++{
++    float3 linearColor = 0.0.xxx;
+     if (debugView == 1U)
+     {
+-        linearColor = baseColor;
++        linearColor = surface.baseColor;
+     }
+     else if (debugView == 2U)
+     {
+-        linearColor = metalness.xxx;
++        linearColor = surface.metalness.xxx;
+     }
+     else if (debugView == 3U)
+     {
+-        linearColor = quantizedNormal * 0.5 + 0.5;
++        linearColor = surface.viewNormal * 0.5 + 0.5;
+         return float4(saturate(linearColor), 1.0);
+     }
+     else if (debugView == 4U)
+     {
+-        linearColor = roughness.xxx;
++        linearColor = surface.roughness.xxx;
+     }
+     else if (debugView == 5U)
+     {
+-        linearColor = saturate(input.position.z).xxx;
++        linearColor = surface.deviceDepth.xxx;
+     }
+     else if (debugView == 6U)
+     {
+@@ -205,8 +221,31 @@ float4 ForwardPS(ForwardVertex input, bool frontFace : SV_IsFrontFace) : SV_Targ
+     }
+     else if (debugView == 7U)
+     {
+-        linearColor = IdentityColor(objectData.metadata.x);
++        linearColor = IdentityColor(surface.identity);
++    }
++    return float4(saturate(DisplayEncode(linearColor)), 1.0);
++}
++
++ForwardVertex ForwardVS(MeshVertex input)
++{
++    ForwardVertex output;
++    float4 worldPosition = float4(input.position + objectData.translation, 1.0);
++    float4 viewPosition = mul(worldPosition, frameData.viewMatrix);
++    output.position = mul(worldPosition, frameData.viewProjection);
++    output.viewPosition = viewPosition.xyz;
++    output.viewNormal = mul(float4(input.normal, 0.0), frameData.viewMatrix).xyz;
++    return output;
++}
++
++float4 ForwardPS(ForwardVertex input, bool frontFace : SV_IsFrontFace) : SV_Target
++{
++    SurfaceRecord surface = BuildSurfaceRecord(input, frontFace);
++    uint debugView = frameData.options.x;
++    if (debugView != 0U)
++    {
++        return VisualizeSurfaceRecord(surface, debugView);
+     }
+ 
++    float3 linearColor = ShadeSurfaceRecord(surface, input.viewPosition);
+     return float4(saturate(DisplayEncode(linearColor)), 1.0);
+ }
+-- 
+2.55.0.windows.3
+

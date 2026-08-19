@@ -1,0 +1,172 @@
+diff --git a/chapters/frame-graph-and-resource-lifetimes/Starter/Renderer.cpp b/chapters/frame-graph-and-resource-lifetimes/Starter/Renderer.cpp
+index c98c038..1a3ea51 100644
+--- a/chapters/frame-graph-and-resource-lifetimes/Starter/Renderer.cpp
++++ b/chapters/frame-graph-and-resource-lifetimes/Starter/Renderer.cpp
+@@ -16,9 +16,9 @@
+ #include <cstdint>
+ #include <filesystem>
+ #include <string>
++#include <utility>
+ 
+ #include <lgp/framework/barriers.hpp>
+-#include <lgp/framework/shader_compiler.hpp>
+ 
+ namespace ch08::frame_graph::starter
+ {
+@@ -102,6 +102,20 @@ enum RootParameter : UINT
+     return barrier;
+ }
+ 
++[[nodiscard]] std::string DescribeDiagnostics(std::vector<PassGraphDiagnostic> const &diagnostics)
++{
++    std::string message{};
++    for (std::size_t diagnosticIndex = 0U; diagnosticIndex < diagnostics.size(); ++diagnosticIndex)
++    {
++        if (diagnosticIndex > 0U)
++        {
++            message += "\n";
++        }
++        message += diagnostics[diagnosticIndex].message;
++    }
++    return message;
++}
++
+ } // namespace
+ 
+ lgp::framework::Status Renderer::CreateShaders()
+@@ -330,6 +344,36 @@ lgp::framework::Status Renderer::CreateHdrIntermediate(lgp::framework::Extent2D
+     return {};
+ }
+ 
++std::expected<Renderer::FrameGraphPlan, lgp::framework::Error> Renderer::CompileFrameGraph(
++    lgp::framework::FrameContext const &frameContext) const
++{
++    PassGraph graph{};
++    TextureResourceId const hdrResourceId = graph.AddImportedTexture("hdrIntermediate", ShaderResourceState());
++    TextureResourceId const frameTargetResourceId =
++        graph.AddImportedTexture("frameTarget", FrameStartState(frameContext));
++
++    PassId const analyticPassId = graph.AddPass("analytic-hdr");
++    PassId const displayPassId = graph.AddPass("display");
++    PassId const frameBoundaryPassId = graph.AddPass("frame-boundary");
++
++    graph.DeclareTextureWrite(analyticPassId, hdrResourceId, RenderTargetState());
++    graph.DeclareTextureRead(displayPassId, hdrResourceId, ShaderResourceState());
++    graph.DeclareTextureWrite(displayPassId, frameTargetResourceId, RenderTargetState());
++    graph.DeclareTextureRead(frameBoundaryPassId, frameTargetResourceId, FrameEndState(frameContext));
++
++    PassGraphCompileResult compileResult = graph.Compile();
++    if (!compileResult)
++    {
++        return std::unexpected(
++            lgp::framework::MakeError("PassGraph::Compile", DescribeDiagnostics(compileResult.error())));
++    }
++
++    return FrameGraphPlan{
++        std::move(*compileResult), hdrResourceId, frameTargetResourceId, analyticPassId, displayPassId,
++        frameBoundaryPassId,
++    };
++}
++
+ lgp::framework::Status Renderer::Initialize(lgp::framework::ApplicationInitContext const &context)
+ {
+     deviceResources_ = &context.deviceResources;
+@@ -359,13 +403,24 @@ lgp::framework::Status Renderer::Update(lgp::framework::UpdateContext const &)
+     return {};
+ }
+ 
++
++
+ lgp::framework::Status Renderer::Render(lgp::framework::FrameContext const &frameContext)
+ {
+     if (frameContext.commandList == nullptr || frameContext.renderTarget == nullptr || hdrIntermediate_ == nullptr)
+     {
++        lastCompiledGraph_.reset();
+         return {};
+     }
+ 
++    std::expected<FrameGraphPlan, lgp::framework::Error> planResult = CompileFrameGraph(frameContext);
++    if (!planResult)
++    {
++        return std::unexpected(std::move(planResult.error()));
++    }
++    FrameGraphPlan plan = std::move(*planResult);
++    lastCompiledGraph_ = plan.compiledGraph;
++
+     ID3D12GraphicsCommandList7 &commandList = *frameContext.commandList;
+     commandList.RSSetViewports(1U, &frameContext.viewport);
+     commandList.RSSetScissorRects(1U, &frameContext.scissorRect);
+@@ -419,6 +474,7 @@ lgp::framework::Status Renderer::Render(lgp::framework::FrameContext const &fram
+ 
+ void Renderer::Shutdown(lgp::framework::DeviceResources &) noexcept
+ {
++    lastCompiledGraph_.reset();
+     hdrIntermediate_.Reset();
+     if (deviceResources_ != nullptr && hdrRtv_)
+     {
+@@ -436,4 +492,9 @@ void Renderer::Shutdown(lgp::framework::DeviceResources &) noexcept
+     deviceResources_ = nullptr;
+ }
+ 
++CompiledPassGraph const *Renderer::LastCompiledGraph() const noexcept
++{
++    return lastCompiledGraph_.has_value() ? &*lastCompiledGraph_ : nullptr;
++}
++
+ } // namespace ch08::frame_graph::starter
+diff --git a/chapters/frame-graph-and-resource-lifetimes/Starter/Renderer.hpp b/chapters/frame-graph-and-resource-lifetimes/Starter/Renderer.hpp
+index e9e3f77..2139aa5 100644
+--- a/chapters/frame-graph-and-resource-lifetimes/Starter/Renderer.hpp
++++ b/chapters/frame-graph-and-resource-lifetimes/Starter/Renderer.hpp
+@@ -1,11 +1,17 @@
+ #pragma once
+ 
++#include "../Common/PassGraph.hpp"
++
+ #include <lgp/framework/application.hpp>
+ #include <lgp/framework/descriptors.hpp>
+ #include <lgp/framework/shader_compiler.hpp>
+ 
+ #include <wrl/client.h>
+ 
++#include <expected>
++#include <optional>
++#include <vector>
++
+ namespace ch08::frame_graph::starter
+ {
+ 
+@@ -19,11 +25,25 @@ class Renderer final : public lgp::framework::IChapterRenderer
+     [[nodiscard]] lgp::framework::Status Render(lgp::framework::FrameContext const &frameContext) override;
+     void Shutdown(lgp::framework::DeviceResources &deviceResources) noexcept override;
+ 
++    [[nodiscard]] CompiledPassGraph const *LastCompiledGraph() const noexcept;
++
+   private:
++    struct FrameGraphPlan final
++    {
++        CompiledPassGraph compiledGraph{};
++        TextureResourceId hdrResourceId{};
++        TextureResourceId frameTargetResourceId{};
++        PassId analyticPassId{};
++        PassId displayPassId{};
++        PassId frameBoundaryPassId{};
++    };
++
+     [[nodiscard]] lgp::framework::Status CreateShaders();
+     [[nodiscard]] lgp::framework::Status CreateRootSignature();
+     [[nodiscard]] lgp::framework::Status CreatePipelineStates();
+     [[nodiscard]] lgp::framework::Status CreateHdrIntermediate(lgp::framework::Extent2D size);
++    [[nodiscard]] std::expected<FrameGraphPlan, lgp::framework::Error> CompileFrameGraph(
++        lgp::framework::FrameContext const &frameContext) const;
+ 
+     lgp::framework::DeviceResources *deviceResources_{};
+     lgp::framework::CompiledShader fullscreenVertexShader_{};
+@@ -35,6 +55,7 @@ class Renderer final : public lgp::framework::IChapterRenderer
+     lgp::framework::DescriptorAllocation hdrRtv_{};
+     lgp::framework::DescriptorAllocation hdrSrv_{};
+     Microsoft::WRL::ComPtr<ID3D12Resource> hdrIntermediate_{};
++    std::optional<CompiledPassGraph> lastCompiledGraph_{};
+ };
+ 
+ } // namespace ch08::frame_graph::starter

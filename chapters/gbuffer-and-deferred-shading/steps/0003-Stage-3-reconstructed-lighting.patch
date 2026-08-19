@@ -1,0 +1,55 @@
+From 4e5add1ea7ab16e79fa415e1549213a7741aef14 Mon Sep 17 00:00:00 2001
+From: Copilot <copilot@example.com>
+Date: Mon, 17 Aug 2026 08:02:10 +0100
+Subject: [PATCH 3/5] Stage 3 reconstructed lighting
+
+---
+ .../Starter/GBufferDeferredLab.hlsl           | 20 +++++++++++++++++--
+ .../Starter/Renderer.cpp                      |  2 +-
+ 2 files changed, 19 insertions(+), 3 deletions(-)
+
+diff --git a/chapters/gbuffer-and-deferred-shading/Starter/GBufferDeferredLab.hlsl b/chapters/gbuffer-and-deferred-shading/Starter/GBufferDeferredLab.hlsl
+index 789b3d2..66347b4 100644
+--- a/chapters/gbuffer-and-deferred-shading/Starter/GBufferDeferredLab.hlsl
++++ b/chapters/gbuffer-and-deferred-shading/Starter/GBufferDeferredLab.hlsl
+@@ -241,6 +241,22 @@ float4 DeferredPS(FullscreenVertex input) : SV_Target
+         return float4(DisplayEncode(IdentityColor(identity)), 1.0);
+     }
+ 
+-    linearColor = baseColor;
+-    return float4(DisplayEncode(linearColor), 1.0);
++    float3 viewDirection = normalize(-viewPosition);
++    float3 lightDirection = normalize(frameData.lightDirectionIntensity.xyz);
++    float nDotL = saturate(dot(viewNormal, lightDirection));
++    float nDotV = saturate(dot(viewNormal, viewDirection));
++    float3 halfVector = normalize(viewDirection + lightDirection);
++    float nDotH = saturate(dot(viewNormal, halfVector));
++    float vDotH = saturate(dot(viewDirection, halfVector));
++    float3 f0 = lerp(float3(0.04, 0.04, 0.04), baseColor, metalness);
++    float3 fresnel = SchlickFresnel(f0, vDotH);
++    float distribution = GgxDistribution(nDotH, roughness);
++    float geometry = SmithG1(nDotV, roughness) * SmithG1(nDotL, roughness);
++    float denominator = max(4.0 * nDotV * nDotL, 1.0e-6);
++    float3 specularBrdf = nDotL > 0.0 && nDotV > 0.0 ? fresnel * distribution * geometry / denominator : 0.0;
++    float3 diffuseWeight =
++        (1.0 - SchlickFresnel(f0, nDotV)) * (1.0 - SchlickFresnel(f0, nDotL)) * (1.0 - metalness);
++    float3 diffuseBrdf = diffuseWeight * baseColor / Pi;
++    linearColor = frameData.lightDirectionIntensity.w * nDotL * (diffuseBrdf + specularBrdf);
++    return float4(saturate(DisplayEncode(linearColor)), 1.0);
+ }
+diff --git a/chapters/gbuffer-and-deferred-shading/Starter/Renderer.cpp b/chapters/gbuffer-and-deferred-shading/Starter/Renderer.cpp
+index e0dadc6..67f48db 100644
+--- a/chapters/gbuffer-and-deferred-shading/Starter/Renderer.cpp
++++ b/chapters/gbuffer-and-deferred-shading/Starter/Renderer.cpp
+@@ -793,7 +793,7 @@ lgp::framework::Status Renderer::Impl::Initialize(lgp::framework::ApplicationIni
+ 
+ lgp::framework::Status Renderer::Impl::Update(lgp::framework::UpdateContext const &)
+ {
+-    sceneState_ = MakeSceneState(headless_, headlessConfiguration_, DepthConvention::Forward, gpu::DebugView::BaseColor);
++    sceneState_ = MakeSceneState(headless_, headlessConfiguration_, DepthConvention::Forward, gpu::DebugView::Final);
+     sceneState_.directionToLightWorld = Normalize(sceneState_.directionToLightWorld);
+     return {};
+ }
+-- 
+2.55.0.windows.3
+

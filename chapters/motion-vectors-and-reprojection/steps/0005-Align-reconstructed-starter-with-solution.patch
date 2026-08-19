@@ -1,0 +1,22 @@
+From ae1e08df482aeedf854c943f3d32daad5391c08b Mon Sep 17 00:00:00 2001
+From: Patch Author <patch-author@example.invalid>
+Date: Sun, 16 Aug 2026 21:36:47 +0100
+Subject: [PATCH 5/5] Align reconstructed starter with solution
+
+---
+ chapters/motion-vectors-and-reprojection/Starter/Main.cpp | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/chapters/motion-vectors-and-reprojection/Starter/Main.cpp b/chapters/motion-vectors-and-reprojection/Starter/Main.cpp
+index 040e110..b85246c 100644
+--- a/chapters/motion-vectors-and-reprojection/Starter/Main.cpp
++++ b/chapters/motion-vectors-and-reprojection/Starter/Main.cpp
+@@ -7,7 +7,7 @@ int wmain(int argc, wchar_t **argv)
+     ch11::reprojection::solution::Renderer renderer{};
+ 
+     lgp::framework::ApplicationConfiguration configuration{};
+-    configuration.title = L"Ch11 Motion Vectors and Reprojection Starter";
++    configuration.title = L"Ch11 Motion Vectors and Reprojection Solution";
+     configuration.width = 1600U;
+     configuration.height = 900U;
+     configuration.enableDebugLayer = false;

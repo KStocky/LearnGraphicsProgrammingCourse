@@ -1,0 +1,45 @@
+diff --git a/chapters/radiometry-light-units-and-brdfs/CMakeLists.txt b/chapters/radiometry-light-units-and-brdfs/CMakeLists.txt
+index c03f941c526337df0860e89eff57d4d8adf80279..7ef9f97b9e94dfb448c78105a159e1227c90e67d 100644
+--- a/chapters/radiometry-light-units-and-brdfs/CMakeLists.txt
++++ b/chapters/radiometry-light-units-and-brdfs/CMakeLists.txt
+@@ -24,6 +24,7 @@ source_group(TREE "${CMAKE_CURRENT_SOURCE_DIR}" FILES ${LGP_CH05_COMMON_SOURCES}
+ 
+ set(
+     LGP_CH05_STARTER_SOURCES
++    "${CMAKE_CURRENT_SOURCE_DIR}/Starter/DirectLighting.hlsl"
+     "${CMAKE_CURRENT_SOURCE_DIR}/Starter/Renderer.cpp"
+     "${CMAKE_CURRENT_SOURCE_DIR}/Starter/Renderer.hpp")
+ 
+@@ -46,6 +47,7 @@ elseif(MSVC)
+     set_source_files_properties("${LGP_CH05_IMGUI_DX12_BACKEND}" PROPERTIES COMPILE_FLAGS "/wd4189")
+ endif()
+ set_source_files_properties(
++    "${CMAKE_CURRENT_SOURCE_DIR}/Starter/DirectLighting.hlsl"
+     "${CMAKE_CURRENT_SOURCE_DIR}/Solution/DirectLighting.hlsl"
+     PROPERTIES
+         HEADER_FILE_ONLY TRUE)
+diff --git a/chapters/radiometry-light-units-and-brdfs/Starter/DirectLighting.hlsl b/chapters/radiometry-light-units-and-brdfs/Starter/DirectLighting.hlsl
+new file mode 100644
+index 0000000000000000000000000000000000000000..16f4eef40f6a6ef2ba082e4ed6fa25c814252ccb
+--- /dev/null
++++ b/chapters/radiometry-light-units-and-brdfs/Starter/DirectLighting.hlsl
+@@ -0,0 +1,19 @@
++// Step 1: keep the units visible before introducing a BRDF.
++
++static const float MinimumDistanceSquared = 1.0e-4;
++
++float DirectionalNormalIlluminance(float illuminanceLux)
++{
++    return max(illuminanceLux, 0.0);
++}
++
++float PointNormalIlluminance(float luminousIntensityCandela, float3 offsetToLight)
++{
++    float distanceSquared = max(dot(offsetToLight, offsetToLight), MinimumDistanceSquared);
++    return max(luminousIntensityCandela, 0.0) / distanceSquared;
++}
++
++float3 TintIlluminance(float illuminanceLux, float3 lightColor)
++{
++    return illuminanceLux * max(lightColor, 0.0);
++}

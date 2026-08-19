@@ -1,0 +1,270 @@
+diff --git a/chapters/texture-sampling-mipmapping-and-reconstruction/CMakeLists.txt b/chapters/texture-sampling-mipmapping-and-reconstruction/CMakeLists.txt
+index a51f203..e45d951 100644
+--- a/chapters/texture-sampling-mipmapping-and-reconstruction/CMakeLists.txt
++++ b/chapters/texture-sampling-mipmapping-and-reconstruction/CMakeLists.txt
+@@ -32,9 +32,25 @@ elseif(MSVC)
+     set_source_files_properties("${LGP_CH03_IMGUI_DX12_BACKEND}" PROPERTIES COMPILE_FLAGS "/wd4189")
+ endif()
+
+-add_library(ch03_texture_sampling_starter_logic STATIC ${LGP_CH03_COMMON_HEADERS} ${LGP_CH03_STARTER_SOURCES})
+-target_link_libraries(ch03_texture_sampling_starter_logic PUBLIC LGP::Framework Microsoft::DirectXMath)
+-target_include_directories(ch03_texture_sampling_starter_logic PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}")
++add_library(
++    ch03_texture_sampling_starter_logic
++    STATIC
++        ${LGP_CH03_COMMON_HEADERS}
++        ${LGP_CH03_STARTER_SOURCES}
++        "${LGP_CH03_IMGUI_DX12_BACKEND}")
++target_link_libraries(
++    ch03_texture_sampling_starter_logic
++    PUBLIC
++        DearImGui::DearImGui
++        LGP::Framework
++        Microsoft::DirectXMath)
++target_include_directories(
++    ch03_texture_sampling_starter_logic
++    PUBLIC
++        "${CMAKE_CURRENT_SOURCE_DIR}"
++        "${LGP_CH03_IMGUI_ROOT}"
++        "${LGP_CH03_IMGUI_ROOT}/backends")
++target_compile_definitions(ch03_texture_sampling_starter_logic PRIVATE IMGUI_IMPL_WIN32_DISABLE_GAMEPAD)
+ set_target_properties(
+     ch03_texture_sampling_starter_logic
+     PROPERTIES
+diff --git a/chapters/texture-sampling-mipmapping-and-reconstruction/Starter/Renderer.cpp b/chapters/texture-sampling-mipmapping-and-reconstruction/Starter/Renderer.cpp
+index 383cb77..bf79ed9 100644
+--- a/chapters/texture-sampling-mipmapping-and-reconstruction/Starter/Renderer.cpp
++++ b/chapters/texture-sampling-mipmapping-and-reconstruction/Starter/Renderer.cpp
+@@ -1,5 +1,7 @@
+ #include "Renderer.hpp"
+
++#include <imgui.h>
++#include <imgui_impl_dx12.h>
+ #include <wrl/client.h>
+
+ #include <DirectXMath.h>
+@@ -174,8 +176,13 @@ class Renderer::Impl final
+     D3D12_VERTEX_BUFFER_VIEW vertexBufferView{};
+     ComPtr<ID3D12Resource> texture{};
+     lgp::framework::DescriptorAllocation srv{};
++    lgp::framework::DescriptorAllocation imguiFontDescriptor{};
+     SamplerMode samplerMode{SamplerMode::Anisotropic};
++    float lodBias{};
+     bool visualizeMip{};
++    bool headless{};
++    bool imguiInitialized{};
++    bool imguiFrameBegun{};
+
+     [[nodiscard]] lgp::framework::Status Initialize(lgp::framework::ApplicationInitContext const &context);
+     [[nodiscard]] lgp::framework::Status CompileShaders();
+@@ -183,6 +190,8 @@ class Renderer::Impl final
+     [[nodiscard]] lgp::framework::Status CreatePipelineState(ID3D12Device &device, DXGI_FORMAT renderTargetFormat);
+     [[nodiscard]] lgp::framework::Status CreateVertexBuffer(ID3D12Device &device);
+     [[nodiscard]] lgp::framework::Status CreateTexture(lgp::framework::DeviceResources &resources);
++    [[nodiscard]] lgp::framework::Status InitializeImGui();
++    [[nodiscard]] lgp::framework::Status BuildUi(lgp::framework::UpdateContext const &context);
+     [[nodiscard]] lgp::framework::Status Render(lgp::framework::FrameContext const &frameContext);
+     void Shutdown() noexcept;
+ };
+@@ -369,9 +378,8 @@ lgp::framework::Status Renderer::Impl::CreateTexture(lgp::framework::DeviceResou
+         IID_PPV_ARGS(texture.ReleaseAndGetAddressOf()));
+     if (FAILED(textureResult))
+     {
+-        return std::unexpected(lgp::framework::MakeHResultError("ID3D12Device10::CreateCommittedResource3",
+-                                                                textureResult,
+-                                                                "Failed to create the chapter texture."));
++        return std::unexpected(lgp::framework::MakeHResultError(
++            "ID3D12Device10::CreateCommittedResource3", textureResult, "Failed to create the chapter texture."));
+     }
+     texture->SetName(L"Ch03 generated mipmapped texture");
+
+@@ -479,6 +487,7 @@ lgp::framework::Status Renderer::Impl::CreateTexture(lgp::framework::DeviceResou
+ lgp::framework::Status Renderer::Impl::Initialize(lgp::framework::ApplicationInitContext const &context)
+ {
+     deviceResources = &context.deviceResources;
++    headless = context.commandLine.headless;
+     ID3D12Device *const device = context.deviceResources.device();
+
+     auto shaderStatus = CompileShaders();
+@@ -501,13 +510,93 @@ lgp::framework::Status Renderer::Impl::Initialize(lgp::framework::ApplicationIni
+     {
+         return vertexStatus;
+     }
+-    return CreatePipelineState(*device, context.deviceResources.back_buffer_format());
++    auto pipelineStatus = CreatePipelineState(*device, context.deviceResources.back_buffer_format());
++    if (!pipelineStatus)
++    {
++        return pipelineStatus;
++    }
++    if (!headless)
++    {
++        return InitializeImGui();
++    }
++    return {};
++}
++
++lgp::framework::Status Renderer::Impl::InitializeImGui()
++{
++    auto descriptorResult = deviceResources->shader_visible_cbv_srv_uav_heap().Allocate(1U);
++    if (!descriptorResult)
++    {
++        return std::unexpected(std::move(descriptorResult.error()));
++    }
++    imguiFontDescriptor = descriptorResult.value();
++
++    IMGUI_CHECKVERSION();
++    ImGui::CreateContext();
++    ImGui::StyleColorsDark();
++    ImGui::GetIO().BackendPlatformName = "LGP.ManualInput";
++
++    ImGui_ImplDX12_InitInfo info{};
++    info.Device = deviceResources->device();
++    info.CommandQueue = deviceResources->graphics_queue();
++    info.NumFramesInFlight = static_cast<int>(deviceResources->back_buffer_count());
++    info.RTVFormat = deviceResources->back_buffer_format();
++    info.DSVFormat = DXGI_FORMAT_UNKNOWN;
++    info.SrvDescriptorHeap = deviceResources->shader_visible_cbv_srv_uav_heap().Get();
++    info.LegacySingleSrvCpuDescriptor = imguiFontDescriptor.cpuHandle;
++    info.LegacySingleSrvGpuDescriptor = imguiFontDescriptor.gpuHandle;
++    if (!ImGui_ImplDX12_Init(&info))
++    {
++        return std::unexpected(
++            lgp::framework::MakeError("ImGui_ImplDX12_Init", "Failed to initialize the texture sampling UI."));
++    }
++    imguiInitialized = true;
++    return {};
++}
++
++lgp::framework::Status Renderer::Impl::BuildUi(lgp::framework::UpdateContext const &context)
++{
++    if (headless || !imguiInitialized)
++    {
++        return {};
++    }
++
++    ImGuiIO &io = ImGui::GetIO();
++    io.DisplaySize = {
++        static_cast<float>(context.drawableSize.width),
++        static_cast<float>(context.drawableSize.height),
++    };
++    io.DeltaTime = static_cast<float>(std::max(context.deltaSeconds, 1.0 / 240.0));
++    io.AddMousePosEvent(static_cast<float>(context.input.mouse.x), static_cast<float>(context.input.mouse.y));
++    io.AddMouseButtonEvent(0, context.input.mouse.IsButtonDown(lgp::framework::MouseButton::Left));
++    io.AddMouseWheelEvent(0.0F, context.input.mouse.wheelDelta);
++    ImGui_ImplDX12_NewFrame();
++    ImGui::NewFrame();
++    imguiFrameBegun = true;
++
++    ImGui::Begin("Texture Sampling");
++    int sampler = static_cast<int>(samplerMode);
++    ImGui::Combo("Sampler", &sampler, "Point\0Bilinear\0Trilinear\0Anisotropic\0");
++    samplerMode = static_cast<SamplerMode>(std::clamp(sampler, 0, 3));
++    ImGui::Checkbox("Visualize mip level", &visualizeMip);
++    ImGui::SliderFloat("LOD bias", &lodBias, -2.0F, 2.0F, "%.2f");
++    ImGui::Separator();
++    ImGui::TextWrapped("The receding quad repeats a high-frequency texture. Compare shimmer/detail with point, "
++                       "bilinear, trilinear, and anisotropic filtering; enable mip visualization to see the "
++                       "implicit derivative-selected mip level. Negative LOD bias sharpens, positive bias blurs.");
++    ImGui::End();
++    return {};
+ }
+
+ lgp::framework::Status Renderer::Impl::Render(lgp::framework::FrameContext const &frameContext)
+ {
+     if (frameContext.commandList == nullptr || frameContext.renderTarget == nullptr)
+     {
++        if (imguiFrameBegun)
++        {
++            ImGui::EndFrame();
++            imguiFrameBegun = false;
++        }
+         return {};
+     }
+
+@@ -544,7 +633,7 @@ lgp::framework::Status Renderer::Impl::Render(lgp::framework::FrameContext const
+     DrawConstants const constants{
+         static_cast<std::uint32_t>(samplerMode),
+         visualizeMip ? 1U : 0U,
+-        0.0F,
++        lodBias,
+         0U,
+     };
+     frameContext.commandList->SetGraphicsRoot32BitConstants(1U, 4U, &constants, 0U);
+@@ -553,6 +642,13 @@ lgp::framework::Status Renderer::Impl::Render(lgp::framework::FrameContext const
+     frameContext.commandList->IASetVertexBuffers(0U, 1U, &vertexBufferView);
+     frameContext.commandList->DrawInstanced(6U, 1U, 0U, 0U);
+
++    if (imguiFrameBegun)
++    {
++        ImGui::Render();
++        ImGui_ImplDX12_RenderDrawData(ImGui::GetDrawData(), frameContext.commandList);
++        imguiFrameBegun = false;
++    }
++
+     lgp::framework::TextureBarrierState const endState{
+         D3D12_BARRIER_SYNC_NONE,
+         D3D12_BARRIER_ACCESS_NO_ACCESS,
+@@ -565,6 +661,22 @@ lgp::framework::Status Renderer::Impl::Render(lgp::framework::FrameContext const
+
+ void Renderer::Impl::Shutdown() noexcept
+ {
++    if (imguiFrameBegun)
++    {
++        ImGui::EndFrame();
++        imguiFrameBegun = false;
++    }
++    if (imguiInitialized)
++    {
++        ImGui_ImplDX12_Shutdown();
++        ImGui::DestroyContext();
++        imguiInitialized = false;
++    }
++    if (deviceResources != nullptr && imguiFontDescriptor)
++    {
++        deviceResources->shader_visible_cbv_srv_uav_heap().Free(imguiFontDescriptor);
++        imguiFontDescriptor = {};
++    }
+     if (deviceResources != nullptr && srv)
+     {
+         deviceResources->shader_visible_cbv_srv_uav_heap().Free(srv);
+@@ -595,6 +707,11 @@ void Renderer::SetMipVisualization(bool enabled) noexcept
+     impl_->visualizeMip = enabled;
+ }
+
++void Renderer::SetLodBias(float bias) noexcept
++{
++    impl_->lodBias = std::clamp(bias, -2.0F, 2.0F);
++}
++
+ lgp::framework::Status Renderer::Initialize(lgp::framework::ApplicationInitContext const &context)
+ {
+     return impl_->Initialize(context);
+@@ -610,6 +727,11 @@ lgp::framework::Status Renderer::Update(lgp::framework::UpdateContext const &)
+     return {};
+ }
+
++lgp::framework::Status Renderer::BuildUi(lgp::framework::UpdateContext const &context)
++{
++    return impl_->BuildUi(context);
++}
++
+ lgp::framework::Status Renderer::Render(lgp::framework::FrameContext const &frameContext)
+ {
+     return impl_->Render(frameContext);
+diff --git a/chapters/texture-sampling-mipmapping-and-reconstruction/Starter/Renderer.hpp b/chapters/texture-sampling-mipmapping-and-reconstruction/Starter/Renderer.hpp
+index f26a9e4..93c25fd 100644
+--- a/chapters/texture-sampling-mipmapping-and-reconstruction/Starter/Renderer.hpp
++++ b/chapters/texture-sampling-mipmapping-and-reconstruction/Starter/Renderer.hpp
+@@ -29,10 +29,12 @@ class Renderer final : public lgp::framework::IChapterRenderer
+
+     void SetSamplerMode(SamplerMode mode) noexcept;
+     void SetMipVisualization(bool enabled) noexcept;
++    void SetLodBias(float bias) noexcept;
+
+     [[nodiscard]] lgp::framework::Status Initialize(lgp::framework::ApplicationInitContext const &context) override;
+     [[nodiscard]] lgp::framework::Status OnResize(lgp::framework::DeviceResources &deviceResources,
+                                                   lgp::framework::Extent2D drawableSize) override;
+     [[nodiscard]] lgp::framework::Status Update(lgp::framework::UpdateContext const &context) override;
++    [[nodiscard]] lgp::framework::Status BuildUi(lgp::framework::UpdateContext const &context) override;
+     [[nodiscard]] lgp::framework::Status Render(lgp::framework::FrameContext const &frameContext) override;
+     void Shutdown(lgp::framework::DeviceResources &deviceResources) noexcept override;

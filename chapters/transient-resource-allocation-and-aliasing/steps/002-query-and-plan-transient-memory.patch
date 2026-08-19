@@ -1,0 +1,176 @@
+diff --git a/chapters/transient-resource-allocation-and-aliasing/CMakeLists.txt b/chapters/transient-resource-allocation-and-aliasing/CMakeLists.txt
+index 7018cd7..a946d81 100644
+--- a/chapters/transient-resource-allocation-and-aliasing/CMakeLists.txt
++++ b/chapters/transient-resource-allocation-and-aliasing/CMakeLists.txt
+@@ -77,7 +77,7 @@ target_link_libraries(
+     ch09_transient_aliasing_starter_logic
+     PUBLIC
+         ch09_transient_aliasing_gpu_common
+-        LGP::Ch08FrameGraphContracts
++        LGP::Ch09TransientAllocationContracts
+         LGP::Framework)
+ target_include_directories(ch09_transient_aliasing_starter_logic PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}")
+ set_target_properties(
+diff --git a/chapters/transient-resource-allocation-and-aliasing/Starter/Renderer.cpp b/chapters/transient-resource-allocation-and-aliasing/Starter/Renderer.cpp
+index 5606f2a..e9f9057 100644
+--- a/chapters/transient-resource-allocation-and-aliasing/Starter/Renderer.cpp
++++ b/chapters/transient-resource-allocation-and-aliasing/Starter/Renderer.cpp
+@@ -12,9 +12,11 @@
+ 
+ #include <d3d12.h>
+ 
++#include <algorithm>
+ #include <array>
+ #include <filesystem>
+ #include <string>
++#include <string_view>
+ #include <utility>
+ #include <vector>
+ 
+@@ -28,6 +30,9 @@ using gpu::RenderTargetState;
+ using gpu::ShaderResourceState;
+ using gpu::UndefinedState;
+ 
++inline constexpr transient_allocation::HeapCompatibilityKey kRtDsTextureHeap{
++    static_cast<std::uint32_t>(D3D12_HEAP_FLAG_ALLOW_ONLY_RT_DS_TEXTURES)};
++
+ [[nodiscard]] std::string DescribeGraphDiagnostics(
+     std::vector<ch08::frame_graph::PassGraphDiagnostic> const &diagnostics)
+ {
+@@ -43,6 +48,29 @@ using gpu::UndefinedState;
+     return message;
+ }
+ 
++[[nodiscard]] std::string DescribeAllocationDiagnostics(
++    std::vector<transient_allocation::AllocationDiagnostic> const &diagnostics)
++{
++    std::string message{};
++    for (transient_allocation::AllocationDiagnostic const &diagnostic : diagnostics)
++    {
++        if (!message.empty())
++        {
++            message += '\n';
++        }
++        message += diagnostic.message;
++    }
++    return message;
++}
++
++[[nodiscard]] ch08::frame_graph::ResourceLifetime const *FindLifetime(
++    ch08::frame_graph::CompiledPassGraph const &graph, ch08::frame_graph::TextureResourceId resourceId) noexcept
++{
++    auto const lifetime =
++        std::ranges::find(graph.resourceLifetimes, resourceId, &ch08::frame_graph::ResourceLifetime::resourceId);
++    return lifetime == graph.resourceLifetimes.end() ? nullptr : &*lifetime;
++}
++
+ [[nodiscard]] std::filesystem::path ShaderPath()
+ {
+     return std::filesystem::path{__FILE__}.parent_path() / "TransientAliasingLab.hlsl";
+@@ -124,6 +152,7 @@ lgp::framework::Status Renderer::CreateTransientTextures(lgp::framework::Extent2
+     if (size.empty())
+     {
+         graphPlan_.reset();
++        allocationPlan_.reset();
+         return {};
+     }
+ 
+@@ -132,7 +161,46 @@ lgp::framework::Status Renderer::CreateTransientTextures(lgp::framework::Extent2
+     {
+         return std::unexpected(std::move(graphResult.error()));
+     }
+-    graphPlan_ = std::move(*graphResult);
++    GraphExecutionPlan graphPlan = std::move(*graphResult);
++
++    D3D12_RESOURCE_DESC1 const description = gpu::TextureDescription(size);
++    D3D12_RESOURCE_ALLOCATION_INFO1 detailedAllocation{};
++    D3D12_RESOURCE_ALLOCATION_INFO const allocation =
++        deviceResources_->device()->GetResourceAllocationInfo2(0U, 1U, &description, &detailedAllocation);
++    if (allocation.SizeInBytes == UINT64_MAX || allocation.SizeInBytes == 0U || allocation.Alignment == 0U)
++    {
++        return std::unexpected(lgp::framework::MakeError(
++            "ID3D12Device10::GetResourceAllocationInfo2",
++            "The adapter returned invalid allocation requirements for the Chapter 9 transient texture."));
++    }
++
++    std::array<ch08::frame_graph::TextureResourceId, 3U> const resourceIds{graphPlan.textureA, graphPlan.textureB,
++                                                                           graphPlan.textureC};
++    std::array<std::string_view, 3U> const names{"A", "B", "C"};
++    std::vector<transient_allocation::TransientTextureRequest> requests{};
++    requests.reserve(resourceIds.size());
++    for (std::size_t index = 0U; index < resourceIds.size(); ++index)
++    {
++        ch08::frame_graph::ResourceLifetime const *lifetime = FindLifetime(graphPlan.graph, resourceIds[index]);
++        if (lifetime == nullptr)
++        {
++            return std::unexpected(lgp::framework::MakeError(
++                "Renderer::CreateTransientTextures", "The compiled graph omitted a transient resource lifetime."));
++        }
++        requests.push_back({resourceIds[index], std::string{names[index]}, allocation.SizeInBytes, allocation.Alignment,
++                            kRtDsTextureHeap, *lifetime});
++    }
++
++    transient_allocation::TransientTextureAllocationResult planResult =
++        transient_allocation::PlanTransientTextureAllocations(requests);
++    if (!planResult)
++    {
++        return std::unexpected(lgp::framework::MakeError("PlanTransientTextureAllocations",
++                                                         DescribeAllocationDiagnostics(planResult.error())));
++    }
++
++    graphPlan_ = std::move(graphPlan);
++    allocationPlan_ = std::move(*planResult);
+ 
+     if (!transientRtvs_)
+     {
+@@ -153,7 +221,6 @@ lgp::framework::Status Renderer::CreateTransientTextures(lgp::framework::Extent2
+         transientSrvs_ = *result;
+     }
+ 
+-    D3D12_RESOURCE_DESC1 const description = gpu::TextureDescription(size);
+     D3D12_CLEAR_VALUE clearValue{};
+     clearValue.Format = gpu::kTransientFormat;
+     clearValue.Color[3] = 1.0F;
+@@ -295,8 +362,14 @@ ch08::frame_graph::CompiledPassGraph const *Renderer::CompiledGraph() const noex
+     return graphPlan_ ? &graphPlan_->graph : nullptr;
+ }
+ 
++transient_allocation::TransientTextureAllocationPlan const *Renderer::AllocationPlan() const noexcept
++{
++    return allocationPlan_ ? &*allocationPlan_ : nullptr;
++}
++
+ void Renderer::Shutdown(lgp::framework::DeviceResources &) noexcept
+ {
++    allocationPlan_.reset();
+     graphPlan_.reset();
+     for (auto &texture : transientTextures_)
+     {
+diff --git a/chapters/transient-resource-allocation-and-aliasing/Starter/Renderer.hpp b/chapters/transient-resource-allocation-and-aliasing/Starter/Renderer.hpp
+index 9bb9358..37a16cd 100644
+--- a/chapters/transient-resource-allocation-and-aliasing/Starter/Renderer.hpp
++++ b/chapters/transient-resource-allocation-and-aliasing/Starter/Renderer.hpp
+@@ -1,6 +1,6 @@
+ #pragma once
+ 
+-#include "PassGraph.hpp"
++#include "../Common/TransientTextureAllocation.hpp"
+ 
+ #include <lgp/framework/application.hpp>
+ #include <lgp/framework/descriptors.hpp>
+@@ -26,6 +26,7 @@ class Renderer final : public lgp::framework::IChapterRenderer
+     void Shutdown(lgp::framework::DeviceResources &deviceResources) noexcept override;
+ 
+     [[nodiscard]] ch08::frame_graph::CompiledPassGraph const *CompiledGraph() const noexcept;
++    [[nodiscard]] transient_allocation::TransientTextureAllocationPlan const *AllocationPlan() const noexcept;
+ 
+   private:
+     struct GraphExecutionPlan final
+@@ -65,6 +66,7 @@ class Renderer final : public lgp::framework::IChapterRenderer
+     lgp::framework::DescriptorAllocation transientSrvs_{};
+     std::array<Microsoft::WRL::ComPtr<ID3D12Resource>, 3U> transientTextures_{};
+     std::optional<GraphExecutionPlan> graphPlan_{};
++    std::optional<transient_allocation::TransientTextureAllocationPlan> allocationPlan_{};
+     bool headless_{};
+ };
+ 

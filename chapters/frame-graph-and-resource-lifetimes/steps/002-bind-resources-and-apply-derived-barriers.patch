@@ -1,0 +1,200 @@
+diff --git a/chapters/frame-graph-and-resource-lifetimes/Starter/Renderer.cpp b/chapters/frame-graph-and-resource-lifetimes/Starter/Renderer.cpp
+index 1a3ea51..070f1a3 100644
+--- a/chapters/frame-graph-and-resource-lifetimes/Starter/Renderer.cpp
++++ b/chapters/frame-graph-and-resource-lifetimes/Starter/Renderer.cpp
+@@ -116,6 +116,20 @@ enum RootParameter : UINT
+     return message;
+ }
+ 
++
++[[nodiscard]] CompiledPass const *FindCompiledPass(CompiledPassGraph const &graph, PassId passId) noexcept
++{
++    for (CompiledPass const &pass : graph.scheduledPasses)
++    {
++        if (pass.id == passId)
++        {
++            return &pass;
++        }
++    }
++
++    return nullptr;
++}
++
+ } // namespace
+ 
+ lgp::framework::Status Renderer::CreateShaders()
+@@ -374,6 +388,59 @@ std::expected<Renderer::FrameGraphPlan, lgp::framework::Error> Renderer::Compile
+     };
+ }
+ 
++lgp::framework::Status Renderer::ApplyBarrierGroup(ID3D12GraphicsCommandList7 &commandList,
++                                                   TextureBarrierGroup const &group,
++                                                   std::vector<ID3D12Resource *> const &resources) const
++{
++    if (group.records.empty())
++    {
++        return {};
++    }
++
++    std::vector<D3D12_TEXTURE_BARRIER> barriers{};
++    barriers.reserve(group.records.size());
++    for (TextureBarrierRecord const &record : group.records)
++    {
++        if (record.resourceId.value >= resources.size() || resources[record.resourceId.value] == nullptr)
++        {
++            return std::unexpected(lgp::framework::MakeError(
++                "Renderer::ApplyBarrierGroup",
++                "Compiled graph referenced a texture resource that is not mapped to an ID3D12Resource."));
++        }
++
++        barriers.push_back(MakeTextureBarrier(*resources[record.resourceId.value], record.before, record.after));
++    }
++
++    D3D12_BARRIER_GROUP barrierGroup{};
++    barrierGroup.Type = D3D12_BARRIER_TYPE_TEXTURE;
++    barrierGroup.NumBarriers = static_cast<UINT>(barriers.size());
++    barrierGroup.pTextureBarriers = barriers.data();
++    commandList.Barrier(1U, &barrierGroup);
++    return {};
++}
++
++void Renderer::ExecuteAnalyticPass(ID3D12GraphicsCommandList7 &commandList) const
++{
++    float const hdrClear[]{0.0F, 0.0F, 0.0F, 1.0F};
++    commandList.OMSetRenderTargets(1U, &hdrRtv_.cpuHandle, FALSE, nullptr);
++    commandList.ClearRenderTargetView(hdrRtv_.cpuHandle, hdrClear, 0U, nullptr);
++    commandList.SetPipelineState(hdrPipeline_.Get());
++    commandList.DrawInstanced(3U, 1U, 0U, 0U);
++}
++
++void Renderer::ExecuteDisplayPass(lgp::framework::FrameContext const &frameContext) const
++{
++    ID3D12GraphicsCommandList7 &commandList = *frameContext.commandList;
++    float const frameClear[]{0.0F, 0.0F, 0.0F, 1.0F};
++    commandList.OMSetRenderTargets(1U, &frameContext.renderTargetView, FALSE, nullptr);
++    commandList.ClearRenderTargetView(frameContext.renderTargetView, frameClear, 0U, nullptr);
++    ID3D12DescriptorHeap *const descriptorHeaps[]{frameContext.shaderVisibleCbvSrvUavHeap};
++    commandList.SetDescriptorHeaps(1U, descriptorHeaps);
++    commandList.SetPipelineState(displayPipeline_.Get());
++    commandList.SetGraphicsRootDescriptorTable(HdrTexture, hdrSrv_.gpuHandle);
++    commandList.DrawInstanced(3U, 1U, 0U, 0U);
++}
++
+ lgp::framework::Status Renderer::Initialize(lgp::framework::ApplicationInitContext const &context)
+ {
+     deviceResources_ = &context.deviceResources;
+@@ -404,7 +471,6 @@ lgp::framework::Status Renderer::Update(lgp::framework::UpdateContext const &)
+ }
+ 
+ 
+-
+ lgp::framework::Status Renderer::Render(lgp::framework::FrameContext const &frameContext)
+ {
+     if (frameContext.commandList == nullptr || frameContext.renderTarget == nullptr || hdrIntermediate_ == nullptr)
+@@ -421,54 +487,51 @@ lgp::framework::Status Renderer::Render(lgp::framework::FrameContext const &fram
+     FrameGraphPlan plan = std::move(*planResult);
+     lastCompiledGraph_ = plan.compiledGraph;
+ 
++    CompiledPass const *analyticPass = FindCompiledPass(plan.compiledGraph, plan.analyticPassId);
++    CompiledPass const *displayPass = FindCompiledPass(plan.compiledGraph, plan.displayPassId);
++    CompiledPass const *frameBoundaryPass = FindCompiledPass(plan.compiledGraph, plan.frameBoundaryPassId);
++    if (analyticPass == nullptr || displayPass == nullptr || frameBoundaryPass == nullptr)
++    {
++        return std::unexpected(lgp::framework::MakeError(
++            "Renderer::Render", "Compiled graph did not produce the expected Chapter 8 starter passes."));
++    }
++
++    std::vector<ID3D12Resource *> resources(plan.compiledGraph.textureResources.size(), nullptr);
++    resources[plan.hdrResourceId.value] = hdrIntermediate_.Get();
++    resources[plan.frameTargetResourceId.value] = frameContext.renderTarget;
++
+     ID3D12GraphicsCommandList7 &commandList = *frameContext.commandList;
+     commandList.RSSetViewports(1U, &frameContext.viewport);
+     commandList.RSSetScissorRects(1U, &frameContext.scissorRect);
+     commandList.IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+     commandList.SetGraphicsRootSignature(rootSignature_.Get());
+ 
+-    std::array<D3D12_TEXTURE_BARRIER, 1U> analyticBarriers{
+-        MakeTextureBarrier(*hdrIntermediate_.Get(), ShaderResourceState(), RenderTargetState()),
+-    };
+-    D3D12_BARRIER_GROUP analyticGroup{};
+-    analyticGroup.Type = D3D12_BARRIER_TYPE_TEXTURE;
+-    analyticGroup.NumBarriers = static_cast<UINT>(analyticBarriers.size());
+-    analyticGroup.pTextureBarriers = analyticBarriers.data();
+-    commandList.Barrier(1U, &analyticGroup);
+-
+-    float const hdrClear[]{0.0F, 0.0F, 0.0F, 1.0F};
+-    commandList.OMSetRenderTargets(1U, &hdrRtv_.cpuHandle, FALSE, nullptr);
+-    commandList.ClearRenderTargetView(hdrRtv_.cpuHandle, hdrClear, 0U, nullptr);
+-    commandList.SetPipelineState(hdrPipeline_.Get());
+-    commandList.DrawInstanced(3U, 1U, 0U, 0U);
++    for (TextureBarrierGroup const &barrierGroup : analyticPass->barrierGroups)
++    {
++        if (auto status = ApplyBarrierGroup(commandList, barrierGroup, resources); !status)
++        {
++            return status;
++        }
++    }
++    ExecuteAnalyticPass(commandList);
+ 
+-    std::array<D3D12_TEXTURE_BARRIER, 2U> displayBarriers{
+-        MakeTextureBarrier(*hdrIntermediate_.Get(), RenderTargetState(), ShaderResourceState()),
+-        MakeTextureBarrier(*frameContext.renderTarget, FrameStartState(frameContext), RenderTargetState()),
+-    };
+-    D3D12_BARRIER_GROUP displayGroup{};
+-    displayGroup.Type = D3D12_BARRIER_TYPE_TEXTURE;
+-    displayGroup.NumBarriers = static_cast<UINT>(displayBarriers.size());
+-    displayGroup.pTextureBarriers = displayBarriers.data();
+-    commandList.Barrier(1U, &displayGroup);
++    for (TextureBarrierGroup const &barrierGroup : displayPass->barrierGroups)
++    {
++        if (auto status = ApplyBarrierGroup(commandList, barrierGroup, resources); !status)
++        {
++            return status;
++        }
++    }
++    ExecuteDisplayPass(frameContext);
+ 
+-    float const frameClear[]{0.0F, 0.0F, 0.0F, 1.0F};
+-    commandList.OMSetRenderTargets(1U, &frameContext.renderTargetView, FALSE, nullptr);
+-    commandList.ClearRenderTargetView(frameContext.renderTargetView, frameClear, 0U, nullptr);
+-    ID3D12DescriptorHeap *const descriptorHeaps[]{frameContext.shaderVisibleCbvSrvUavHeap};
+-    commandList.SetDescriptorHeaps(1U, descriptorHeaps);
+-    commandList.SetPipelineState(displayPipeline_.Get());
+-    commandList.SetGraphicsRootDescriptorTable(HdrTexture, hdrSrv_.gpuHandle);
+-    commandList.DrawInstanced(3U, 1U, 0U, 0U);
++    for (TextureBarrierGroup const &barrierGroup : frameBoundaryPass->barrierGroups)
++    {
++        if (auto status = ApplyBarrierGroup(commandList, barrierGroup, resources); !status)
++        {
++            return status;
++        }
++    }
+ 
+-    std::array<D3D12_TEXTURE_BARRIER, 1U> frameBoundaryBarriers{
+-        MakeTextureBarrier(*frameContext.renderTarget, RenderTargetState(), FrameEndState(frameContext)),
+-    };
+-    D3D12_BARRIER_GROUP frameBoundaryGroup{};
+-    frameBoundaryGroup.Type = D3D12_BARRIER_TYPE_TEXTURE;
+-    frameBoundaryGroup.NumBarriers = static_cast<UINT>(frameBoundaryBarriers.size());
+-    frameBoundaryGroup.pTextureBarriers = frameBoundaryBarriers.data();
+-    commandList.Barrier(1U, &frameBoundaryGroup);
+     return {};
+ }
+ 
+diff --git a/chapters/frame-graph-and-resource-lifetimes/Starter/Renderer.hpp b/chapters/frame-graph-and-resource-lifetimes/Starter/Renderer.hpp
+index 2139aa5..4e445f7 100644
+--- a/chapters/frame-graph-and-resource-lifetimes/Starter/Renderer.hpp
++++ b/chapters/frame-graph-and-resource-lifetimes/Starter/Renderer.hpp
+@@ -44,6 +44,11 @@ class Renderer final : public lgp::framework::IChapterRenderer
+     [[nodiscard]] lgp::framework::Status CreateHdrIntermediate(lgp::framework::Extent2D size);
+     [[nodiscard]] std::expected<FrameGraphPlan, lgp::framework::Error> CompileFrameGraph(
+         lgp::framework::FrameContext const &frameContext) const;
++    [[nodiscard]] lgp::framework::Status ApplyBarrierGroup(ID3D12GraphicsCommandList7 &commandList,
++                                                           TextureBarrierGroup const &group,
++                                                           std::vector<ID3D12Resource *> const &resources) const;
++    void ExecuteAnalyticPass(ID3D12GraphicsCommandList7 &commandList) const;
++    void ExecuteDisplayPass(lgp::framework::FrameContext const &frameContext) const;
+ 
+     lgp::framework::DeviceResources *deviceResources_{};
+     lgp::framework::CompiledShader fullscreenVertexShader_{};

@@ -1,0 +1,196 @@
+diff --git a/chapters/gpu-work-distribution-and-indirect-execution/Starter/Renderer.cpp b/chapters/gpu-work-distribution-and-indirect-execution/Starter/Renderer.cpp
+index c3e5a40..8570c64 100644
+--- a/chapters/gpu-work-distribution-and-indirect-execution/Starter/Renderer.cpp
++++ b/chapters/gpu-work-distribution-and-indirect-execution/Starter/Renderer.cpp
+@@ -578,7 +578,6 @@ lgp::framework::Status Renderer::Render(lgp::framework::FrameContext const &fram
+     {
+         return writeStatus;
+     }
+-
+     ID3D12GraphicsCommandList7 &commandList = *frameContext.commandList;
+     ID3D12DescriptorHeap *const heaps[]{frameContext.shaderVisibleCbvSrvUavHeap};
+     commandList.SetDescriptorHeaps(1U, heaps);
+@@ -586,27 +585,41 @@ lgp::framework::Status Renderer::Render(lgp::framework::FrameContext const &fram
+     std::vector<D3D12_BUFFER_BARRIER> bufferBarriers{};
+     gpu::BufferBarrierState const writableBefore =
+         slot.writableStateInitialized ? gpu::ComputeUnorderedAccessState() : gpu::NoAccessState();
+-    bufferBarriers.push_back(gpu::MakeBufferBarrier(*slot.flags.Get(), writableBefore, gpu::ComputeUnorderedAccessState()));
+-    bufferBarriers.push_back(gpu::MakeBufferBarrier(*slot.emittedIndices.Get(), writableBefore, gpu::ComputeUnorderedAccessState()));
+-    bufferBarriers.push_back(gpu::MakeBufferBarrier(*slot.indirectCommands.Get(), writableBefore, gpu::ComputeUnorderedAccessState()));
+-    bufferBarriers.push_back(gpu::MakeBufferBarrier(*slot.indirectCount.Get(), writableBefore, gpu::ComputeUnorderedAccessState()));
+-    bufferBarriers.push_back(gpu::MakeBufferBarrier(*slot.statistics.Get(), writableBefore, gpu::ComputeUnorderedAccessState()));
++    bufferBarriers.push_back(
++        gpu::MakeBufferBarrier(*slot.flags.Get(), writableBefore, gpu::ComputeUnorderedAccessState()));
++    bufferBarriers.push_back(
++        gpu::MakeBufferBarrier(*slot.emittedIndices.Get(), writableBefore, gpu::ComputeUnorderedAccessState()));
++    bufferBarriers.push_back(
++        gpu::MakeBufferBarrier(*slot.indirectCommands.Get(), writableBefore, gpu::ComputeUnorderedAccessState()));
++    bufferBarriers.push_back(
++        gpu::MakeBufferBarrier(*slot.indirectCount.Get(), writableBefore, gpu::ComputeUnorderedAccessState()));
++    bufferBarriers.push_back(
++        gpu::MakeBufferBarrier(*slot.statistics.Get(), writableBefore, gpu::ComputeUnorderedAccessState()));
+     gpu::SubmitBufferBarriers(commandList, bufferBarriers);
+ 
+-    DispatchConstants const dispatchConstants{configuration.capacity, gpu::kCandidateCount, gpu::kVertexCountPerQuad, 0U};
++    DispatchConstants const dispatchConstants{configuration.capacity, gpu::kCandidateCount, gpu::kVertexCountPerQuad,
++                                              0U};
++
+     commandList.SetComputeRootSignature(computeRootSignature_.Get());
+-    commandList.SetComputeRoot32BitConstants(DispatchRootConstants, sizeof(DispatchConstants) / sizeof(std::uint32_t), &dispatchConstants, 0U);
++    commandList.SetComputeRoot32BitConstants(DispatchRootConstants, sizeof(DispatchConstants) / sizeof(std::uint32_t),
++                                             &dispatchConstants, 0U);
+     commandList.SetComputeRootDescriptorTable(ComputeSrvTable, slot.descriptors.GpuHandle(CandidateSrv));
+     commandList.SetComputeRootDescriptorTable(ComputeUavTable, slot.descriptors.GpuHandle(FlagsUav));
++
+     commandList.SetPipelineState(resetPipeline_.Get());
+     commandList.Dispatch(1U, 1U, 1U);
+ 
+     bufferBarriers = {
+-        gpu::MakeBufferBarrier(*slot.flags.Get(), gpu::ComputeUnorderedAccessState(), gpu::ComputeUnorderedAccessState()),
+-        gpu::MakeBufferBarrier(*slot.emittedIndices.Get(), gpu::ComputeUnorderedAccessState(), gpu::ComputeUnorderedAccessState()),
+-        gpu::MakeBufferBarrier(*slot.indirectCommands.Get(), gpu::ComputeUnorderedAccessState(), gpu::ComputeUnorderedAccessState()),
+-        gpu::MakeBufferBarrier(*slot.indirectCount.Get(), gpu::ComputeUnorderedAccessState(), gpu::ComputeUnorderedAccessState()),
+-        gpu::MakeBufferBarrier(*slot.statistics.Get(), gpu::ComputeUnorderedAccessState(), gpu::ComputeUnorderedAccessState()),
++        gpu::MakeBufferBarrier(*slot.flags.Get(), gpu::ComputeUnorderedAccessState(),
++                               gpu::ComputeUnorderedAccessState()),
++        gpu::MakeBufferBarrier(*slot.emittedIndices.Get(), gpu::ComputeUnorderedAccessState(),
++                               gpu::ComputeUnorderedAccessState()),
++        gpu::MakeBufferBarrier(*slot.indirectCommands.Get(), gpu::ComputeUnorderedAccessState(),
++                               gpu::ComputeUnorderedAccessState()),
++        gpu::MakeBufferBarrier(*slot.indirectCount.Get(), gpu::ComputeUnorderedAccessState(),
++                               gpu::ComputeUnorderedAccessState()),
++        gpu::MakeBufferBarrier(*slot.statistics.Get(), gpu::ComputeUnorderedAccessState(),
++                               gpu::ComputeUnorderedAccessState()),
+     };
+     gpu::SubmitBufferBarriers(commandList, bufferBarriers);
+ 
+@@ -614,15 +627,26 @@ lgp::framework::Status Renderer::Render(lgp::framework::FrameContext const &fram
+     commandList.Dispatch(1U, 1U, 1U);
+ 
+     bufferBarriers = {
+-        gpu::MakeBufferBarrier(*slot.flags.Get(), gpu::ComputeUnorderedAccessState(), gpu::ComputeShaderResourceState()),
++        gpu::MakeBufferBarrier(*slot.flags.Get(), gpu::ComputeUnorderedAccessState(),
++                               gpu::ComputeShaderResourceState()),
+     };
+     gpu::SubmitBufferBarriers(commandList, bufferBarriers);
+ 
+-    commandList.SetPipelineState(stablePipeline_.Get());
++    commandList.SetPipelineState((configuration.mode == gpu::ExecutionMode::Stable) ? stablePipeline_.Get()
++                                                                                    : atomicPipeline_.Get());
+     commandList.Dispatch(1U, 1U, 1U);
+ 
++    bufferBarriers = {
++        gpu::MakeBufferBarrier(*slot.indirectCommands.Get(), gpu::ComputeUnorderedAccessState(),
++                               gpu::ExecuteIndirectState()),
++        gpu::MakeBufferBarrier(*slot.indirectCount.Get(), gpu::ComputeUnorderedAccessState(),
++                               gpu::ExecuteIndirectState()),
++    };
++    gpu::SubmitBufferBarriers(commandList, bufferBarriers);
++
+     std::vector<D3D12_TEXTURE_BARRIER> textureBarriers{
+-        gpu::MakeTextureBarrier(*frameContext.renderTarget, gpu::FrameStartState(frameContext), gpu::RenderTargetState()),
++        gpu::MakeTextureBarrier(*frameContext.renderTarget, gpu::FrameStartState(frameContext),
++                                gpu::RenderTargetState()),
+     };
+     gpu::SubmitTextureBarriers(commandList, textureBarriers);
+ 
+@@ -633,21 +657,36 @@ lgp::framework::Status Renderer::Render(lgp::framework::FrameContext const &fram
+     commandList.RSSetScissorRects(1U, &frameContext.scissorRect);
+     commandList.IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+     commandList.SetGraphicsRootSignature(graphicsRootSignature_.Get());
+-    commandList.SetPipelineState(graphicsPipeline_.Get());
+     commandList.SetGraphicsRootDescriptorTable(CandidateSrvTable, slot.descriptors.GpuHandle(CandidateSrv));
++    commandList.SetPipelineState(graphicsPipeline_.Get());
++    commandList.ExecuteIndirect(commandSignature_.Get(), configuration.capacity, slot.indirectCommands.Get(), 0U,
++                                slot.indirectCount.Get(), 0U);
+ 
+     bufferBarriers = {
+-        gpu::MakeBufferBarrier(*slot.indirectCommands.Get(), gpu::ComputeUnorderedAccessState(), gpu::ExecuteIndirectState()),
+-        gpu::MakeBufferBarrier(*slot.indirectCount.Get(), gpu::ComputeUnorderedAccessState(), gpu::ExecuteIndirectState()),
++        gpu::MakeBufferBarrier(*slot.emittedIndices.Get(), gpu::ComputeUnorderedAccessState(), gpu::CopySourceState()),
++        gpu::MakeBufferBarrier(*slot.indirectCommands.Get(), gpu::ExecuteIndirectState(), gpu::CopySourceState()),
++        gpu::MakeBufferBarrier(*slot.indirectCount.Get(), gpu::ExecuteIndirectState(), gpu::CopySourceState()),
++        gpu::MakeBufferBarrier(*slot.statistics.Get(), gpu::ComputeUnorderedAccessState(), gpu::CopySourceState()),
+     };
+     gpu::SubmitBufferBarriers(commandList, bufferBarriers);
+ 
+-    commandList.ExecuteIndirect(commandSignature_.Get(), configuration.capacity, slot.indirectCommands.Get(), 0U, slot.indirectCount.Get(), 0U);
++    commandList.CopyBufferRegion(slot.emittedIndicesReadback.Get(), 0U, slot.emittedIndices.Get(), 0U,
++                                 slot.emittedIndices.size_in_bytes());
++    commandList.CopyBufferRegion(slot.indirectCommandsReadback.Get(), 0U, slot.indirectCommands.Get(), 0U,
++                                 slot.indirectCommands.size_in_bytes());
++    commandList.CopyBufferRegion(slot.indirectCountReadback.Get(), 0U, slot.indirectCount.Get(), 0U,
++                                 slot.indirectCount.size_in_bytes());
++    commandList.CopyBufferRegion(slot.statisticsReadback.Get(), 0U, slot.statistics.Get(), 0U,
++                                 slot.statistics.size_in_bytes());
+ 
+     bufferBarriers = {
+-        gpu::MakeBufferBarrier(*slot.flags.Get(), gpu::ComputeShaderResourceState(), gpu::ComputeUnorderedAccessState()),
+-        gpu::MakeBufferBarrier(*slot.indirectCommands.Get(), gpu::ExecuteIndirectState(), gpu::ComputeUnorderedAccessState()),
+-        gpu::MakeBufferBarrier(*slot.indirectCount.Get(), gpu::ExecuteIndirectState(), gpu::ComputeUnorderedAccessState()),
++        gpu::MakeBufferBarrier(*slot.flags.Get(), gpu::ComputeShaderResourceState(),
++                               gpu::ComputeUnorderedAccessState()),
++        gpu::MakeBufferBarrier(*slot.emittedIndices.Get(), gpu::CopySourceState(), gpu::ComputeUnorderedAccessState()),
++        gpu::MakeBufferBarrier(*slot.indirectCommands.Get(), gpu::CopySourceState(),
++                               gpu::ComputeUnorderedAccessState()),
++        gpu::MakeBufferBarrier(*slot.indirectCount.Get(), gpu::CopySourceState(), gpu::ComputeUnorderedAccessState()),
++        gpu::MakeBufferBarrier(*slot.statistics.Get(), gpu::CopySourceState(), gpu::ComputeUnorderedAccessState()),
+     };
+     gpu::SubmitBufferBarriers(commandList, bufferBarriers);
+ 
+@@ -655,7 +694,7 @@ lgp::framework::Status Renderer::Render(lgp::framework::FrameContext const &fram
+         gpu::MakeTextureBarrier(*frameContext.renderTarget, gpu::RenderTargetState(), gpu::FrameEndState(frameContext)),
+     };
+     gpu::SubmitTextureBarriers(commandList, textureBarriers);
+-
++    slot.writableStateInitialized = true;
+     slot.writableStateInitialized = true;
+     lastRenderedFrameSlot_ = frameContext.frameSlot;
+     return {};
+@@ -701,8 +740,44 @@ void Renderer::ConfigureHeadlessTest(HeadlessTestConfiguration const &configurat
+ 
+ std::expected<Renderer::ReadbackOutputs, lgp::framework::Error> Renderer::ReadBackOutputs()
+ {
+-    return std::unexpected(lgp::framework::MakeError(
+-        "ReadBackOutputs", "Chapter 13 Starter enables indirect diagnostics and readback in a later patch."));
++    if (frameSlots_.empty())
++    {
++        return std::unexpected(lgp::framework::MakeError("ReadBackOutputs", "No Chapter 13 frame has been rendered."));
++    }
++    auto const idle = deviceResources_->WaitForGpuIdle();
++    if (!idle)
++    {
++        return std::unexpected(std::move(idle.error()));
++    }
++
++    FrameSlotResources const &slot = frameSlots_[lastRenderedFrameSlot_];
++    ReadbackOutputs outputs{};
++    outputs.mode = ActiveConfiguration().mode;
++
++    auto const *statisticsValues = reinterpret_cast<std::uint32_t const *>(slot.statisticsReadback.mapped_data());
++    auto const *countValue = reinterpret_cast<std::uint32_t const *>(slot.indirectCountReadback.mapped_data());
++    if (statisticsValues == nullptr || countValue == nullptr)
++    {
++        return std::unexpected(
++            lgp::framework::MakeError("ReadBackOutputs", "The Chapter 13 readback buffers are not mapped."));
++    }
++
++    outputs.statistics = {
++        statisticsValues[0],
++        statisticsValues[1],
++        statisticsValues[2],
++        statisticsValues[3],
++    };
++    outputs.gpuCount = countValue[0];
++    outputs.executionCount = ResolveExecutionCount(ActiveConfiguration().capacity, outputs.gpuCount);
++
++    auto const *indices = reinterpret_cast<std::uint32_t const *>(slot.emittedIndicesReadback.mapped_data());
++    outputs.emittedCandidateIndices.assign(indices, indices + outputs.statistics.emittedCount);
++
++    outputs.indirectCommands.resize(outputs.statistics.emittedCount);
++    std::memcpy(outputs.indirectCommands.data(), slot.indirectCommandsReadback.mapped_data(),
++                static_cast<std::size_t>(outputs.statistics.emittedCount) * sizeof(IndirectDrawCommand));
++    return outputs;
+ }
+ 
+ } // namespace ch13::work_distribution::starter

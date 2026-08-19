@@ -1,0 +1,246 @@
+diff --git a/chapters/color-spaces-hdr-exposure-and-tone-mapping/CMakeLists.txt b/chapters/color-spaces-hdr-exposure-and-tone-mapping/CMakeLists.txt
+index 035a167..c3723eb 100644
+--- a/chapters/color-spaces-hdr-exposure-and-tone-mapping/CMakeLists.txt
++++ b/chapters/color-spaces-hdr-exposure-and-tone-mapping/CMakeLists.txt
+@@ -34,9 +34,24 @@ set_source_files_properties(
+     PROPERTIES
+         HEADER_FILE_ONLY TRUE)
+
+-add_library(ch04_color_pipeline_starter_logic STATIC ${LGP_CH04_COMMON_HEADERS} ${LGP_CH04_STARTER_SOURCES})
+-target_link_libraries(ch04_color_pipeline_starter_logic PUBLIC LGP::Framework)
+-target_include_directories(ch04_color_pipeline_starter_logic PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}")
++add_library(
++    ch04_color_pipeline_starter_logic
++    STATIC
++        ${LGP_CH04_COMMON_HEADERS}
++        ${LGP_CH04_STARTER_SOURCES}
++        "${LGP_CH04_IMGUI_DX12_BACKEND}")
++target_link_libraries(
++    ch04_color_pipeline_starter_logic
++    PUBLIC
++        DearImGui::DearImGui
++        LGP::Framework)
++target_include_directories(
++    ch04_color_pipeline_starter_logic
++    PUBLIC
++        "${CMAKE_CURRENT_SOURCE_DIR}"
++        "${LGP_CH04_IMGUI_ROOT}"
++        "${LGP_CH04_IMGUI_ROOT}/backends")
++target_compile_definitions(ch04_color_pipeline_starter_logic PRIVATE IMGUI_IMPL_WIN32_DISABLE_GAMEPAD)
+ set_target_properties(
+     ch04_color_pipeline_starter_logic
+     PROPERTIES
+@@ -85,6 +100,7 @@ set_target_properties(
+         FOLDER "Chapters/ColorPipeline")
+ lgp_configure_framework_chapter_app(
+     TARGET Ch04_ColorPipeline_Starter
++    ENABLE_IMGUI
+     EXTRA_DEPENDENCIES ch04_color_pipeline_starter_logic)
+
+ add_executable(Ch04_ColorPipeline_Solution "${CMAKE_CURRENT_SOURCE_DIR}/Solution/Main.cpp")
+diff --git a/chapters/color-spaces-hdr-exposure-and-tone-mapping/Starter/Renderer.cpp b/chapters/color-spaces-hdr-exposure-and-tone-mapping/Starter/Renderer.cpp
+index 0c1cd2c..fc76ad8 100644
+--- a/chapters/color-spaces-hdr-exposure-and-tone-mapping/Starter/Renderer.cpp
++++ b/chapters/color-spaces-hdr-exposure-and-tone-mapping/Starter/Renderer.cpp
+@@ -8,10 +8,15 @@
+
+ #include "Renderer.hpp"
+
++#include <imgui.h>
++#include <imgui_impl_dx12.h>
++
+ #include <d3d12.h>
+ #include <wrl/client.h>
+
++#include <algorithm>
+ #include <array>
++#include <cmath>
+ #include <cstdint>
+ #include <filesystem>
+ #include <memory>
+@@ -102,13 +107,19 @@ class Renderer::Impl final
+     lgp::framework::DescriptorAllocation hdrRtv{};
+     lgp::framework::DescriptorAllocation hdrSrv{};
+     ComPtr<ID3D12Resource> hdrTarget{};
++    lgp::framework::DescriptorAllocation imguiFontDescriptor{};
+     OutputRootConstants outputConstants{};
++    bool headless{};
++    bool imguiInitialized{};
++    bool imguiFrameBegun{};
+
+     [[nodiscard]] lgp::framework::Status Initialize(lgp::framework::ApplicationInitContext const &context);
+     [[nodiscard]] lgp::framework::Status CreateShaders();
+     [[nodiscard]] lgp::framework::Status CreateRootSignature();
+     [[nodiscard]] lgp::framework::Status CreatePipelineStates();
+     [[nodiscard]] lgp::framework::Status CreateHdrTarget(lgp::framework::Extent2D size);
++    [[nodiscard]] lgp::framework::Status InitializeImGui();
++    [[nodiscard]] lgp::framework::Status BuildUi(lgp::framework::UpdateContext const &context);
+     [[nodiscard]] lgp::framework::Status Render(lgp::framework::FrameContext const &frameContext);
+     void Shutdown() noexcept;
+ };
+@@ -351,9 +362,42 @@ lgp::framework::Status Renderer::Impl::CreateHdrTarget(lgp::framework::Extent2D
+     return {};
+ }
+
++lgp::framework::Status Renderer::Impl::InitializeImGui()
++{
++    auto descriptorResult = deviceResources->shader_visible_cbv_srv_uav_heap().Allocate(1U);
++    if (!descriptorResult)
++    {
++        return std::unexpected(std::move(descriptorResult.error()));
++    }
++    imguiFontDescriptor = descriptorResult.value();
++
++    IMGUI_CHECKVERSION();
++    ImGui::CreateContext();
++    ImGui::StyleColorsDark();
++    ImGui::GetIO().BackendPlatformName = "LGP.ManualInput";
++
++    ImGui_ImplDX12_InitInfo info{};
++    info.Device = deviceResources->device();
++    info.CommandQueue = deviceResources->graphics_queue();
++    info.NumFramesInFlight = static_cast<int>(deviceResources->back_buffer_count());
++    info.RTVFormat = deviceResources->back_buffer_format();
++    info.SrvDescriptorHeap = deviceResources->shader_visible_cbv_srv_uav_heap().Get();
++    info.LegacySingleSrvCpuDescriptor = imguiFontDescriptor.cpuHandle;
++    info.LegacySingleSrvGpuDescriptor = imguiFontDescriptor.gpuHandle;
++    if (!ImGui_ImplDX12_Init(&info))
++    {
++        return std::unexpected(
++            lgp::framework::MakeError("ImGui_ImplDX12_Init", "Failed to initialize the color pipeline UI."));
++    }
++    imguiInitialized = true;
++    return {};
++}
++
+ lgp::framework::Status Renderer::Impl::Initialize(lgp::framework::ApplicationInitContext const &context)
+ {
+     deviceResources = &context.deviceResources;
++    headless = context.commandLine.headless;
++
+     if (auto status = CreateShaders(); !status)
+     {
+         return status;
+@@ -370,6 +414,50 @@ lgp::framework::Status Renderer::Impl::Initialize(lgp::framework::ApplicationIni
+     {
+         return status;
+     }
++    if (!headless)
++    {
++        return InitializeImGui();
++    }
++    return {};
++}
++
++lgp::framework::Status Renderer::Impl::BuildUi(lgp::framework::UpdateContext const &context)
++{
++    if (headless || !imguiInitialized)
++    {
++        return {};
++    }
++
++    ImGuiIO &io = ImGui::GetIO();
++    io.DisplaySize = {
++        static_cast<float>(context.drawableSize.width),
++        static_cast<float>(context.drawableSize.height),
++    };
++    io.DeltaTime = static_cast<float>(std::max(context.deltaSeconds, 1.0 / 240.0));
++    io.AddMousePosEvent(static_cast<float>(context.input.mouse.x), static_cast<float>(context.input.mouse.y));
++    io.AddMouseButtonEvent(0, context.input.mouse.IsButtonDown(lgp::framework::MouseButton::Left));
++    io.AddMouseWheelEvent(0.0F, context.input.mouse.wheelDelta);
++
++    ImGui_ImplDX12_NewFrame();
++    ImGui::NewFrame();
++    imguiFrameBegun = true;
++
++    ImGui::Begin("Color Pipeline");
++    ImGui::SliderFloat("Exposure EV", &outputConstants.exposureValue, -8.0F, 8.0F, "%.2f EV");
++
++    int toneMapper = static_cast<int>(outputConstants.toneMapper);
++    ImGui::Combo("Tone mapper", &toneMapper, "None\0Reinhard\0ACES-fitted\0");
++    outputConstants.toneMapper = static_cast<std::uint32_t>(toneMapper);
++
++    bool bypassSrgb = outputConstants.bypassSrgbEncode != 0U;
++    ImGui::Checkbox("Diagnostic: bypass exact sRGB encode", &bypassSrgb);
++    outputConstants.bypassSrgbEncode = bypassSrgb ? 1U : 0U;
++
++    ImGui::Separator();
++    ImGui::Text("Exposure multiplier: %.3fx", static_cast<double>(std::exp2(outputConstants.exposureValue)));
++    ImGui::TextWrapped("Pass 1 renders analytic HDR color into R16G16B16A16_FLOAT. Pass 2 applies exposure, "
++                       "tone mapping, then exact sRGB encoding unless the diagnostic bypass is enabled.");
++    ImGui::End();
+     return {};
+ }
+
+@@ -377,6 +465,11 @@ lgp::framework::Status Renderer::Impl::Render(lgp::framework::FrameContext const
+ {
+     if (frameContext.commandList == nullptr || frameContext.renderTarget == nullptr || hdrTarget == nullptr)
+     {
++        if (imguiFrameBegun)
++        {
++            ImGui::EndFrame();
++            imguiFrameBegun = false;
++        }
+         return {};
+     }
+
+@@ -407,6 +500,13 @@ lgp::framework::Status Renderer::Impl::Render(lgp::framework::FrameContext const
+     commandList->SetGraphicsRootDescriptorTable(HdrTexture, hdrSrv.gpuHandle);
+     commandList->DrawInstanced(3U, 1U, 0U, 0U);
+
++    if (imguiFrameBegun)
++    {
++        ImGui::Render();
++        ImGui_ImplDX12_RenderDrawData(ImGui::GetDrawData(), commandList);
++        imguiFrameBegun = false;
++    }
++
+     lgp::framework::TransitionTexture(*commandList, *frameContext.renderTarget, kRenderTargetState,
+                                       FrameEndState(frameContext));
+     return {};
+@@ -414,6 +514,22 @@ lgp::framework::Status Renderer::Impl::Render(lgp::framework::FrameContext const
+
+ void Renderer::Impl::Shutdown() noexcept
+ {
++    if (imguiFrameBegun)
++    {
++        ImGui::EndFrame();
++        imguiFrameBegun = false;
++    }
++    if (imguiInitialized)
++    {
++        ImGui_ImplDX12_Shutdown();
++        ImGui::DestroyContext();
++        imguiInitialized = false;
++    }
++    if (deviceResources != nullptr && imguiFontDescriptor)
++    {
++        deviceResources->shader_visible_cbv_srv_uav_heap().Free(imguiFontDescriptor);
++        imguiFontDescriptor = {};
++    }
+     hdrTarget.Reset();
+     if (deviceResources != nullptr && hdrRtv)
+     {
+@@ -452,6 +568,11 @@ lgp::framework::Status Renderer::Update(lgp::framework::UpdateContext const &)
+     return {};
+ }
+
++lgp::framework::Status Renderer::BuildUi(lgp::framework::UpdateContext const &context)
++{
++    return impl_->BuildUi(context);
++}
++
+ lgp::framework::Status Renderer::Render(lgp::framework::FrameContext const &frameContext)
+ {
+     return impl_->Render(frameContext);
+diff --git a/chapters/color-spaces-hdr-exposure-and-tone-mapping/Starter/Renderer.hpp b/chapters/color-spaces-hdr-exposure-and-tone-mapping/Starter/Renderer.hpp
+index 5ea5e90..d229b43 100644
+--- a/chapters/color-spaces-hdr-exposure-and-tone-mapping/Starter/Renderer.hpp
++++ b/chapters/color-spaces-hdr-exposure-and-tone-mapping/Starter/Renderer.hpp
+@@ -24,5 +24,6 @@ class Renderer final : public lgp::framework::IChapterRenderer
+     [[nodiscard]] lgp::framework::Status OnResize(lgp::framework::DeviceResources &deviceResources,
+                                                   lgp::framework::Extent2D drawableSize) override;
+     [[nodiscard]] lgp::framework::Status Update(lgp::framework::UpdateContext const &context) override;
++    [[nodiscard]] lgp::framework::Status BuildUi(lgp::framework::UpdateContext const &context) override;
+     [[nodiscard]] lgp::framework::Status Render(lgp::framework::FrameContext const &frameContext) override;
+     void Shutdown(lgp::framework::DeviceResources &deviceResources) noexcept override;

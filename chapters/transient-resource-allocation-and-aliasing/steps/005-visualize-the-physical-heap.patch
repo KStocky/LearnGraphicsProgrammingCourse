@@ -1,0 +1,622 @@
+diff --git a/chapters/transient-resource-allocation-and-aliasing/CMakeLists.txt b/chapters/transient-resource-allocation-and-aliasing/CMakeLists.txt
+index a946d81..9e05893 100644
+--- a/chapters/transient-resource-allocation-and-aliasing/CMakeLists.txt
++++ b/chapters/transient-resource-allocation-and-aliasing/CMakeLists.txt
+@@ -72,14 +72,25 @@ set_target_properties(
+         FOLDER "Chapters/TransientAllocation")
+ source_group(TREE "${CMAKE_CURRENT_SOURCE_DIR}" FILES ${LGP_CH09_GPU_COMMON_SOURCES})
+ 
+-add_library(ch09_transient_aliasing_starter_logic STATIC ${LGP_CH09_STARTER_SOURCES})
++add_library(
++    ch09_transient_aliasing_starter_logic
++    STATIC
++        ${LGP_CH09_STARTER_SOURCES}
++        "${LGP_CH09_IMGUI_DX12_BACKEND}")
+ target_link_libraries(
+     ch09_transient_aliasing_starter_logic
+     PUBLIC
++        DearImGui::DearImGui
+         ch09_transient_aliasing_gpu_common
+         LGP::Ch09TransientAllocationContracts
+         LGP::Framework)
+-target_include_directories(ch09_transient_aliasing_starter_logic PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}")
++target_include_directories(
++    ch09_transient_aliasing_starter_logic
++    PUBLIC
++        "${CMAKE_CURRENT_SOURCE_DIR}"
++        "${LGP_CH09_IMGUI_ROOT}"
++        "${LGP_CH09_IMGUI_ROOT}/backends")
++target_compile_definitions(ch09_transient_aliasing_starter_logic PRIVATE IMGUI_IMPL_WIN32_DISABLE_GAMEPAD)
+ set_target_properties(
+     ch09_transient_aliasing_starter_logic
+     PROPERTIES
+@@ -128,6 +139,7 @@ set_target_properties(
+         FOLDER "Chapters/TransientAllocation")
+ lgp_configure_framework_chapter_app(
+     TARGET Ch09_TransientAliasing_Starter
++    ENABLE_IMGUI
+     EXTRA_DEPENDENCIES ch09_transient_aliasing_starter_logic)
+ 
+ add_executable(Ch09_TransientAliasing_Solution "${CMAKE_CURRENT_SOURCE_DIR}/Solution/Main.cpp")
+diff --git a/chapters/transient-resource-allocation-and-aliasing/Starter/Main.cpp b/chapters/transient-resource-allocation-and-aliasing/Starter/Main.cpp
+index 3e5aefe..8e4c857 100644
+--- a/chapters/transient-resource-allocation-and-aliasing/Starter/Main.cpp
++++ b/chapters/transient-resource-allocation-and-aliasing/Starter/Main.cpp
+@@ -4,10 +4,10 @@
+ 
+ int wmain(int argc, wchar_t **argv)
+ {
+-    ch09::transient_aliasing::starter::Renderer renderer{};
++    ch09::transient_aliasing::solution::Renderer renderer{};
+ 
+     lgp::framework::ApplicationConfiguration configuration{};
+-    configuration.title = L"Ch09 Transient Aliasing Starter";
++    configuration.title = L"Ch09 Transient Aliasing Solution";
+     configuration.width = 1600U;
+     configuration.height = 900U;
+     configuration.rtvDescriptorCount = 32U;
+diff --git a/chapters/transient-resource-allocation-and-aliasing/Starter/Renderer.cpp b/chapters/transient-resource-allocation-and-aliasing/Starter/Renderer.cpp
+index f0d7125..9665739 100644
+--- a/chapters/transient-resource-allocation-and-aliasing/Starter/Renderer.cpp
++++ b/chapters/transient-resource-allocation-and-aliasing/Starter/Renderer.cpp
+@@ -10,17 +10,20 @@
+ 
+ #include "../Common/GpuLabSupport.hpp"
+ 
++#include <imgui.h>
++#include <imgui_impl_dx12.h>
++
+ #include <d3d12.h>
+ 
+ #include <algorithm>
+ #include <array>
++#include <cstddef>
+ #include <filesystem>
+ #include <string>
+ #include <string_view>
+ #include <utility>
+-#include <vector>
+ 
+-namespace ch09::transient_aliasing::starter
++namespace ch09::transient_aliasing::solution
+ {
+ namespace
+ {
+@@ -32,14 +35,18 @@ using gpu::RenderTargetState;
+ using gpu::ShaderResourceState;
+ using gpu::UndefinedState;
+ 
+-inline constexpr transient_allocation::HeapCompatibilityKey kRtDsTextureHeap{
++inline constexpr HeapCompatibilityKey kRtDsTextureHeap{
+     static_cast<std::uint32_t>(D3D12_HEAP_FLAG_ALLOW_ONLY_RT_DS_TEXTURES)};
+ 
+-[[nodiscard]] std::string DescribeGraphDiagnostics(
+-    std::vector<ch08::frame_graph::PassGraphDiagnostic> const &diagnostics)
++[[nodiscard]] std::filesystem::path ShaderPath()
++{
++    return std::filesystem::path{__FILE__}.parent_path() / "TransientAliasingLab.hlsl";
++}
++
++[[nodiscard]] std::string DescribeGraphDiagnostics(std::vector<PassGraphDiagnostic> const &diagnostics)
+ {
+     std::string message{};
+-    for (ch08::frame_graph::PassGraphDiagnostic const &diagnostic : diagnostics)
++    for (PassGraphDiagnostic const &diagnostic : diagnostics)
+     {
+         if (!message.empty())
+         {
+@@ -50,11 +57,10 @@ inline constexpr transient_allocation::HeapCompatibilityKey kRtDsTextureHeap{
+     return message;
+ }
+ 
+-[[nodiscard]] std::string DescribeAllocationDiagnostics(
+-    std::vector<transient_allocation::AllocationDiagnostic> const &diagnostics)
++[[nodiscard]] std::string DescribeAllocationDiagnostics(std::vector<AllocationDiagnostic> const &diagnostics)
+ {
+     std::string message{};
+-    for (transient_allocation::AllocationDiagnostic const &diagnostic : diagnostics)
++    for (AllocationDiagnostic const &diagnostic : diagnostics)
+     {
+         if (!message.empty())
+         {
+@@ -65,35 +71,37 @@ inline constexpr transient_allocation::HeapCompatibilityKey kRtDsTextureHeap{
+     return message;
+ }
+ 
+-[[nodiscard]] ch08::frame_graph::ResourceLifetime const *FindLifetime(
+-    ch08::frame_graph::CompiledPassGraph const &graph, ch08::frame_graph::TextureResourceId resourceId) noexcept
++[[nodiscard]] ResourceLifetime const *FindLifetime(CompiledPassGraph const &graph,
++                                                   TextureResourceId resourceId) noexcept
+ {
+-    auto const lifetime =
+-        std::ranges::find(graph.resourceLifetimes, resourceId, &ch08::frame_graph::ResourceLifetime::resourceId);
++    auto const lifetime = std::ranges::find(graph.resourceLifetimes, resourceId, &ResourceLifetime::resourceId);
+     return lifetime == graph.resourceLifetimes.end() ? nullptr : &*lifetime;
+ }
+ 
+-[[nodiscard]] transient_allocation::TexturePlacement const *FindPlacement(
+-    transient_allocation::TransientTextureAllocationPlan const &plan,
+-    ch08::frame_graph::TextureResourceId resourceId) noexcept
++[[nodiscard]] TexturePlacement const *FindPlacement(TransientTextureAllocationPlan const &plan,
++                                                    TextureResourceId resourceId) noexcept
+ {
+-    auto const placement =
+-        std::ranges::find(plan.placements, resourceId, &transient_allocation::TexturePlacement::resourceId);
++    auto const placement = std::ranges::find(plan.placements, resourceId, &TexturePlacement::resourceId);
+     return placement == plan.placements.end() ? nullptr : &*placement;
+ }
+ 
+-[[nodiscard]] std::filesystem::path ShaderPath()
++[[nodiscard]] std::string_view ResourceName(CompiledPassGraph const &graph, TextureResourceId resourceId) noexcept
+ {
+-    return std::filesystem::path{__FILE__}.parent_path() / "TransientAliasingLab.hlsl";
++    if (resourceId.value >= graph.textureResources.size())
++    {
++        return "unknown";
++    }
++    return graph.textureResources[resourceId.value].name;
+ }
+ 
+-void SubmitTextureBarriers(ID3D12GraphicsCommandList7 &commandList, D3D12_TEXTURE_BARRIER *barriers, UINT barrierCount)
++[[nodiscard]] std::string LifetimeLabel(ResourceLifetime const &lifetime)
+ {
+-    D3D12_BARRIER_GROUP group{};
+-    group.Type = D3D12_BARRIER_TYPE_TEXTURE;
+-    group.NumBarriers = barrierCount;
+-    group.pTextureBarriers = barriers;
+-    commandList.Barrier(1U, &group);
++    if (!lifetime.firstExecutionIndex || !lifetime.lastExecutionIndex)
++    {
++        return "unused";
++    }
++    return "[" + std::to_string(*lifetime.firstExecutionIndex) + ", " + std::to_string(*lifetime.lastExecutionIndex) +
++           "]";
+ }
+ 
+ } // namespace
+@@ -119,8 +127,6 @@ lgp::framework::Status Renderer::CreatePipelineStates()
+ 
+ std::expected<Renderer::GraphExecutionPlan, lgp::framework::Error> Renderer::CompileGraph() const
+ {
+-    using namespace ch08::frame_graph;
+-
+     PassGraph graph{};
+     TextureResourceId const textureA = graph.AddTransientTexture("A");
+     TextureResourceId const textureB = graph.AddTransientTexture("B");
+@@ -161,13 +167,33 @@ lgp::framework::Status Renderer::CreateTransientTextures(lgp::framework::Extent2
+         texture.Reset();
+     }
+     transientHeap_.Reset();
++    graphPlan_.reset();
++    allocationPlan_.reset();
++    lastAliasHandoffTrace_.clear();
+     if (size.empty())
+     {
+-        graphPlan_.reset();
+-        allocationPlan_.reset();
+         return {};
+     }
+ 
++    if (!transientRtvs_)
++    {
++        auto result = deviceResources_->rtv_heap().Allocate(3U);
++        if (!result)
++        {
++            return std::unexpected(std::move(result.error()));
++        }
++        transientRtvs_ = *result;
++    }
++    if (!transientSrvs_)
++    {
++        auto result = deviceResources_->shader_visible_cbv_srv_uav_heap().Allocate(3U);
++        if (!result)
++        {
++            return std::unexpected(std::move(result.error()));
++        }
++        transientSrvs_ = *result;
++    }
++
+     auto graphResult = CompileGraph();
+     if (!graphResult)
+     {
+@@ -186,14 +212,13 @@ lgp::framework::Status Renderer::CreateTransientTextures(lgp::framework::Extent2
+             "The adapter returned invalid allocation requirements for the Chapter 9 transient texture."));
+     }
+ 
+-    std::array<ch08::frame_graph::TextureResourceId, 3U> const resourceIds{graphPlan.textureA, graphPlan.textureB,
+-                                                                           graphPlan.textureC};
++    std::array<TextureResourceId, 3U> const resourceIds{graphPlan.textureA, graphPlan.textureB, graphPlan.textureC};
+     std::array<std::string_view, 3U> const names{"A", "B", "C"};
+-    std::vector<transient_allocation::TransientTextureRequest> requests{};
++    std::vector<TransientTextureRequest> requests{};
+     requests.reserve(resourceIds.size());
+     for (std::size_t index = 0U; index < resourceIds.size(); ++index)
+     {
+-        ch08::frame_graph::ResourceLifetime const *lifetime = FindLifetime(graphPlan.graph, resourceIds[index]);
++        ResourceLifetime const *lifetime = FindLifetime(graphPlan.graph, resourceIds[index]);
+         if (lifetime == nullptr)
+         {
+             return std::unexpected(lgp::framework::MakeError(
+@@ -203,41 +228,20 @@ lgp::framework::Status Renderer::CreateTransientTextures(lgp::framework::Extent2
+                             kRtDsTextureHeap, *lifetime});
+     }
+ 
+-    transient_allocation::TransientTextureAllocationResult planResult =
+-        transient_allocation::PlanTransientTextureAllocations(requests);
++    TransientTextureAllocationResult planResult = PlanTransientTextureAllocations(requests);
+     if (!planResult)
+     {
+         return std::unexpected(lgp::framework::MakeError("PlanTransientTextureAllocations",
+                                                          DescribeAllocationDiagnostics(planResult.error())));
+     }
+-
+-    transient_allocation::TransientTextureAllocationPlan allocationPlan = std::move(*planResult);
++    TransientTextureAllocationPlan allocationPlan = std::move(*planResult);
+     if (allocationPlan.heaps.size() != 1U)
+     {
+         return std::unexpected(lgp::framework::MakeError(
+             "PlanTransientTextureAllocations", "The Chapter 9 lab requires exactly one compatible physical heap."));
+     }
+ 
+-    if (!transientRtvs_)
+-    {
+-        auto result = deviceResources_->rtv_heap().Allocate(3U);
+-        if (!result)
+-        {
+-            return std::unexpected(std::move(result.error()));
+-        }
+-        transientRtvs_ = *result;
+-    }
+-    if (!transientSrvs_)
+-    {
+-        auto result = deviceResources_->shader_visible_cbv_srv_uav_heap().Allocate(3U);
+-        if (!result)
+-        {
+-            return std::unexpected(std::move(result.error()));
+-        }
+-        transientSrvs_ = *result;
+-    }
+-
+-    transient_allocation::HeapAllocation const &plannedHeap = allocationPlan.heaps.front();
++    HeapAllocation const &plannedHeap = allocationPlan.heaps.front();
+     D3D12_HEAP_DESC heapDescription{};
+     heapDescription.SizeInBytes = plannedHeap.size;
+     heapDescription.Alignment = plannedHeap.alignment;
+@@ -254,44 +258,74 @@ lgp::framework::Status Renderer::CreateTransientTextures(lgp::framework::Extent2
+     D3D12_CLEAR_VALUE clearValue{};
+     clearValue.Format = gpu::kTransientFormat;
+     clearValue.Color[3] = 1.0F;
+-    for (std::size_t textureIndex = 0U; textureIndex < transientTextures_.size(); ++textureIndex)
++    for (std::size_t index = 0U; index < resourceIds.size(); ++index)
+     {
+-        transient_allocation::TexturePlacement const *placement =
+-            FindPlacement(allocationPlan, resourceIds[textureIndex]);
++        TexturePlacement const *placement = FindPlacement(allocationPlan, resourceIds[index]);
+         if (placement == nullptr)
+         {
+             return std::unexpected(lgp::framework::MakeError(
+                 "Renderer::CreateTransientTextures", "The allocation plan omitted a transient texture placement."));
+         }
+-        HRESULT const result = deviceResources_->device()->CreatePlacedResource2(
++        HRESULT const placedResult = deviceResources_->device()->CreatePlacedResource2(
+             transientHeap_.Get(), placement->offset, &description, D3D12_BARRIER_LAYOUT_UNDEFINED, &clearValue, 0U,
+-            nullptr, IID_PPV_ARGS(transientTextures_[textureIndex].ReleaseAndGetAddressOf()));
+-        if (FAILED(result))
++            nullptr, IID_PPV_ARGS(transientTextures_[index].ReleaseAndGetAddressOf()));
++        if (FAILED(placedResult))
+         {
+             return std::unexpected(
+-                lgp::framework::MakeHResultError("ID3D12Device10::CreatePlacedResource2", result,
++                lgp::framework::MakeHResultError("ID3D12Device10::CreatePlacedResource2", placedResult,
+                                                  "Failed to create a placed Chapter 9 transient texture."));
+         }
+ 
+         D3D12_RENDER_TARGET_VIEW_DESC rtv{};
+         rtv.Format = gpu::kTransientFormat;
+         rtv.ViewDimension = D3D12_RTV_DIMENSION_TEXTURE2D;
+-        deviceResources_->device()->CreateRenderTargetView(transientTextures_[textureIndex].Get(), &rtv,
+-                                                           transientRtvs_.CpuHandle(static_cast<UINT>(textureIndex)));
++        deviceResources_->device()->CreateRenderTargetView(transientTextures_[index].Get(), &rtv,
++                                                           transientRtvs_.CpuHandle(static_cast<UINT>(index)));
+ 
+         D3D12_SHADER_RESOURCE_VIEW_DESC srv{};
+         srv.Format = gpu::kTransientFormat;
+         srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+         srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+         srv.Texture2D.MipLevels = 1U;
+-        deviceResources_->device()->CreateShaderResourceView(transientTextures_[textureIndex].Get(), &srv,
+-                                                             transientSrvs_.CpuHandle(static_cast<UINT>(textureIndex)));
++        deviceResources_->device()->CreateShaderResourceView(transientTextures_[index].Get(), &srv,
++                                                             transientSrvs_.CpuHandle(static_cast<UINT>(index)));
+     }
++
+     graphPlan_ = std::move(graphPlan);
+     allocationPlan_ = std::move(allocationPlan);
+     return {};
+ }
+ 
++lgp::framework::Status Renderer::InitializeImGui()
++{
++    auto descriptorResult = deviceResources_->shader_visible_cbv_srv_uav_heap().Allocate(1U);
++    if (!descriptorResult)
++    {
++        return std::unexpected(std::move(descriptorResult.error()));
++    }
++    imguiFontDescriptor_ = *descriptorResult;
++
++    IMGUI_CHECKVERSION();
++    ImGui::CreateContext();
++    ImGui::StyleColorsDark();
++    ImGui::GetIO().BackendPlatformName = "LGP.ManualInput";
++    ImGui_ImplDX12_InitInfo info{};
++    info.Device = deviceResources_->device();
++    info.CommandQueue = deviceResources_->graphics_queue();
++    info.NumFramesInFlight = static_cast<int>(deviceResources_->back_buffer_count());
++    info.RTVFormat = deviceResources_->back_buffer_format();
++    info.SrvDescriptorHeap = deviceResources_->shader_visible_cbv_srv_uav_heap().Get();
++    info.LegacySingleSrvCpuDescriptor = imguiFontDescriptor_.cpuHandle;
++    info.LegacySingleSrvGpuDescriptor = imguiFontDescriptor_.gpuHandle;
++    if (!ImGui_ImplDX12_Init(&info))
++    {
++        return std::unexpected(
++            lgp::framework::MakeError("ImGui_ImplDX12_Init", "Failed to initialize Chapter 9 diagnostics."));
++    }
++    imguiInitialized_ = true;
++    return {};
++}
++
+ lgp::framework::Status Renderer::ApplyBarrierGroup(ID3D12GraphicsCommandList7 &commandList,
+                                                    TextureBarrierGroup const &group,
+                                                    std::vector<ID3D12Resource *> const &resources) const
+@@ -313,7 +347,11 @@ lgp::framework::Status Renderer::ApplyBarrierGroup(ID3D12GraphicsCommandList7 &c
+     }
+     if (!barriers.empty())
+     {
+-        SubmitTextureBarriers(commandList, barriers.data(), static_cast<UINT>(barriers.size()));
++        D3D12_BARRIER_GROUP barrierGroup{};
++        barrierGroup.Type = D3D12_BARRIER_TYPE_TEXTURE;
++        barrierGroup.NumBarriers = static_cast<UINT>(barriers.size());
++        barrierGroup.pTextureBarriers = barriers.data();
++        commandList.Barrier(1U, &barrierGroup);
+     }
+     return {};
+ }
+@@ -385,7 +423,12 @@ lgp::framework::Status Renderer::ExecuteAliasHandoff(ID3D12GraphicsCommandList7
+         MakeTextureBarrier(*resources[activatedId.value], activateBefore, RenderTargetState(),
+                            D3D12_TEXTURE_BARRIER_FLAG_DISCARD),
+     };
+-    SubmitTextureBarriers(commandList, barriers.data(), static_cast<UINT>(barriers.size()));
++    D3D12_BARRIER_GROUP group{};
++    group.Type = D3D12_BARRIER_TYPE_TEXTURE;
++    group.NumBarriers = static_cast<UINT>(barriers.size());
++    group.pTextureBarriers = barriers.data();
++    commandList.Barrier(1U, &group);
++
+     lastAliasHandoffTrace_ = {
+         {predecessorId, ShaderResourceState(), deactivateAfter, D3D12_TEXTURE_BARRIER_FLAG_NONE},
+         {activatedId, activateBefore, RenderTargetState(), D3D12_TEXTURE_BARRIER_FLAG_DISCARD},
+@@ -401,6 +444,68 @@ void Renderer::DrawTo(ID3D12GraphicsCommandList7 &commandList, ID3D12PipelineSta
+     commandList.DrawInstanced(3U, 1U, 0U, 0U);
+ }
+ 
++void Renderer::BuildDiagnosticsWindow() const
++{
++    if (!graphPlan_ || !allocationPlan_)
++    {
++        return;
++    }
++    ImGui::Begin("Transient texture placement");
++    ImGui::Text("Requested: %llu bytes", static_cast<unsigned long long>(allocationPlan_->totalRequestedBytes));
++    ImGui::Text("Heap: %llu bytes", static_cast<unsigned long long>(allocationPlan_->totalHeapBytes));
++    ImGui::Text("Saved: %llu bytes", static_cast<unsigned long long>(allocationPlan_->savedBytes));
++    ImGui::Separator();
++
++    float const availableWidth = (std::max)(ImGui::GetContentRegionAvail().x, 1.0F);
++    for (TexturePlacement const &placement : allocationPlan_->placements)
++    {
++        ImGui::Text("%s lifetime %s heap %zu offset %llu range [%llu, %llu)", placement.name.c_str(),
++                    LifetimeLabel(placement.lifetime).c_str(), placement.heapIndex,
++                    static_cast<unsigned long long>(placement.offset),
++                    static_cast<unsigned long long>(placement.offset),
++                    static_cast<unsigned long long>(placement.offset + placement.allocationSize));
++        float const start =
++            availableWidth * static_cast<float>(placement.offset) / static_cast<float>(allocationPlan_->totalHeapBytes);
++        float const width = availableWidth * static_cast<float>(placement.allocationSize) /
++                            static_cast<float>(allocationPlan_->totalHeapBytes);
++        ImGui::SetCursorPosX(ImGui::GetCursorPosX() + start);
++        ImGui::ProgressBar(width / availableWidth, {availableWidth - start, 10.0F}, "");
++    }
++
++    ImGui::Separator();
++    for (AliasActivation const &activation : allocationPlan_->aliasActivations)
++    {
++        std::string predecessors{};
++        std::string const resourceName{ResourceName(graphPlan_->graph, activation.resourceId)};
++        for (TextureResourceId const predecessor : activation.predecessorResourceIds)
++        {
++            if (!predecessors.empty())
++            {
++                predecessors += ", ";
++            }
++            predecessors += ResourceName(graphPlan_->graph, predecessor);
++        }
++        ImGui::Text("Pass %u activates %s after %s", activation.passIndex, resourceName.c_str(), predecessors.c_str());
++    }
++    ImGui::End();
++}
++
++void Renderer::ExecuteComposite(lgp::framework::FrameContext const &frameContext)
++{
++    ID3D12GraphicsCommandList7 &commandList = *frameContext.commandList;
++    ID3D12DescriptorHeap *const descriptorHeaps[]{frameContext.shaderVisibleCbvSrvUavHeap};
++    commandList.SetDescriptorHeaps(1U, descriptorHeaps);
++    commandList.SetGraphicsRootDescriptorTable(0U, transientSrvs_.GpuHandle(1U));
++    DrawTo(commandList, *compositePipeline_.Get(), frameContext.renderTargetView);
++    if (imguiFrameBegun_)
++    {
++        commandList.SetDescriptorHeaps(1U, descriptorHeaps);
++        ImGui::Render();
++        ImGui_ImplDX12_RenderDrawData(ImGui::GetDrawData(), &commandList);
++        imguiFrameBegun_ = false;
++    }
++}
++
+ lgp::framework::Status Renderer::Initialize(lgp::framework::ApplicationInitContext const &context)
+ {
+     deviceResources_ = &context.deviceResources;
+@@ -417,7 +522,11 @@ lgp::framework::Status Renderer::Initialize(lgp::framework::ApplicationInitConte
+     {
+         return status;
+     }
+-    return CreateTransientTextures(context.drawableSize);
++    if (auto status = CreateTransientTextures(context.drawableSize); !status)
++    {
++        return status;
++    }
++    return headless_ ? lgp::framework::Status{} : InitializeImGui();
+ }
+ 
+ lgp::framework::Status Renderer::OnResize(lgp::framework::DeviceResources &, lgp::framework::Extent2D drawableSize)
+@@ -425,8 +534,28 @@ lgp::framework::Status Renderer::OnResize(lgp::framework::DeviceResources &, lgp
+     return CreateTransientTextures(drawableSize);
+ }
+ 
+-lgp::framework::Status Renderer::Update(lgp::framework::UpdateContext const &)
++lgp::framework::Status Renderer::Update(lgp::framework::UpdateContext const &context)
+ {
++    if (headless_ || !imguiInitialized_)
++    {
++        return {};
++    }
++    if (imguiFrameBegun_)
++    {
++        ImGui::EndFrame();
++        imguiFrameBegun_ = false;
++    }
++    ImGuiIO &io = ImGui::GetIO();
++    io.DisplaySize = {static_cast<float>(context.drawableSize.width), static_cast<float>(context.drawableSize.height)};
++    io.DeltaTime = static_cast<float>((std::max)(context.deltaSeconds, 1.0 / 240.0));
++    io.AddMousePosEvent(static_cast<float>(context.input.mouse.x), static_cast<float>(context.input.mouse.y));
++    io.AddMouseButtonEvent(0, context.input.mouse.IsButtonDown(lgp::framework::MouseButton::Left));
++    io.AddMouseButtonEvent(1, context.input.mouse.IsButtonDown(lgp::framework::MouseButton::Right));
++    io.AddMouseWheelEvent(0.0F, context.input.mouse.wheelDelta);
++    ImGui_ImplDX12_NewFrame();
++    ImGui::NewFrame();
++    imguiFrameBegun_ = true;
++    BuildDiagnosticsWindow();
+     return {};
+ }
+ 
+@@ -488,9 +617,7 @@ lgp::framework::Status Renderer::Render(lgp::framework::FrameContext const &fram
+         }
+         else if (pass.id == graphPlan_->compositePass)
+         {
+-            commandList.SetDescriptorHeaps(1U, descriptorHeaps);
+-            commandList.SetGraphicsRootDescriptorTable(0U, transientSrvs_.GpuHandle(1U));
+-            DrawTo(commandList, *compositePipeline_.Get(), frameContext.renderTargetView);
++            ExecuteComposite(frameContext);
+         }
+         else if (pass.id != graphPlan_->boundaryPass)
+         {
+@@ -501,12 +628,12 @@ lgp::framework::Status Renderer::Render(lgp::framework::FrameContext const &fram
+     return {};
+ }
+ 
+-ch08::frame_graph::CompiledPassGraph const *Renderer::CompiledGraph() const noexcept
++CompiledPassGraph const *Renderer::CompiledGraph() const noexcept
+ {
+     return graphPlan_ ? &graphPlan_->graph : nullptr;
+ }
+ 
+-transient_allocation::TransientTextureAllocationPlan const *Renderer::AllocationPlan() const noexcept
++TransientTextureAllocationPlan const *Renderer::AllocationPlan() const noexcept
+ {
+     return allocationPlan_ ? &*allocationPlan_ : nullptr;
+ }
+@@ -518,6 +645,17 @@ std::vector<ExecutedAliasBarrierRecord> const &Renderer::LastAliasHandoffTrace()
+ 
+ void Renderer::Shutdown(lgp::framework::DeviceResources &) noexcept
+ {
++    if (imguiFrameBegun_)
++    {
++        ImGui::EndFrame();
++        imguiFrameBegun_ = false;
++    }
++    if (imguiInitialized_)
++    {
++        ImGui_ImplDX12_Shutdown();
++        ImGui::DestroyContext();
++        imguiInitialized_ = false;
++    }
+     lastAliasHandoffTrace_.clear();
+     allocationPlan_.reset();
+     graphPlan_.reset();
+@@ -536,6 +674,11 @@ void Renderer::Shutdown(lgp::framework::DeviceResources &) noexcept
+         deviceResources_->shader_visible_cbv_srv_uav_heap().Free(transientSrvs_);
+         transientSrvs_ = {};
+     }
++    if (deviceResources_ != nullptr && imguiFontDescriptor_)
++    {
++        deviceResources_->shader_visible_cbv_srv_uav_heap().Free(imguiFontDescriptor_);
++        imguiFontDescriptor_ = {};
++    }
+     compositePipeline_.Reset();
+     accentPipeline_.Reset();
+     copyPipeline_.Reset();
+@@ -544,4 +687,4 @@ void Renderer::Shutdown(lgp::framework::DeviceResources &) noexcept
+     deviceResources_ = nullptr;
+ }
+ 
+-} // namespace ch09::transient_aliasing::starter
++} // namespace ch09::transient_aliasing::solution
+diff --git a/chapters/transient-resource-allocation-and-aliasing/Starter/Renderer.hpp b/chapters/transient-resource-allocation-and-aliasing/Starter/Renderer.hpp
+index 0a976ba..1bd7869 100644
+--- a/chapters/transient-resource-allocation-and-aliasing/Starter/Renderer.hpp
++++ b/chapters/transient-resource-allocation-and-aliasing/Starter/Renderer.hpp
+@@ -9,11 +9,10 @@
+ #include <wrl/client.h>
+ 
+ #include <array>
+-#include <expected>
+ #include <optional>
+ #include <vector>
+ 
+-namespace ch09::transient_aliasing::starter
++namespace ch09::transient_aliasing::solution
+ {
+ 
+ struct ExecutedAliasBarrierRecord final
+@@ -57,6 +56,7 @@ class Renderer final : public lgp::framework::IChapterRenderer
+     [[nodiscard]] lgp::framework::Status CreateRootSignature();
+     [[nodiscard]] lgp::framework::Status CreatePipelineStates();
+     [[nodiscard]] lgp::framework::Status CreateTransientTextures(lgp::framework::Extent2D size);
++    [[nodiscard]] lgp::framework::Status InitializeImGui();
+     [[nodiscard]] std::expected<GraphExecutionPlan, lgp::framework::Error> CompileGraph() const;
+     [[nodiscard]] lgp::framework::Status ApplyBarrierGroup(ID3D12GraphicsCommandList7 &commandList,
+                                                            ch08::frame_graph::TextureBarrierGroup const &group,
+@@ -64,6 +64,8 @@ class Renderer final : public lgp::framework::IChapterRenderer
+     [[nodiscard]] lgp::framework::Status ExecuteAliasHandoff(ID3D12GraphicsCommandList7 &commandList);
+     void DrawTo(ID3D12GraphicsCommandList7 &commandList, ID3D12PipelineState &pipeline,
+                 D3D12_CPU_DESCRIPTOR_HANDLE renderTarget) const;
++    void BuildDiagnosticsWindow() const;
++    void ExecuteComposite(lgp::framework::FrameContext const &frameContext);
+ 
+     lgp::framework::DeviceResources *deviceResources_{};
+     lgp::framework::CompiledShader fullscreenVertexShader_{};
+@@ -78,12 +80,15 @@ class Renderer final : public lgp::framework::IChapterRenderer
+     Microsoft::WRL::ComPtr<ID3D12PipelineState> compositePipeline_{};
+     lgp::framework::DescriptorAllocation transientRtvs_{};
+     lgp::framework::DescriptorAllocation transientSrvs_{};
++    lgp::framework::DescriptorAllocation imguiFontDescriptor_{};
+     Microsoft::WRL::ComPtr<ID3D12Heap> transientHeap_{};
+     std::array<Microsoft::WRL::ComPtr<ID3D12Resource>, 3U> transientTextures_{};
+     std::optional<GraphExecutionPlan> graphPlan_{};
+     std::optional<transient_allocation::TransientTextureAllocationPlan> allocationPlan_{};
+     std::vector<ExecutedAliasBarrierRecord> lastAliasHandoffTrace_{};
+     bool headless_{};
++    bool imguiInitialized_{};
++    bool imguiFrameBegun_{};
+ };
+ 
+-} // namespace ch09::transient_aliasing::starter
++} // namespace ch09::transient_aliasing::solution

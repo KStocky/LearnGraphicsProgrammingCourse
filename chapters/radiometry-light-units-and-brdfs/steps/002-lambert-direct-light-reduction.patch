@@ -1,0 +1,85 @@
+diff --git a/chapters/radiometry-light-units-and-brdfs/Starter/DirectLighting.hlsl b/chapters/radiometry-light-units-and-brdfs/Starter/DirectLighting.hlsl
+index 16f4eef40f6a6ef2ba082e4ed6fa25c814252ccb..b64314b75d4bac0eeb2758eea5273334c0719f3f 100644
+--- a/chapters/radiometry-light-units-and-brdfs/Starter/DirectLighting.hlsl
++++ b/chapters/radiometry-light-units-and-brdfs/Starter/DirectLighting.hlsl
+@@ -1,7 +1,59 @@
+-// Step 1: keep the units visible before introducing a BRDF.
++struct LightingConstants
++{
++    row_major float4x4 viewProjection;
++    float3 cameraPosition;
++    uint lightType;
++    float3 lightPosition;
++    float intensity;
++    float3 directionToLight;
++    uint visualization;
++    float3 lightColor;
++    uint useMaterialOverride;
++    float3 overrideBaseColor;
++    float overrideRoughness;
++    float overrideMetalness;
++    float3 padding;
++};
++
++struct ObjectConstants
++{
++    float3 translation;
++    float padding0;
++    float3 baseColor;
++    float roughness;
++    float metalness;
++    float3 dielectricF0;
++};
++
++ConstantBuffer<LightingConstants> lighting : register(b0);
++ConstantBuffer<ObjectConstants> objectData : register(b1);
++
++struct MeshVertex
++{
++    float3 position : POSITION;
++    float3 normal : NORMAL;
++};
++
++struct LitVertex
++{
++    float4 position : SV_Position;
++    float3 worldPosition : POSITION;
++    float3 worldNormal : NORMAL;
++};
+ 
++static const float Pi = 3.14159265358979323846;
+ static const float MinimumDistanceSquared = 1.0e-4;
+ 
++LitVertex LightingVS(MeshVertex input)
++{
++    LitVertex output;
++    float4 worldPosition = float4(input.position + objectData.translation, 1.0);
++    output.position = mul(worldPosition, lighting.viewProjection);
++    output.worldPosition = worldPosition.xyz;
++    output.worldNormal = input.normal;
++    return output;
++}
++
+ float DirectionalNormalIlluminance(float illuminanceLux)
+ {
+     return max(illuminanceLux, 0.0);
+@@ -13,7 +65,17 @@ float PointNormalIlluminance(float luminousIntensityCandela, float3 offsetToLigh
+     return max(luminousIntensityCandela, 0.0) / distanceSquared;
+ }
+ 
+-float3 TintIlluminance(float illuminanceLux, float3 lightColor)
++float3 LambertDiffuse(float3 baseColor)
++{
++    return baseColor / Pi;
++}
++
++float4 LightingPS(LitVertex input) : SV_Target
+ {
+-    return illuminanceLux * max(lightColor, 0.0);
++    float3 normal = normalize(input.worldNormal);
++    float3 directionToLight = normalize(lighting.directionToLight);
++    float normalIlluminance = DirectionalNormalIlluminance(lighting.intensity);
++    float nDotL = saturate(dot(normal, directionToLight));
++    float3 irradiance = max(lighting.lightColor, 0.0) * normalIlluminance * nDotL;
++    return float4(irradiance * LambertDiffuse(objectData.baseColor), 1.0);
+ }

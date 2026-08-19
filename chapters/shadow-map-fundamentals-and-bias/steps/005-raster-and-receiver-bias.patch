@@ -1,0 +1,67 @@
+diff --git a/chapters/shadow-map-fundamentals-and-bias/CMakeLists.txt b/chapters/shadow-map-fundamentals-and-bias/CMakeLists.txt
+--- a/chapters/shadow-map-fundamentals-and-bias/CMakeLists.txt
++++ b/chapters/shadow-map-fundamentals-and-bias/CMakeLists.txt
+@@ -43,2 +43,2 @@
+-set(LGP_CH07_STARTER_STAGE 4)
++set(LGP_CH07_STARTER_STAGE 5)
+ set_source_files_properties(
+diff --git a/chapters/shadow-map-fundamentals-and-bias/Starter/DirectionalBaseline.hlsl b/chapters/shadow-map-fundamentals-and-bias/Starter/DirectionalBaseline.hlsl
+index 5a26c83..fba30af 100644
+--- a/chapters/shadow-map-fundamentals-and-bias/Starter/DirectionalBaseline.hlsl
++++ b/chapters/shadow-map-fundamentals-and-bias/Starter/DirectionalBaseline.hlsl
+@@ -134,13 +134,15 @@ float4 LightingPS(LitVertex input) : SV_Target
+     float metalness;
+     ObjectMaterial(baseColor, roughness, metalness);
+     float3 lightDirection = normalize(lighting.directionToLight);
+-    float4 shadowClip = mul(float4(input.worldPosition, 1.0), lighting.lightViewProjection);
++    float3 offsetWorldPosition = input.worldPosition + (normal * lighting.receiverNormalOffsetWorld);
++    float4 shadowClip = mul(float4(offsetWorldPosition, 1.0), lighting.lightViewProjection);
+     float3 shadowNdc = shadowClip.xyz / shadowClip.w;
+     float2 shadowUv = float2((shadowNdc.x * 0.5) + 0.5, 0.5 - (shadowNdc.y * 0.5));
+     bool inFrustum = IsInShadowFrustum(shadowNdc);
++    float comparisonDepth = shadowNdc.z - lighting.receiverDepthBias;
+     float visibility = !inFrustum
+         ? 1.0
+-        : shadowMap.SampleCmpLevelZero(shadowComparisonSampler, shadowUv, shadowNdc.z);
++        : shadowMap.SampleCmpLevelZero(shadowComparisonSampler, shadowUv, comparisonDepth);
+     float3 viewDirection = normalize(lighting.cameraPosition - input.worldPosition);
+     float nDotL = saturate(dot(normal, lightDirection));
+     float nDotV = saturate(dot(normal, viewDirection));
+diff --git a/chapters/shadow-map-fundamentals-and-bias/Starter/Renderer.cpp b/chapters/shadow-map-fundamentals-and-bias/Starter/Renderer.cpp
+index 187c991..3fdd6f8 100644
+--- a/chapters/shadow-map-fundamentals-and-bias/Starter/Renderer.cpp
++++ b/chapters/shadow-map-fundamentals-and-bias/Starter/Renderer.cpp
+@@ -181,9 +181,9 @@ class Renderer::Impl final
+     DepthRange lightDepthRange{0.1F, 40.0F};
+     float lightDistance{18.0F};
+     std::uint32_t shadowResolution{1024U};
+-    std::int32_t rasterConstantBias{};
+-    float rasterSlopeBias{};
+-    float rasterBiasClamp{};
++    std::int32_t rasterConstantBias{1200};
++    float rasterSlopeBias{1.5F};
++    float rasterBiasClamp{0.01F};
+     bool shadowEnabled{true};
+     ShadowVisualization visualization{ShadowVisualization::Final};
+     float orbitAzimuth{};
+diff --git a/chapters/shadow-map-fundamentals-and-bias/Starter/Renderer.hpp b/chapters/shadow-map-fundamentals-and-bias/Starter/Renderer.hpp
+index 2de47bd..89fa1f0 100644
+--- a/chapters/shadow-map-fundamentals-and-bias/Starter/Renderer.hpp
++++ b/chapters/shadow-map-fundamentals-and-bias/Starter/Renderer.hpp
+@@ -36,11 +36,11 @@ struct HeadlessTestConfiguration final
+     Float3 lightTarget{0.0F, 0.0F, 0.0F};
+     float lightDistance{18.0F};
+     DepthRange depthRange{0.1F, 40.0F};
+-    std::int32_t rasterConstantBias{};
+-    float rasterSlopeBias{};
+-    float rasterBiasClamp{};
+-    float receiverDepthBias{};
+-    float receiverNormalOffsetWorld{};
++    std::int32_t rasterConstantBias{1200};
++    float rasterSlopeBias{1.5F};
++    float rasterBiasClamp{0.01F};
++    float receiverDepthBias{0.00035F};
++    float receiverNormalOffsetWorld{0.02F};
+     bool shadowEnabled{true};
+     ShadowVisualization visualization{ShadowVisualization::Final};
+ };

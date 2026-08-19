@@ -1,0 +1,1398 @@
+diff --git a/chapters/pass-scheduling-and-multi-queue-execution/CMakeLists.txt b/chapters/pass-scheduling-and-multi-queue-execution/CMakeLists.txt
+index 78d7ec957a34247de006503f386533da70d36e20..0b5e13ff4a6a3c042223ca6889286529d658a913 100644
+--- a/chapters/pass-scheduling-and-multi-queue-execution/CMakeLists.txt
++++ b/chapters/pass-scheduling-and-multi-queue-execution/CMakeLists.txt
+@@ -73,13 +73,24 @@ set_target_properties(
+         FOLDER "Chapters/PassScheduling")
+ source_group(TREE "${CMAKE_CURRENT_SOURCE_DIR}" FILES ${LGP_CH10_GPU_COMMON_SOURCES})
+ 
+-add_library(ch10_multi_queue_starter_logic STATIC ${LGP_CH10_STARTER_SOURCES})
++add_library(
++    ch10_multi_queue_starter_logic
++    STATIC
++        ${LGP_CH10_STARTER_SOURCES}
++        "${LGP_CH10_IMGUI_DX12_BACKEND}")
+ target_link_libraries(
+     ch10_multi_queue_starter_logic
+     PUBLIC
++        DearImGui::DearImGui
+         ch10_multi_queue_gpu_common
+         LGP::Framework)
+-target_include_directories(ch10_multi_queue_starter_logic PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}")
++target_include_directories(
++    ch10_multi_queue_starter_logic
++    PUBLIC
++        "${CMAKE_CURRENT_SOURCE_DIR}"
++        "${LGP_CH10_IMGUI_ROOT}"
++        "${LGP_CH10_IMGUI_ROOT}/backends")
++target_compile_definitions(ch10_multi_queue_starter_logic PRIVATE IMGUI_IMPL_WIN32_DISABLE_GAMEPAD)
+ set_target_properties(
+     ch10_multi_queue_starter_logic
+     PROPERTIES
+diff --git a/chapters/pass-scheduling-and-multi-queue-execution/Starter/Main.cpp b/chapters/pass-scheduling-and-multi-queue-execution/Starter/Main.cpp
+index d2de8f442f136363016f7952da05de7fd3f8c147..bceac7fe5969583370c9f73ec281c82e921a6ec9 100644
+--- a/chapters/pass-scheduling-and-multi-queue-execution/Starter/Main.cpp
++++ b/chapters/pass-scheduling-and-multi-queue-execution/Starter/Main.cpp
+@@ -4,10 +4,10 @@
+ 
+ int wmain(int argc, wchar_t **argv)
+ {
+-    ch10::pass_scheduling::starter::Renderer renderer{};
++    ch10::pass_scheduling::solution::Renderer renderer{};
+ 
+     lgp::framework::ApplicationConfiguration configuration{};
+-    configuration.title = L"Ch10 Multi-Queue Scheduling Starter";
++    configuration.title = L"Ch10 Multi-Queue Scheduling Solution";
+     configuration.width = 1600U;
+     configuration.height = 900U;
+     configuration.rtvDescriptorCount = 32U;
+diff --git a/chapters/pass-scheduling-and-multi-queue-execution/Starter/Renderer.cpp b/chapters/pass-scheduling-and-multi-queue-execution/Starter/Renderer.cpp
+index eca6c88140ebf7aece856da90beedf88effd2652..e0c770335251b1e525599e210197be886c759560 100644
+--- a/chapters/pass-scheduling-and-multi-queue-execution/Starter/Renderer.cpp
++++ b/chapters/pass-scheduling-and-multi-queue-execution/Starter/Renderer.cpp
+@@ -1,14 +1,31 @@
++#ifndef WIN32_LEAN_AND_MEAN
++#define WIN32_LEAN_AND_MEAN
++#endif
++
++#ifndef NOMINMAX
++#define NOMINMAX
++#endif
++
+ #include "Renderer.hpp"
+ 
+ #include <lgp/framework/pix.hpp>
+ 
++#include <imgui.h>
++#include <imgui_impl_dx12.h>
++
++#include <Windows.h>
++
++#include <algorithm>
+ #include <array>
++#include <cmath>
++#include <cstring>
+ #include <filesystem>
+-#include <ranges>
++#include <string>
++#include <string_view>
+ #include <tuple>
+ #include <utility>
+ 
+-namespace ch10::pass_scheduling::starter
++namespace ch10::pass_scheduling::solution
+ {
+ namespace
+ {
+@@ -21,6 +38,11 @@ inline constexpr UINT kGraphicsScratchSrv = 2U;
+ inline constexpr UINT kGraphicsFinalSrv = 3U;
+ inline constexpr UINT kComputeScratchUav = 4U;
+ inline constexpr UINT kComputeFinalUav = 5U;
++inline constexpr UINT kComputeQueriesPerSlot = 2U;
++inline constexpr UINT kDirectQueriesPerSlot = 4U;
++inline constexpr std::uint64_t kComputeReadbackBytes = 2U * sizeof(std::uint64_t);
++inline constexpr std::uint64_t kDirectReadbackBytes = 4U * sizeof(std::uint64_t);
++inline constexpr std::size_t kMaxFrameSlotUsageHistory = 120U;
+ 
+ [[nodiscard]] std::filesystem::path ShaderPath()
+ {
+@@ -38,6 +60,75 @@ inline constexpr UINT kComputeFinalUav = 5U;
+     return pass == plan.passes.end() ? nullptr : &*pass;
+ }
+ 
++[[nodiscard]] double NormalizeTimestamp(std::uint64_t timestamp, std::uint64_t gpuCalibration,
++                                        std::uint64_t cpuCalibration, std::uint64_t queueFrequency,
++                                        std::uint64_t qpcFrequency) noexcept
++{
++    long double const cpuSeconds = static_cast<long double>(cpuCalibration) / static_cast<long double>(qpcFrequency);
++    long double gpuDelta = 0.0L;
++    if (timestamp >= gpuCalibration)
++    {
++        gpuDelta = static_cast<long double>(timestamp - gpuCalibration);
++    }
++    else
++    {
++        gpuDelta = -static_cast<long double>(gpuCalibration - timestamp);
++    }
++    return static_cast<double>(cpuSeconds + (gpuDelta / static_cast<long double>(queueFrequency)));
++}
++
++void DrawIntervalBar(double start, double end, double spanStart, double spanEnd)
++{
++    double const span = spanEnd - spanStart;
++    if (span <= 0.0 || end <= start)
++    {
++        return;
++    }
++    float const availableWidth = (std::max)(ImGui::GetContentRegionAvail().x, 1.0F);
++    float const startFraction = static_cast<float>((start - spanStart) / span);
++    float const durationFraction = static_cast<float>((end - start) / span);
++    float const barWidth = (std::max)(availableWidth * durationFraction, 1.0F);
++    float const baseX = ImGui::GetCursorPosX();
++    ImGui::SetCursorPosX(baseX + (availableWidth * startFraction));
++    ImGui::ProgressBar(1.0F, {barWidth, 8.0F}, "");
++}
++
++[[nodiscard]] std::string_view TraceLabel(gpu::QueueExecutionTraceKind kind) noexcept
++{
++    switch (kind)
++    {
++    case gpu::QueueExecutionTraceKind::ComputeBranchRecorded:
++        return "Compute branch recorded";
++    case gpu::QueueExecutionTraceKind::IndependentGraphicsBranchRecorded:
++        return "Independent graphics branch recorded";
++    case gpu::QueueExecutionTraceKind::CompositeRecordedForFrameworkSubmission:
++        return "Composite recorded for framework submission";
++    case gpu::QueueExecutionTraceKind::ComputeExecute:
++        return "Compute queue executes branch";
++    case gpu::QueueExecutionTraceKind::ComputeSignal:
++        return "Compute queue signals fence";
++    case gpu::QueueExecutionTraceKind::IndependentDirectExecute:
++        return "Direct queue executes independent branch";
++    case gpu::QueueExecutionTraceKind::DirectWaitBeforeComposite:
++        return "Direct queue waits before composite";
++    }
++    return "Unknown execution trace record";
++}
++
++[[nodiscard]] std::string_view IntervalLabel(gpu::GpuIntervalKind kind) noexcept
++{
++    switch (kind)
++    {
++    case gpu::GpuIntervalKind::ComputeBranch:
++        return "Compute branch";
++    case gpu::GpuIntervalKind::IndependentGraphicsBranch:
++        return "Independent graphics branch";
++    case gpu::GpuIntervalKind::Composite:
++        return "Composite";
++    }
++    return "Unknown GPU interval";
++}
++
+ } // namespace
+ 
+ UINT Renderer::DescriptorIndex(UINT frameSlot, UINT withinSlot) const noexcept
+@@ -50,46 +141,33 @@ UINT Renderer::RtvIndex(UINT frameSlot, UINT withinSlot) const noexcept
+     return (frameSlot * kRtvsPerSlot) + withinSlot;
+ }
+ 
+-lgp::framework::Status Renderer::CreateDeviceObjects()
++UINT Renderer::ComputeQueryIndex(UINT frameSlot, UINT withinSlot) const noexcept
+ {
+-    if (auto status = CreateComputeQueueObjects(); !status)
+-    {
+-        return status;
+-    }
+-    if (auto status = gpu::CreateLabShaders(ShaderPath(), shaders_); !status)
+-    {
+-        return status;
+-    }
+-    if (auto status = gpu::CreateLabRootSignature(*deviceResources_->device(), rootSignature_); !status)
+-    {
+-        return status;
+-    }
+-    if (auto status = gpu::CreateLabPipelines(*deviceResources_->device(), deviceResources_->back_buffer_format(),
+-                                              *rootSignature_.Get(), shaders_, pipelines_);
+-        !status)
+-    {
+-        return status;
+-    }
+-    return CreateFrameCommandObjects();
++    return (frameSlot * kComputeQueriesPerSlot) + withinSlot;
+ }
+ 
+-lgp::framework::Status Renderer::CreateComputeQueueObjects()
++UINT Renderer::DirectQueryIndex(UINT frameSlot, UINT withinSlot) const noexcept
+ {
+-    D3D12_COMMAND_QUEUE_DESC description{};
+-    description.Type = D3D12_COMMAND_LIST_TYPE_COMPUTE;
+-    HRESULT result =
+-        deviceResources_->device()->CreateCommandQueue(&description, IID_PPV_ARGS(computeQueue_.ReleaseAndGetAddressOf()));
+-    if (FAILED(result))
++    return (frameSlot * kDirectQueriesPerSlot) + withinSlot;
++}
++
++lgp::framework::Status Renderer::CreateQueueObjects()
++{
++    D3D12_COMMAND_QUEUE_DESC queueDescription{};
++    queueDescription.Type = D3D12_COMMAND_LIST_TYPE_COMPUTE;
++    HRESULT const queueResult = deviceResources_->device()->CreateCommandQueue(
++        &queueDescription, IID_PPV_ARGS(computeQueue_.ReleaseAndGetAddressOf()));
++    if (FAILED(queueResult))
+     {
+-        return std::unexpected(lgp::framework::MakeHResultError(
+-            "ID3D12Device::CreateCommandQueue", result, "Failed to create the Chapter 10 compute queue."));
++        return std::unexpected(lgp::framework::MakeHResultError("ID3D12Device::CreateCommandQueue", queueResult,
++                                                                "Failed to create the Chapter 10 compute queue."));
+     }
+-    result = deviceResources_->device()->CreateFence(0U, D3D12_FENCE_FLAG_NONE,
+-                                                      IID_PPV_ARGS(computeFence_.ReleaseAndGetAddressOf()));
+-    if (FAILED(result))
++    HRESULT const fenceResult = deviceResources_->device()->CreateFence(
++        0U, D3D12_FENCE_FLAG_NONE, IID_PPV_ARGS(computeFence_.ReleaseAndGetAddressOf()));
++    if (FAILED(fenceResult))
+     {
+-        return std::unexpected(lgp::framework::MakeHResultError(
+-            "ID3D12Device::CreateFence", result, "Failed to create the Chapter 10 compute fence."));
++        return std::unexpected(lgp::framework::MakeHResultError("ID3D12Device::CreateFence", fenceResult,
++                                                                "Failed to create the Chapter 10 compute fence."));
+     }
+     return {};
+ }
+@@ -97,67 +175,153 @@ lgp::framework::Status Renderer::CreateComputeQueueObjects()
+ lgp::framework::Status Renderer::CreateFrameCommandObjects()
+ {
+     frameSlots_.resize(deviceResources_->back_buffer_count());
+-    for (FrameSlotTextures &slot : frameSlots_)
++    for (FrameSlotResources &slot : frameSlots_)
+     {
+-        HRESULT result = deviceResources_->device()->CreateCommandAllocator(
++        HRESULT const computeAllocatorResult = deviceResources_->device()->CreateCommandAllocator(
+             D3D12_COMMAND_LIST_TYPE_COMPUTE, IID_PPV_ARGS(slot.computeAllocator.ReleaseAndGetAddressOf()));
+-        if (FAILED(result))
++        if (FAILED(computeAllocatorResult))
+         {
+-            return std::unexpected(lgp::framework::MakeHResultError(
+-                "ID3D12Device::CreateCommandAllocator", result, "Failed to create a per-slot compute allocator."));
++            return std::unexpected(
++                lgp::framework::MakeHResultError("ID3D12Device::CreateCommandAllocator", computeAllocatorResult,
++                                                 "Failed to create a per-slot Chapter 10 compute allocator."));
+         }
+-        result = deviceResources_->device()->CreateCommandList(
++        HRESULT const computeListResult = deviceResources_->device()->CreateCommandList(
+             0U, D3D12_COMMAND_LIST_TYPE_COMPUTE, slot.computeAllocator.Get(), nullptr,
+             IID_PPV_ARGS(slot.computeList.ReleaseAndGetAddressOf()));
+-        if (FAILED(result))
++        if (FAILED(computeListResult))
+         {
+-            return std::unexpected(lgp::framework::MakeHResultError(
+-                "ID3D12Device::CreateCommandList", result, "Failed to create a per-slot compute command list."));
++            return std::unexpected(
++                lgp::framework::MakeHResultError("ID3D12Device::CreateCommandList", computeListResult,
++                                                 "Failed to create a per-slot Chapter 10 compute list."));
+         }
+-        result = slot.computeList->Close();
+-        if (FAILED(result))
++        if (FAILED(slot.computeList->Close()))
+         {
+-            return std::unexpected(lgp::framework::MakeHResultError(
+-                "ID3D12GraphicsCommandList::Close", result, "Failed to close a new compute command list."));
++            return std::unexpected(lgp::framework::MakeError("ID3D12GraphicsCommandList::Close",
++                                                             "Failed to close the initial Chapter 10 compute list."));
+         }
+-        result = deviceResources_->device()->CreateCommandAllocator(
++
++        HRESULT const directAllocatorResult = deviceResources_->device()->CreateCommandAllocator(
+             D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(slot.directAllocator.ReleaseAndGetAddressOf()));
+-        if (FAILED(result))
++        if (FAILED(directAllocatorResult))
+         {
+             return std::unexpected(lgp::framework::MakeHResultError(
+-                "ID3D12Device::CreateCommandAllocator", result, "Failed to create a per-slot direct allocator."));
++                "ID3D12Device::CreateCommandAllocator", directAllocatorResult,
++                "Failed to create a per-slot Chapter 10 independent direct allocator."));
+         }
+-        result = deviceResources_->device()->CreateCommandList(
++        HRESULT const directListResult = deviceResources_->device()->CreateCommandList(
+             0U, D3D12_COMMAND_LIST_TYPE_DIRECT, slot.directAllocator.Get(), nullptr,
+             IID_PPV_ARGS(slot.directList.ReleaseAndGetAddressOf()));
+-        if (FAILED(result))
++        if (FAILED(directListResult))
+         {
+-            return std::unexpected(lgp::framework::MakeHResultError(
+-                "ID3D12Device::CreateCommandList", result, "Failed to create a per-slot direct command list."));
++            return std::unexpected(
++                lgp::framework::MakeHResultError("ID3D12Device::CreateCommandList", directListResult,
++                                                 "Failed to create a per-slot Chapter 10 independent direct list."));
+         }
+-        result = slot.directList->Close();
+-        if (FAILED(result))
++        if (FAILED(slot.directList->Close()))
+         {
+-            return std::unexpected(lgp::framework::MakeHResultError(
+-                "ID3D12GraphicsCommandList::Close", result, "Failed to close a new direct command list."));
++            return std::unexpected(lgp::framework::MakeError(
++                "ID3D12GraphicsCommandList::Close", "Failed to close the initial Chapter 10 independent direct list."));
+         }
+     }
+     return {};
+ }
+ 
++lgp::framework::Status Renderer::CreateTimestampObjects()
++{
++    UINT const frameSlotCount = deviceResources_->back_buffer_count();
++    D3D12_QUERY_HEAP_DESC computeHeapDescription{};
++    computeHeapDescription.Type = D3D12_QUERY_HEAP_TYPE_TIMESTAMP;
++    computeHeapDescription.Count = frameSlotCount * kComputeQueriesPerSlot;
++    HRESULT const computeHeapResult = deviceResources_->device()->CreateQueryHeap(
++        &computeHeapDescription, IID_PPV_ARGS(computeTimestampHeap_.ReleaseAndGetAddressOf()));
++    if (FAILED(computeHeapResult))
++    {
++        return std::unexpected(
++            lgp::framework::MakeHResultError("ID3D12Device::CreateQueryHeap", computeHeapResult,
++                                             "Failed to create the Chapter 10 compute timestamp heap."));
++    }
++    D3D12_QUERY_HEAP_DESC directHeapDescription{};
++    directHeapDescription.Type = D3D12_QUERY_HEAP_TYPE_TIMESTAMP;
++    directHeapDescription.Count = frameSlotCount * kDirectQueriesPerSlot;
++    HRESULT const directHeapResult = deviceResources_->device()->CreateQueryHeap(
++        &directHeapDescription, IID_PPV_ARGS(directTimestampHeap_.ReleaseAndGetAddressOf()));
++    if (FAILED(directHeapResult))
++    {
++        return std::unexpected(
++            lgp::framework::MakeHResultError("ID3D12Device::CreateQueryHeap", directHeapResult,
++                                             "Failed to create the Chapter 10 direct timestamp heap."));
++    }
++
++    for (UINT frameSlot = 0U; frameSlot < frameSlotCount; ++frameSlot)
++    {
++        auto computeReadback = lgp::framework::CreateCommittedBuffer(
++            *deviceResources_->device(),
++            {kComputeReadbackBytes, D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_FLAG_NONE,
++             L"Ch10 Compute Timestamp Readback"});
++        if (!computeReadback)
++        {
++            return std::unexpected(std::move(computeReadback.error()));
++        }
++        frameSlots_[frameSlot].computeTimestampReadback = std::move(*computeReadback);
++
++        auto directReadback = lgp::framework::CreateCommittedBuffer(
++            *deviceResources_->device(),
++            {kDirectReadbackBytes, D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_FLAG_NONE,
++             L"Ch10 Direct Timestamp Readback"});
++        if (!directReadback)
++        {
++            return std::unexpected(std::move(directReadback.error()));
++        }
++        frameSlots_[frameSlot].directTimestampReadback = std::move(*directReadback);
++    }
++
++    return {};
++}
++
++lgp::framework::Status Renderer::CreateDeviceObjects()
++{
++    if (auto status = gpu::CreateLabShaders(ShaderPath(), shaders_); !status)
++    {
++        return status;
++    }
++    if (auto status = gpu::CreateLabRootSignature(*deviceResources_->device(), rootSignature_); !status)
++    {
++        return status;
++    }
++    if (auto status = gpu::CreateLabPipelines(*deviceResources_->device(), deviceResources_->back_buffer_format(),
++                                              *rootSignature_.Get(), shaders_, pipelines_);
++        !status)
++    {
++        return status;
++    }
++    if (auto status = CreateQueueObjects(); !status)
++    {
++        return status;
++    }
++    if (auto status = CreateFrameCommandObjects(); !status)
++    {
++        return status;
++    }
++    return CreateTimestampObjects();
++}
++
+ void Renderer::ReleaseSizeDependentResources() noexcept
+ {
+-    for (FrameSlotTextures &slot : frameSlots_)
++    for (FrameSlotResources &slot : frameSlots_)
+     {
+         for (auto &texture : slot.textures)
+         {
+             texture.Reset();
+         }
++        slot.submissionCalibration = {};
++        slot.timingPending = false;
+     }
+     graph_.reset();
+     physicalByteSizes_.reset();
+-    serialSchedule_.reset();
+-    asyncSchedule_.reset();
++    schedules_.reset();
++    lastExecutionTrace_.clear();
++    lastProducerBarrierTrace_.clear();
++    lastGpuTimingSample_.reset();
+ }
+ 
+ lgp::framework::Status Renderer::CreateSizeDependentResources(lgp::framework::Extent2D size)
+@@ -189,7 +353,7 @@ lgp::framework::Status Renderer::CreateSizeDependentResources(lgp::framework::Ex
+         textureRtvs_ = *rtvs;
+     }
+ 
+-    auto graphResult = gpu::CompileLabGraph(deviceResources_->headless());
++    auto graphResult = gpu::CompileLabGraph(headless_);
+     if (!graphResult)
+     {
+         return std::unexpected(std::move(graphResult.error()));
+@@ -205,7 +369,6 @@ lgp::framework::Status Renderer::CreateSizeDependentResources(lgp::framework::Ex
+         return std::unexpected(std::move(schedulesResult.error()));
+     }
+ 
+-    frameSlots_.resize(frameSlotCount);
+     D3D12_RESOURCE_DESC1 const computeDescription = gpu::ComputeTextureDescription(size);
+     D3D12_RESOURCE_DESC1 const graphicsDescription = gpu::GraphicsTextureDescription(size);
+     D3D12_HEAP_PROPERTIES heap{};
+@@ -213,10 +376,9 @@ lgp::framework::Status Renderer::CreateSizeDependentResources(lgp::framework::Ex
+     D3D12_CLEAR_VALUE clearValue{};
+     clearValue.Format = gpu::kTransientFormat;
+     clearValue.Color[3] = 1.0F;
+-
+     for (UINT frameSlot = 0U; frameSlot < frameSlotCount; ++frameSlot)
+     {
+-        FrameSlotTextures &slot = frameSlots_[frameSlot];
++        FrameSlotResources &slot = frameSlots_[frameSlot];
+         for (std::size_t textureIndex = 0U; textureIndex < gpu::kLabTextureCount; ++textureIndex)
+         {
+             bool const computeTexture = textureIndex <= TextureIndex(gpu::LabTextureIndex::ComputeFinal);
+@@ -229,7 +391,7 @@ lgp::framework::Status Renderer::CreateSizeDependentResources(lgp::framework::Ex
+             {
+                 return std::unexpected(
+                     lgp::framework::MakeHResultError("ID3D12Device10::CreateCommittedResource3", result,
+-                                                     "Failed to create a per-frame Chapter 10 Starter texture."));
++                                                     "Failed to create a per-frame Chapter 10 Solution texture."));
+             }
+         }
+ 
+@@ -274,18 +436,47 @@ lgp::framework::Status Renderer::CreateSizeDependentResources(lgp::framework::Ex
+ 
+     graph_ = std::move(*graphResult);
+     physicalByteSizes_ = *sizesResult;
+-    serialSchedule_ = std::move(schedulesResult->serial);
+-    asyncSchedule_ = std::move(schedulesResult->async);
++    schedules_ = std::move(*schedulesResult);
+     return ValidateConcreteAsyncPlan();
+ }
+ 
++lgp::framework::Status Renderer::InitializeImGui()
++{
++    auto descriptor = deviceResources_->shader_visible_cbv_srv_uav_heap().Allocate(1U);
++    if (!descriptor)
++    {
++        return std::unexpected(std::move(descriptor.error()));
++    }
++    imguiFontDescriptor_ = *descriptor;
++    IMGUI_CHECKVERSION();
++    ImGui::CreateContext();
++    ImGui::StyleColorsDark();
++    ImGui::GetIO().BackendPlatformName = "LGP.ManualInput";
++    ImGui_ImplDX12_InitInfo info{};
++    info.Device = deviceResources_->device();
++    info.CommandQueue = deviceResources_->graphics_queue();
++    info.NumFramesInFlight = static_cast<int>(deviceResources_->back_buffer_count());
++    info.RTVFormat = deviceResources_->back_buffer_format();
++    info.SrvDescriptorHeap = deviceResources_->shader_visible_cbv_srv_uav_heap().Get();
++    info.LegacySingleSrvCpuDescriptor = imguiFontDescriptor_.cpuHandle;
++    info.LegacySingleSrvGpuDescriptor = imguiFontDescriptor_.gpuHandle;
++    if (!ImGui_ImplDX12_Init(&info))
++    {
++        return std::unexpected(
++            lgp::framework::MakeError("ImGui_ImplDX12_Init", "Failed to initialize Chapter 10 diagnostics."));
++    }
++    imguiInitialized_ = true;
++    return {};
++}
++
+ lgp::framework::Status Renderer::ValidateConcreteAsyncPlan() const
+ {
+-    if (!graph_ || !asyncSchedule_)
++    if (!graph_ || !schedules_)
+     {
+         return std::unexpected(
+             lgp::framework::MakeError("Renderer::ValidateConcreteAsyncPlan", "The async plan is unavailable."));
+     }
++    SchedulePlan const &plan = schedules_->async;
+     std::array<std::tuple<ch08::frame_graph::PassId, QueueKind, std::uint32_t>, 5U> const expected{{
+         {graph_->computeGenerate, QueueKind::Compute, 0U},
+         {graph_->computeCollapse, QueueKind::Compute, 1U},
+@@ -295,30 +486,58 @@ lgp::framework::Status Renderer::ValidateConcreteAsyncPlan() const
+     }};
+     for (auto const &[passId, queue, queuePosition] : expected)
+     {
+-        ScheduledPass const *pass = FindPass(*asyncSchedule_, passId);
++        ScheduledPass const *pass = FindPass(plan, passId);
+         if (pass == nullptr || pass->queue != queue || pass->queuePosition != queuePosition)
+         {
+-            return std::unexpected(lgp::framework::MakeError(
+-                "Renderer::ValidateConcreteAsyncPlan", "A pass queue or position does not match runtime recording."));
++            return std::unexpected(lgp::framework::MakeError("Renderer::ValidateConcreteAsyncPlan",
++                                                             "A concrete pass queue or queue position does not match "
++                                                             "the runtime recording order."));
+         }
+     }
+-    if (asyncSchedule_->crossQueueFenceDependencies.size() != 1U)
++    if (plan.crossQueueFenceDependencies.size() != 1U)
+     {
+         return std::unexpected(lgp::framework::MakeError("Renderer::ValidateConcreteAsyncPlan",
+                                                          "The async plan must have exactly one fence dependency."));
+     }
+-    CrossQueueFenceDependency const &fence = asyncSchedule_->crossQueueFenceDependencies.front();
++    CrossQueueFenceDependency const &fence = plan.crossQueueFenceDependencies.front();
+     bool const reasonMatches = fence.reasons.size() == 1U && fence.reasons.front().resourceId == graph_->computeFinal;
+     if (fence.producerPassId != graph_->computeCollapse || fence.consumerPassId != graph_->composite ||
+         fence.producerQueue != QueueKind::Compute || fence.consumerQueue != QueueKind::Direct ||
+         fence.signalAfterProducerQueuePosition != 1U || fence.waitBeforeConsumerQueuePosition != 2U || !reasonMatches)
+     {
+         return std::unexpected(lgp::framework::MakeError(
+-            "Renderer::ValidateConcreteAsyncPlan", "The planned compute-to-composite fence does not match runtime."));
++            "Renderer::ValidateConcreteAsyncPlan",
++            "The concrete compute-collapse to composite fence dependency does not match the runtime path."));
+     }
+     return {};
+ }
+ 
++void Renderer::CaptureSubmissionCalibration(std::uint64_t frameIndex, FrameSlotResources &slot) noexcept
++{
++    gpu::GpuSubmissionCalibration calibration{};
++    calibration.frameIndex = frameIndex;
++    LARGE_INTEGER qpcFrequency{};
++    if (QueryPerformanceFrequency(&qpcFrequency) != FALSE)
++    {
++        calibration.qpcFrequency = static_cast<std::uint64_t>(qpcFrequency.QuadPart);
++    }
++
++    HRESULT const computeFrequencyResult = computeQueue_->GetTimestampFrequency(&calibration.compute.frequency);
++    HRESULT const computeClockResult =
++        computeQueue_->GetClockCalibration(&calibration.compute.gpuTimestamp, &calibration.compute.cpuQpc);
++    calibration.compute.valid = SUCCEEDED(computeFrequencyResult) && SUCCEEDED(computeClockResult) &&
++                                calibration.compute.frequency != 0U && calibration.qpcFrequency != 0U;
++
++    HRESULT const directFrequencyResult =
++        deviceResources_->graphics_queue()->GetTimestampFrequency(&calibration.direct.frequency);
++    HRESULT const directClockResult = deviceResources_->graphics_queue()->GetClockCalibration(
++        &calibration.direct.gpuTimestamp, &calibration.direct.cpuQpc);
++    calibration.direct.valid = SUCCEEDED(directFrequencyResult) && SUCCEEDED(directClockResult) &&
++                               calibration.direct.frequency != 0U && calibration.qpcFrequency != 0U;
++    calibration.sharedCalibrationValid = calibration.compute.valid && calibration.direct.valid;
++    slot.submissionCalibration = calibration;
++}
++
+ void Renderer::DrawTo(ID3D12GraphicsCommandList7 &commandList, ID3D12PipelineState &pipeline,
+                       D3D12_CPU_DESCRIPTOR_HANDLE renderTarget) const
+ {
+@@ -335,130 +554,361 @@ void Renderer::Dispatch(ID3D12GraphicsCommandList7 &commandList, ID3D12PipelineS
+ }
+ 
+ lgp::framework::Status Renderer::RecordComputeBranch(lgp::framework::FrameContext const &frameContext,
+-                                                     FrameSlotTextures &slot)
++                                                     FrameSlotResources &slot)
+ {
+-    HRESULT result = slot.computeAllocator->Reset();
+-    if (FAILED(result))
++    HRESULT const allocatorReset = slot.computeAllocator->Reset();
++    if (FAILED(allocatorReset))
+     {
+-        return std::unexpected(lgp::framework::MakeHResultError(
+-            "ID3D12CommandAllocator::Reset", result, "Failed to reset the Chapter 10 compute allocator."));
++        return std::unexpected(lgp::framework::MakeHResultError("ID3D12CommandAllocator::Reset", allocatorReset,
++                                                                "Failed to reset a Chapter 10 compute allocator."));
+     }
+-    result = slot.computeList->Reset(slot.computeAllocator.Get(), nullptr);
+-    if (FAILED(result))
++    HRESULT const listReset = slot.computeList->Reset(slot.computeAllocator.Get(), nullptr);
++    if (FAILED(listReset))
+     {
+-        return std::unexpected(lgp::framework::MakeHResultError(
+-            "ID3D12GraphicsCommandList::Reset", result, "Failed to reset the Chapter 10 compute command list."));
++        return std::unexpected(lgp::framework::MakeHResultError("ID3D12GraphicsCommandList::Reset", listReset,
++                                                                "Failed to reset a Chapter 10 compute list."));
+     }
+-
+     ID3D12GraphicsCommandList7 &commandList = *slot.computeList.Get();
+-    ID3D12DescriptorHeap *const descriptorHeaps[]{frameContext.shaderVisibleCbvSrvUavHeap};
+-    commandList.SetDescriptorHeaps(1U, descriptorHeaps);
+-    commandList.SetComputeRootSignature(rootSignature_.Get());
+-    ID3D12Resource &computeScratch = *slot.textures[TextureIndex(gpu::LabTextureIndex::ComputeScratch)].Get();
+-    ID3D12Resource &computeFinal = *slot.textures[TextureIndex(gpu::LabTextureIndex::ComputeFinal)].Get();
++    {
++        lgp::framework::PixEventScope pixEvent{commandList, lgp::framework::PixColor(80U, 220U, 220U),
++                                               L"Ch10 Compute Branch"};
++        ID3D12DescriptorHeap *const descriptorHeaps[]{frameContext.shaderVisibleCbvSrvUavHeap};
++        commandList.SetDescriptorHeaps(1U, descriptorHeaps);
++        commandList.SetComputeRootSignature(rootSignature_.Get());
++        UINT const queryStart = ComputeQueryIndex(frameContext.frameSlot, 0U);
++        commandList.EndQuery(computeTimestampHeap_.Get(), D3D12_QUERY_TYPE_TIMESTAMP, queryStart);
+ 
+-    std::vector<D3D12_TEXTURE_BARRIER> barriers{
+-        gpu::MakeTextureBarrier(computeScratch, gpu::UndefinedState(), gpu::ComputeUnorderedAccessState(),
+-                                D3D12_TEXTURE_BARRIER_FLAG_DISCARD),
+-    };
+-    gpu::SubmitTextureBarriers(commandList, barriers);
+-    commandList.SetComputeRootDescriptorTable(
+-        2U, textureDescriptors_.GpuHandle(DescriptorIndex(frameContext.frameSlot, kComputeScratchUav)));
+-    Dispatch(commandList, *pipelines_.computeGenerate.Get(), frameContext.drawableSize);
++        ID3D12Resource &computeScratch = *slot.textures[TextureIndex(gpu::LabTextureIndex::ComputeScratch)].Get();
++        ID3D12Resource &computeFinal = *slot.textures[TextureIndex(gpu::LabTextureIndex::ComputeFinal)].Get();
++        std::vector<D3D12_TEXTURE_BARRIER> barriers{
++            gpu::MakeTextureBarrier(computeScratch, gpu::UndefinedState(), gpu::ComputeUnorderedAccessState(),
++                                    D3D12_TEXTURE_BARRIER_FLAG_DISCARD),
++        };
++        gpu::SubmitTextureBarriers(commandList, barriers);
++        commandList.SetComputeRootDescriptorTable(
++            2U, textureDescriptors_.GpuHandle(DescriptorIndex(frameContext.frameSlot, kComputeScratchUav)));
++        Dispatch(commandList, *pipelines_.computeGenerate.Get(), frameContext.drawableSize);
+ 
+-    barriers = {
+-        gpu::MakeTextureBarrier(computeScratch, gpu::ComputeUnorderedAccessState(), gpu::ComputeShaderResourceState()),
+-        gpu::MakeTextureBarrier(computeFinal, gpu::UndefinedState(), gpu::ComputeUnorderedAccessState(),
+-                                D3D12_TEXTURE_BARRIER_FLAG_DISCARD),
+-    };
+-    gpu::SubmitTextureBarriers(commandList, barriers);
+-    commandList.SetComputeRootDescriptorTable(
+-        0U, textureDescriptors_.GpuHandle(DescriptorIndex(frameContext.frameSlot, kComputeScratchSrv)));
+-    commandList.SetComputeRootDescriptorTable(
+-        2U, textureDescriptors_.GpuHandle(DescriptorIndex(frameContext.frameSlot, kComputeFinalUav)));
+-    Dispatch(commandList, *pipelines_.computeCollapse.Get(), frameContext.drawableSize);
++        barriers = {
++            gpu::MakeTextureBarrier(computeScratch, gpu::ComputeUnorderedAccessState(),
++                                    gpu::ComputeShaderResourceState()),
++            gpu::MakeTextureBarrier(computeFinal, gpu::UndefinedState(), gpu::ComputeUnorderedAccessState(),
++                                    D3D12_TEXTURE_BARRIER_FLAG_DISCARD),
++        };
++        gpu::SubmitTextureBarriers(commandList, barriers);
++        commandList.SetComputeRootDescriptorTable(
++            0U, textureDescriptors_.GpuHandle(DescriptorIndex(frameContext.frameSlot, kComputeScratchSrv)));
++        commandList.SetComputeRootDescriptorTable(
++            2U, textureDescriptors_.GpuHandle(DescriptorIndex(frameContext.frameSlot, kComputeFinalUav)));
++        Dispatch(commandList, *pipelines_.computeCollapse.Get(), frameContext.drawableSize);
+ 
+-    barriers = {
+-        gpu::MakeTextureBarrier(computeScratch, gpu::ComputeShaderResourceState(), gpu::UndefinedState()),
+-        gpu::MakeTextureBarrier(computeFinal, gpu::ComputeUnorderedAccessState(), gpu::ComputeProducedSharedShaderResourceState()),
+-    };
+-    gpu::SubmitTextureBarriers(commandList, barriers);
+-    result = commandList.Close();
+-    if (FAILED(result))
++        lgp::framework::TextureBarrierState const producedState = gpu::ComputeProducedSharedShaderResourceState();
++        barriers = {
++            gpu::MakeTextureBarrier(computeScratch, gpu::ComputeShaderResourceState(), gpu::UndefinedState()),
++            gpu::MakeTextureBarrier(computeFinal, gpu::ComputeUnorderedAccessState(), producedState),
++        };
++        gpu::SubmitTextureBarriers(commandList, barriers);
++        lastProducerBarrierTrace_ = {
++            {graph_->computeScratch, gpu::ComputeShaderResourceState(), gpu::UndefinedState(),
++             D3D12_TEXTURE_BARRIER_FLAG_NONE},
++            {graph_->computeFinal, gpu::ComputeUnorderedAccessState(), producedState, D3D12_TEXTURE_BARRIER_FLAG_NONE},
++        };
++
++        commandList.EndQuery(computeTimestampHeap_.Get(), D3D12_QUERY_TYPE_TIMESTAMP, queryStart + 1U);
++        commandList.ResolveQueryData(computeTimestampHeap_.Get(), D3D12_QUERY_TYPE_TIMESTAMP, queryStart, 2U,
++                                     slot.computeTimestampReadback.resource(), 0U);
++    }
++    HRESULT const closeResult = commandList.Close();
++    if (FAILED(closeResult))
+     {
+-        return std::unexpected(lgp::framework::MakeHResultError(
+-            "ID3D12GraphicsCommandList::Close", result, "Failed to close the Chapter 10 compute command list."));
++        return std::unexpected(lgp::framework::MakeHResultError("ID3D12GraphicsCommandList::Close", closeResult,
++                                                                "Failed to close the Chapter 10 compute list."));
+     }
++    lastExecutionTrace_.push_back(
++        {gpu::QueueExecutionTraceKind::ComputeBranchRecorded, QueueKind::Compute, std::nullopt});
+     return {};
+ }
+ 
+-lgp::framework::Status Renderer::RecordGraphicsBranch(lgp::framework::FrameContext const &frameContext,
+-                                                      FrameSlotTextures &slot)
++lgp::framework::Status Renderer::RecordIndependentGraphicsBranch(lgp::framework::FrameContext const &frameContext,
++                                                                 FrameSlotResources &slot)
+ {
+-    HRESULT result = slot.directAllocator->Reset();
+-    if (FAILED(result))
++    HRESULT const allocatorReset = slot.directAllocator->Reset();
++    if (FAILED(allocatorReset))
+     {
+-        return std::unexpected(lgp::framework::MakeHResultError(
+-            "ID3D12CommandAllocator::Reset", result, "Failed to reset the Chapter 10 direct allocator."));
++        return std::unexpected(
++            lgp::framework::MakeHResultError("ID3D12CommandAllocator::Reset", allocatorReset,
++                                             "Failed to reset a Chapter 10 independent direct allocator."));
+     }
+-    result = slot.directList->Reset(slot.directAllocator.Get(), nullptr);
+-    if (FAILED(result))
++    HRESULT const listReset = slot.directList->Reset(slot.directAllocator.Get(), nullptr);
++    if (FAILED(listReset))
+     {
+         return std::unexpected(lgp::framework::MakeHResultError(
+-            "ID3D12GraphicsCommandList::Reset", result, "Failed to reset the Chapter 10 direct command list."));
++            "ID3D12GraphicsCommandList::Reset", listReset, "Failed to reset a Chapter 10 independent direct list."));
+     }
+-
+     ID3D12GraphicsCommandList7 &commandList = *slot.directList.Get();
++    {
++        lgp::framework::PixEventScope pixEvent{commandList, lgp::framework::PixColor(255U, 180U, 80U),
++                                               L"Ch10 Independent Graphics"};
++        ID3D12DescriptorHeap *const descriptorHeaps[]{frameContext.shaderVisibleCbvSrvUavHeap};
++        commandList.SetDescriptorHeaps(1U, descriptorHeaps);
++        commandList.SetGraphicsRootSignature(rootSignature_.Get());
++        commandList.RSSetViewports(1U, &frameContext.viewport);
++        commandList.RSSetScissorRects(1U, &frameContext.scissorRect);
++        commandList.IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
++        UINT const queryStart = DirectQueryIndex(frameContext.frameSlot, 0U);
++        commandList.EndQuery(directTimestampHeap_.Get(), D3D12_QUERY_TYPE_TIMESTAMP, queryStart);
++
++        ID3D12Resource &graphicsScratch = *slot.textures[TextureIndex(gpu::LabTextureIndex::GraphicsScratch)].Get();
++        ID3D12Resource &graphicsFinal = *slot.textures[TextureIndex(gpu::LabTextureIndex::GraphicsFinal)].Get();
++        std::vector<D3D12_TEXTURE_BARRIER> barriers{
++            gpu::MakeTextureBarrier(graphicsScratch, gpu::UndefinedState(), gpu::RenderTargetState(),
++                                    D3D12_TEXTURE_BARRIER_FLAG_DISCARD),
++        };
++        gpu::SubmitTextureBarriers(commandList, barriers);
++        DrawTo(commandList, *pipelines_.graphicsGeometry.Get(),
++               textureRtvs_.CpuHandle(RtvIndex(frameContext.frameSlot, 0U)));
++
++        barriers = {
++            gpu::MakeTextureBarrier(graphicsScratch, gpu::RenderTargetState(), gpu::PixelShaderResourceState()),
++            gpu::MakeTextureBarrier(graphicsFinal, gpu::UndefinedState(), gpu::RenderTargetState(),
++                                    D3D12_TEXTURE_BARRIER_FLAG_DISCARD),
++        };
++        gpu::SubmitTextureBarriers(commandList, barriers);
++        commandList.SetGraphicsRootDescriptorTable(
++            0U, textureDescriptors_.GpuHandle(DescriptorIndex(frameContext.frameSlot, kGraphicsScratchSrv)));
++        DrawTo(commandList, *pipelines_.graphicsResolve.Get(),
++               textureRtvs_.CpuHandle(RtvIndex(frameContext.frameSlot, 1U)));
++
++        barriers = {
++            gpu::MakeTextureBarrier(graphicsScratch, gpu::PixelShaderResourceState(), gpu::UndefinedState()),
++            gpu::MakeTextureBarrier(graphicsFinal, gpu::RenderTargetState(), gpu::PixelShaderResourceState()),
++        };
++        gpu::SubmitTextureBarriers(commandList, barriers);
++        commandList.EndQuery(directTimestampHeap_.Get(), D3D12_QUERY_TYPE_TIMESTAMP, queryStart + 1U);
++        commandList.ResolveQueryData(directTimestampHeap_.Get(), D3D12_QUERY_TYPE_TIMESTAMP, queryStart, 2U,
++                                     slot.directTimestampReadback.resource(), 0U);
++    }
++    HRESULT const closeResult = commandList.Close();
++    if (FAILED(closeResult))
++    {
++        return std::unexpected(
++            lgp::framework::MakeHResultError("ID3D12GraphicsCommandList::Close", closeResult,
++                                             "Failed to close the Chapter 10 independent direct list."));
++    }
++    lastExecutionTrace_.push_back(
++        {gpu::QueueExecutionTraceKind::IndependentGraphicsBranchRecorded, QueueKind::Direct, std::nullopt});
++    return {};
++}
++
++lgp::framework::Status Renderer::RecordComposite(lgp::framework::FrameContext const &frameContext,
++                                                 FrameSlotResources &slot)
++{
++    ID3D12GraphicsCommandList7 &commandList = *frameContext.commandList;
++    lgp::framework::PixEventScope pixEvent{commandList, lgp::framework::PixColor(180U, 100U, 255U), L"Ch10 Composite"};
+     ID3D12DescriptorHeap *const descriptorHeaps[]{frameContext.shaderVisibleCbvSrvUavHeap};
+     commandList.SetDescriptorHeaps(1U, descriptorHeaps);
+     commandList.SetGraphicsRootSignature(rootSignature_.Get());
+     commandList.RSSetViewports(1U, &frameContext.viewport);
+     commandList.RSSetScissorRects(1U, &frameContext.scissorRect);
+     commandList.IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
++    UINT const queryStart = DirectQueryIndex(frameContext.frameSlot, 2U);
++    commandList.EndQuery(directTimestampHeap_.Get(), D3D12_QUERY_TYPE_TIMESTAMP, queryStart);
+ 
+-    ID3D12Resource &graphicsScratch = *slot.textures[TextureIndex(gpu::LabTextureIndex::GraphicsScratch)].Get();
+-    ID3D12Resource &graphicsFinal = *slot.textures[TextureIndex(gpu::LabTextureIndex::GraphicsFinal)].Get();
+     std::vector<D3D12_TEXTURE_BARRIER> barriers{
+-        gpu::MakeTextureBarrier(graphicsScratch, gpu::UndefinedState(), gpu::RenderTargetState(),
+-                                D3D12_TEXTURE_BARRIER_FLAG_DISCARD),
++        gpu::MakeTextureBarrier(*frameContext.renderTarget, gpu::FrameStartState(frameContext.headless),
++                                gpu::RenderTargetState()),
+     };
+     gpu::SubmitTextureBarriers(commandList, barriers);
+-    DrawTo(commandList, *pipelines_.graphicsGeometry.Get(),
+-           textureRtvs_.CpuHandle(RtvIndex(frameContext.frameSlot, 0U)));
++    commandList.SetGraphicsRootDescriptorTable(
++        0U, textureDescriptors_.GpuHandle(DescriptorIndex(frameContext.frameSlot, kComputeFinalSrv)));
++    commandList.SetGraphicsRootDescriptorTable(
++        1U, textureDescriptors_.GpuHandle(DescriptorIndex(frameContext.frameSlot, kGraphicsFinalSrv)));
++    DrawTo(commandList, *pipelines_.composite.Get(), frameContext.renderTargetView);
+ 
++    if (imguiFrameBegun_)
++    {
++        commandList.SetDescriptorHeaps(1U, descriptorHeaps);
++        ImGui::Render();
++        ImGui_ImplDX12_RenderDrawData(ImGui::GetDrawData(), &commandList);
++        imguiFrameBegun_ = false;
++    }
++
++    ID3D12Resource &computeFinal = *slot.textures[TextureIndex(gpu::LabTextureIndex::ComputeFinal)].Get();
++    ID3D12Resource &graphicsFinal = *slot.textures[TextureIndex(gpu::LabTextureIndex::GraphicsFinal)].Get();
+     barriers = {
+-        gpu::MakeTextureBarrier(graphicsScratch, gpu::RenderTargetState(), gpu::PixelShaderResourceState()),
+-        gpu::MakeTextureBarrier(graphicsFinal, gpu::UndefinedState(), gpu::RenderTargetState(),
+-                                D3D12_TEXTURE_BARRIER_FLAG_DISCARD),
++        gpu::MakeTextureBarrier(computeFinal, gpu::PixelShaderResourceState(), gpu::UndefinedState()),
++        gpu::MakeTextureBarrier(graphicsFinal, gpu::PixelShaderResourceState(), gpu::UndefinedState()),
++        gpu::MakeTextureBarrier(*frameContext.renderTarget, gpu::RenderTargetState(),
++                                gpu::FrameEndState(frameContext.headless)),
+     };
+     gpu::SubmitTextureBarriers(commandList, barriers);
+-    commandList.SetGraphicsRootDescriptorTable(
+-        0U, textureDescriptors_.GpuHandle(DescriptorIndex(frameContext.frameSlot, kGraphicsScratchSrv)));
+-    DrawTo(commandList, *pipelines_.graphicsResolve.Get(),
+-           textureRtvs_.CpuHandle(RtvIndex(frameContext.frameSlot, 1U)));
++    commandList.EndQuery(directTimestampHeap_.Get(), D3D12_QUERY_TYPE_TIMESTAMP, queryStart + 1U);
++    commandList.ResolveQueryData(directTimestampHeap_.Get(), D3D12_QUERY_TYPE_TIMESTAMP, queryStart, 2U,
++                                 slot.directTimestampReadback.resource(), 2U * sizeof(std::uint64_t));
++    lastExecutionTrace_.push_back(
++        {gpu::QueueExecutionTraceKind::CompositeRecordedForFrameworkSubmission, QueueKind::Direct, std::nullopt});
++    return {};
++}
+ 
+-    barriers = {
+-        gpu::MakeTextureBarrier(graphicsScratch, gpu::PixelShaderResourceState(), gpu::UndefinedState()),
+-        gpu::MakeTextureBarrier(graphicsFinal, gpu::RenderTargetState(), gpu::PixelShaderResourceState()),
++lgp::framework::Status Renderer::ReadCompletedTimingSample(UINT frameSlot)
++{
++    FrameSlotResources &slot = frameSlots_[frameSlot];
++    if (!slot.timingPending)
++    {
++        return {};
++    }
++    std::array<std::uint64_t, 2U> computeTimestamps{};
++    std::array<std::uint64_t, 4U> directTimestamps{};
++    D3D12_RANGE const computeReadRange{0U, static_cast<SIZE_T>(kComputeReadbackBytes)};
++    void *computeData = nullptr;
++    HRESULT const computeMapResult = slot.computeTimestampReadback.resource()->Map(0U, &computeReadRange, &computeData);
++    if (FAILED(computeMapResult))
++    {
++        return std::unexpected(lgp::framework::MakeHResultError("ID3D12Resource::Map", computeMapResult,
++                                                                "Failed to map Chapter 10 compute timestamps."));
++    }
++    std::memcpy(computeTimestamps.data(), computeData, kComputeReadbackBytes);
++    D3D12_RANGE const noWrites{0U, 0U};
++    slot.computeTimestampReadback.resource()->Unmap(0U, &noWrites);
++
++    D3D12_RANGE const directReadRange{0U, static_cast<SIZE_T>(kDirectReadbackBytes)};
++    void *directData = nullptr;
++    HRESULT const directMapResult = slot.directTimestampReadback.resource()->Map(0U, &directReadRange, &directData);
++    if (FAILED(directMapResult))
++    {
++        return std::unexpected(lgp::framework::MakeHResultError("ID3D12Resource::Map", directMapResult,
++                                                                "Failed to map Chapter 10 direct timestamps."));
++    }
++    std::memcpy(directTimestamps.data(), directData, kDirectReadbackBytes);
++    slot.directTimestampReadback.resource()->Unmap(0U, &noWrites);
++
++    gpu::GpuTimingSample sample{};
++    sample.frameIndex = slot.submittedFrameIndex;
++    sample.submissionCalibration = slot.submissionCalibration;
++    sample.sharedCalibrationValid = slot.submissionCalibration.sharedCalibrationValid;
++    sample.intervals = {
++        gpu::GpuTimestampInterval{gpu::GpuIntervalKind::ComputeBranch, QueueKind::Compute, computeTimestamps[0],
++                                  computeTimestamps[1]},
++        gpu::GpuTimestampInterval{gpu::GpuIntervalKind::IndependentGraphicsBranch, QueueKind::Direct,
++                                  directTimestamps[0], directTimestamps[1]},
++        gpu::GpuTimestampInterval{gpu::GpuIntervalKind::Composite, QueueKind::Direct, directTimestamps[2],
++                                  directTimestamps[3]},
+     };
+-    gpu::SubmitTextureBarriers(commandList, barriers);
+-    result = commandList.Close();
+-    if (FAILED(result))
++    for (gpu::GpuTimestampInterval &interval : sample.intervals)
+     {
+-        return std::unexpected(lgp::framework::MakeHResultError(
+-            "ID3D12GraphicsCommandList::Close", result, "Failed to close the Chapter 10 direct command list."));
++        gpu::GpuQueueCalibration const &calibration = interval.queue == QueueKind::Compute
++                                                          ? sample.submissionCalibration.compute
++                                                          : sample.submissionCalibration.direct;
++        if (calibration.frequency != 0U && interval.endTimestamp >= interval.startTimestamp)
++        {
++            interval.durationSeconds = static_cast<double>(interval.endTimestamp - interval.startTimestamp) /
++                                       static_cast<double>(calibration.frequency);
++        }
++        if (sample.sharedCalibrationValid)
++        {
++            interval.normalizedStartSeconds =
++                NormalizeTimestamp(interval.startTimestamp, calibration.gpuTimestamp, calibration.cpuQpc,
++                                   calibration.frequency, sample.submissionCalibration.qpcFrequency);
++            interval.normalizedEndSeconds =
++                NormalizeTimestamp(interval.endTimestamp, calibration.gpuTimestamp, calibration.cpuQpc,
++                                   calibration.frequency, sample.submissionCalibration.qpcFrequency);
++        }
+     }
++    lastGpuTimingSample_ = sample;
++    slot.timingPending = false;
+     return {};
+ }
+ 
++void Renderer::BuildDiagnosticsWindow() const
++{
++    if (!schedules_)
++    {
++        return;
++    }
++    ImGui::Begin("Pass schedule comparison");
++    ImGui::Text("Abstract makespan: serial %llu, async %llu",
++                static_cast<unsigned long long>(schedules_->serial.abstractMakespanTicks),
++                static_cast<unsigned long long>(schedules_->async.abstractMakespanTicks));
++    if (schedules_->serial.peakTransientBytes && schedules_->async.peakTransientBytes)
++    {
++        ImGui::Text("Complete peak bytes: serial %llu, async %llu",
++                    static_cast<unsigned long long>(*schedules_->serial.peakTransientBytes),
++                    static_cast<unsigned long long>(*schedules_->async.peakTransientBytes));
++    }
++    for (ScheduledPass const &pass : schedules_->async.passes)
++    {
++        ImGui::Text("%s %s [%llu, %llu)", pass.queue == QueueKind::Compute ? "Compute" : "Direct",
++                    pass.educationalName.c_str(), static_cast<unsigned long long>(pass.abstractStartTick),
++                    static_cast<unsigned long long>(pass.abstractEndTick));
++        DrawIntervalBar(static_cast<double>(pass.abstractStartTick), static_cast<double>(pass.abstractEndTick), 0.0,
++                        static_cast<double>(schedules_->async.abstractMakespanTicks));
++    }
++    if (!schedules_->async.crossQueueFenceDependencies.empty())
++    {
++        CrossQueueFenceDependency const &dependency = schedules_->async.crossQueueFenceDependencies.front();
++        ImGui::Text("Fence: pass %u signals; pass %u waits", dependency.producerPassId.value,
++                    dependency.consumerPassId.value);
++    }
++    ImGui::Separator();
++    for (gpu::QueueExecutionTraceRecord const &record : lastExecutionTrace_)
++    {
++        std::string_view const label = TraceLabel(record.kind);
++        ImGui::Text("%.*s | %s queue | fence %llu", static_cast<int>(label.size()), label.data(),
++                    record.queue == QueueKind::Compute ? "Compute" : "Direct",
++                    static_cast<unsigned long long>(record.fenceValue.value_or(0U)));
++    }
++    if (lastGpuTimingSample_)
++    {
++        ImGui::Separator();
++        ImGui::Text("GPU frame %llu; shared calibration %s",
++                    static_cast<unsigned long long>(lastGpuTimingSample_->frameIndex),
++                    lastGpuTimingSample_->sharedCalibrationValid ? "valid" : "unavailable");
++        double sharedStart = 0.0;
++        double sharedEnd = 0.0;
++        if (lastGpuTimingSample_->sharedCalibrationValid)
++        {
++            sharedStart = *lastGpuTimingSample_->intervals.front().normalizedStartSeconds;
++            sharedEnd = *lastGpuTimingSample_->intervals.front().normalizedEndSeconds;
++            for (gpu::GpuTimestampInterval const &interval : lastGpuTimingSample_->intervals)
++            {
++                sharedStart = (std::min)(sharedStart, *interval.normalizedStartSeconds);
++                sharedEnd = (std::max)(sharedEnd, *interval.normalizedEndSeconds);
++            }
++        }
++        for (gpu::GpuTimestampInterval const &interval : lastGpuTimingSample_->intervals)
++        {
++            std::string_view const label = IntervalLabel(interval.kind);
++            ImGui::Text("%.*s: %.3f ms", static_cast<int>(label.size()), label.data(),
++                        interval.durationSeconds.value_or(0.0) * 1'000.0);
++            if (interval.normalizedStartSeconds && interval.normalizedEndSeconds)
++            {
++                ImGui::Text("  calibrated [%.6f, %.6f] s", *interval.normalizedStartSeconds,
++                            *interval.normalizedEndSeconds);
++                DrawIntervalBar(*interval.normalizedStartSeconds, *interval.normalizedEndSeconds, sharedStart,
++                                sharedEnd);
++            }
++        }
++        if (!lastGpuTimingSample_->sharedCalibrationValid)
++        {
++            ImGui::TextUnformatted("Durations remain useful; the submission graph alone proves overlap opportunity.");
++        }
++    }
++    ImGui::End();
++}
++
+ lgp::framework::Status Renderer::Initialize(lgp::framework::ApplicationInitContext const &context)
+ {
+     deviceResources_ = &context.deviceResources;
++    headless_ = context.commandLine.headless;
+     if (auto status = CreateDeviceObjects(); !status)
+     {
+         return status;
+     }
+-    return CreateSizeDependentResources(context.drawableSize);
++    if (auto status = CreateSizeDependentResources(context.drawableSize); !status)
++    {
++        return status;
++    }
++    return {};
+ }
+ 
+ lgp::framework::Status Renderer::OnResize(lgp::framework::DeviceResources &, lgp::framework::Extent2D drawableSize)
+@@ -466,8 +916,28 @@ lgp::framework::Status Renderer::OnResize(lgp::framework::DeviceResources &, lgp
+     return CreateSizeDependentResources(drawableSize);
+ }
+ 
+-lgp::framework::Status Renderer::Update(lgp::framework::UpdateContext const &)
++lgp::framework::Status Renderer::Update(lgp::framework::UpdateContext const &context)
+ {
++    if (headless_ || !imguiInitialized_)
++    {
++        return {};
++    }
++    if (imguiFrameBegun_)
++    {
++        ImGui::EndFrame();
++        imguiFrameBegun_ = false;
++    }
++    ImGuiIO &io = ImGui::GetIO();
++    io.DisplaySize = {static_cast<float>(context.drawableSize.width), static_cast<float>(context.drawableSize.height)};
++    io.DeltaTime = static_cast<float>((std::max)(context.deltaSeconds, 1.0 / 240.0));
++    io.AddMousePosEvent(static_cast<float>(context.input.mouse.x), static_cast<float>(context.input.mouse.y));
++    io.AddMouseButtonEvent(0, context.input.mouse.IsButtonDown(lgp::framework::MouseButton::Left));
++    io.AddMouseButtonEvent(1, context.input.mouse.IsButtonDown(lgp::framework::MouseButton::Right));
++    io.AddMouseWheelEvent(0.0F, context.input.mouse.wheelDelta);
++    ImGui_ImplDX12_NewFrame();
++    ImGui::NewFrame();
++    imguiFrameBegun_ = true;
++    BuildDiagnosticsWindow();
+     return {};
+ }
+ 
+@@ -475,102 +945,88 @@ lgp::framework::Status Renderer::Render(lgp::framework::FrameContext const &fram
+ {
+     if (frameContext.commandList == nullptr)
+     {
+-        return std::unexpected(lgp::framework::MakeError("Starter::Renderer::Render",
++        return std::unexpected(lgp::framework::MakeError("Solution::Renderer::Render",
+                                                          "The frame context does not provide a direct command list."));
+     }
+     if (frameContext.renderTarget == nullptr)
+     {
+-        return std::unexpected(lgp::framework::MakeError("Starter::Renderer::Render",
++        return std::unexpected(lgp::framework::MakeError("Solution::Renderer::Render",
+                                                          "The frame context does not provide a render target."));
+     }
+-    if (!graph_ || !serialSchedule_ || !asyncSchedule_ || !physicalByteSizes_)
++    if (!graph_ || !schedules_ || !physicalByteSizes_)
+     {
+         return std::unexpected(lgp::framework::MakeError(
+-            "Starter::Renderer::Render",
++            "Solution::Renderer::Render",
+             "Size-dependent graph, schedule, and texture resources are unavailable; resize to a non-empty extent "
+             "before rendering."));
+     }
+     if (frameContext.frameSlot >= frameSlots_.size())
+     {
+-        return std::unexpected(lgp::framework::MakeError("Starter::Renderer::Render",
++        return std::unexpected(lgp::framework::MakeError("Solution::Renderer::Render",
+                                                          "The frame context references an out-of-range frame slot."));
+     }
++    if (auto status = ValidateConcreteAsyncPlan(); !status)
++    {
++        return status;
++    }
++    if (auto status = ReadCompletedTimingSample(frameContext.frameSlot); !status)
++    {
++        return status;
++    }
+ 
+-    FrameSlotTextures &slot = frameSlots_[frameContext.frameSlot];
+     lastExecutionTrace_.clear();
++    lastProducerBarrierTrace_.clear();
++    FrameSlotResources &slot = frameSlots_[frameContext.frameSlot];
+     if (auto status = RecordComputeBranch(frameContext, slot); !status)
+     {
+         return status;
+     }
+-    lastExecutionTrace_.push_back(
+-        {gpu::QueueExecutionTraceKind::ComputeBranchRecorded, QueueKind::Compute, std::nullopt});
+-    if (auto status = RecordGraphicsBranch(frameContext, slot); !status)
++    if (auto status = RecordIndependentGraphicsBranch(frameContext, slot); !status)
++    {
++        return status;
++    }
++    if (auto status = RecordComposite(frameContext, slot); !status)
+     {
+         return status;
+     }
+-    lastExecutionTrace_.push_back(
+-        {gpu::QueueExecutionTraceKind::IndependentGraphicsBranchRecorded, QueueKind::Direct, std::nullopt});
+-
+-    ID3D12GraphicsCommandList7 &commandList = *frameContext.commandList;
+-    ID3D12DescriptorHeap *const descriptorHeaps[]{frameContext.shaderVisibleCbvSrvUavHeap};
+-    commandList.SetDescriptorHeaps(1U, descriptorHeaps);
+-    commandList.SetComputeRootSignature(rootSignature_.Get());
+-    commandList.SetGraphicsRootSignature(rootSignature_.Get());
+-    commandList.RSSetViewports(1U, &frameContext.viewport);
+-    commandList.RSSetScissorRects(1U, &frameContext.scissorRect);
+-    commandList.IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+-
+-    lgp::framework::PixEventScope frameEvent{commandList, lgp::framework::PixColor(80U, 160U, 255U),
+-                                             L"Ch10 Early Wait"};
+-
+-    ID3D12Resource &computeFinal = *slot.textures[TextureIndex(gpu::LabTextureIndex::ComputeFinal)].Get();
+-    ID3D12Resource &graphicsFinal = *slot.textures[TextureIndex(gpu::LabTextureIndex::GraphicsFinal)].Get();
+-    std::vector<D3D12_TEXTURE_BARRIER> barriers{
+-        gpu::MakeTextureBarrier(*frameContext.renderTarget, gpu::FrameStartState(frameContext.headless),
+-                                gpu::RenderTargetState()),
+-    };
+-    gpu::SubmitTextureBarriers(commandList, barriers);
+-    commandList.SetGraphicsRootDescriptorTable(
+-        0U, textureDescriptors_.GpuHandle(DescriptorIndex(frameContext.frameSlot, kComputeFinalSrv)));
+-    commandList.SetGraphicsRootDescriptorTable(
+-        1U, textureDescriptors_.GpuHandle(DescriptorIndex(frameContext.frameSlot, kGraphicsFinalSrv)));
+-    DrawTo(commandList, *pipelines_.composite.Get(), frameContext.renderTargetView);
+-    lastExecutionTrace_.push_back(
+-        {gpu::QueueExecutionTraceKind::CompositeRecordedForFrameworkSubmission, QueueKind::Direct, std::nullopt});
+-
+-    barriers = {
+-        gpu::MakeTextureBarrier(computeFinal, gpu::ComputeProducedSharedShaderResourceState(), gpu::UndefinedState()),
+-        gpu::MakeTextureBarrier(graphicsFinal, gpu::PixelShaderResourceState(), gpu::UndefinedState()),
+-        gpu::MakeTextureBarrier(*frameContext.renderTarget, gpu::RenderTargetState(),
+-                                gpu::FrameEndState(frameContext.headless)),
+-    };
+-    gpu::SubmitTextureBarriers(commandList, barriers);
+ 
+-    ID3D12CommandList *computeLists[]{slot.computeList.Get()};
++    CaptureSubmissionCalibration(frameContext.frameIndex, slot);
++    ID3D12CommandList *const computeLists[]{slot.computeList.Get()};
+     computeQueue_->ExecuteCommandLists(1U, computeLists);
+     lastExecutionTrace_.push_back({gpu::QueueExecutionTraceKind::ComputeExecute, QueueKind::Compute, std::nullopt});
++
+     std::uint64_t const fenceValue = nextComputeFenceValue_++;
+-    HRESULT result = computeQueue_->Signal(computeFence_.Get(), fenceValue);
+-    if (FAILED(result))
++    HRESULT const signalResult = computeQueue_->Signal(computeFence_.Get(), fenceValue);
++    if (FAILED(signalResult))
+     {
+-        return std::unexpected(lgp::framework::MakeHResultError(
+-            "ID3D12CommandQueue::Signal", result, "Failed to signal the Chapter 10 compute fence."));
++        return std::unexpected(lgp::framework::MakeHResultError("ID3D12CommandQueue::Signal", signalResult,
++                                                                "Failed to signal the Chapter 10 compute fence."));
+     }
+     lastSignaledComputeFenceValue_ = fenceValue;
+     lastExecutionTrace_.push_back({gpu::QueueExecutionTraceKind::ComputeSignal, QueueKind::Compute, fenceValue});
+ 
+-    ID3D12CommandList *directLists[]{slot.directList.Get()};
++    ID3D12CommandList *const directLists[]{slot.directList.Get()};
+     deviceResources_->graphics_queue()->ExecuteCommandLists(1U, directLists);
+     lastExecutionTrace_.push_back(
+         {gpu::QueueExecutionTraceKind::IndependentDirectExecute, QueueKind::Direct, std::nullopt});
+-    result = deviceResources_->graphics_queue()->Wait(computeFence_.Get(), fenceValue);
+-    if (FAILED(result))
++
++    HRESULT const waitResult = deviceResources_->graphics_queue()->Wait(computeFence_.Get(), fenceValue);
++    if (FAILED(waitResult))
+     {
+         return std::unexpected(lgp::framework::MakeHResultError(
+-            "ID3D12CommandQueue::Wait", result, "Failed to queue the Chapter 10 compute dependency."));
++            "ID3D12CommandQueue::Wait", waitResult, "Failed to enqueue the Chapter 10 direct-queue dependency wait."));
+     }
+     lastExecutionTrace_.push_back(
+         {gpu::QueueExecutionTraceKind::DirectWaitBeforeComposite, QueueKind::Direct, fenceValue});
++
++    slot.submittedFrameIndex = frameContext.frameIndex;
++    slot.timingPending = true;
++    if (frameSlotUsageHistory_.size() >= kMaxFrameSlotUsageHistory)
++    {
++        frameSlotUsageHistory_.erase(frameSlotUsageHistory_.begin());
++    }
++    frameSlotUsageHistory_.push_back(
++        {frameContext.frameIndex, frameContext.frameSlot, fenceValue, slot.submissionCalibration.frameIndex});
+     return {};
+ }
+ 
+@@ -581,12 +1037,12 @@ gpu::LabGraph const *Renderer::CompiledGraph() const noexcept
+ 
+ SchedulePlan const *Renderer::SerialSchedule() const noexcept
+ {
+-    return serialSchedule_ ? &*serialSchedule_ : nullptr;
++    return schedules_ ? &schedules_->serial : nullptr;
+ }
+ 
+ SchedulePlan const *Renderer::AsyncSchedule() const noexcept
+ {
+-    return asyncSchedule_ ? &*asyncSchedule_ : nullptr;
++    return schedules_ ? &schedules_->async : nullptr;
+ }
+ 
+ gpu::PhysicalTextureByteSizes const *Renderer::PhysicalByteSizes() const noexcept
+@@ -599,9 +1055,66 @@ std::vector<gpu::QueueExecutionTraceRecord> const &Renderer::LastExecutionTrace(
+     return lastExecutionTrace_;
+ }
+ 
++std::vector<gpu::ExecutedTextureBarrier> const &Renderer::LastProducerBarrierTrace() const noexcept
++{
++    return lastProducerBarrierTrace_;
++}
++
++std::optional<gpu::GpuTimingSample> const &Renderer::LastGpuTimingSample() const noexcept
++{
++    return lastGpuTimingSample_;
++}
++
++std::vector<gpu::FrameSlotUsageRecord> const &Renderer::FrameSlotUsageHistory() const noexcept
++{
++    return frameSlotUsageHistory_;
++}
++
++void Renderer::DrainComputeQueueForShutdown() noexcept
++{
++    if (computeQueue_ == nullptr || computeFence_ == nullptr || lastSignaledComputeFenceValue_ == 0U ||
++        computeFence_->GetCompletedValue() >= lastSignaledComputeFenceValue_)
++    {
++        return;
++    }
++    if (deviceResources_ == nullptr || FAILED(deviceResources_->device()->GetDeviceRemovedReason()))
++    {
++        return;
++    }
++    HANDLE const eventHandle = CreateEventW(nullptr, FALSE, FALSE, nullptr);
++    if (eventHandle == nullptr)
++    {
++        return;
++    }
++    if (SUCCEEDED(computeFence_->SetEventOnCompletion(lastSignaledComputeFenceValue_, eventHandle)))
++    {
++        (void)WaitForSingleObject(eventHandle, 5'000U);
++    }
++    CloseHandle(eventHandle);
++}
++
+ void Renderer::Shutdown(lgp::framework::DeviceResources &) noexcept
+ {
++    if (imguiFrameBegun_)
++    {
++        ImGui::EndFrame();
++        imguiFrameBegun_ = false;
++    }
++    if (imguiInitialized_)
++    {
++        ImGui_ImplDX12_Shutdown();
++        ImGui::DestroyContext();
++        imguiInitialized_ = false;
++    }
++    DrainComputeQueueForShutdown();
+     ReleaseSizeDependentResources();
++    frameSlotUsageHistory_.clear();
++    lastGpuTimingSample_.reset();
++    if (deviceResources_ != nullptr && imguiFontDescriptor_)
++    {
++        deviceResources_->shader_visible_cbv_srv_uav_heap().Free(imguiFontDescriptor_);
++        imguiFontDescriptor_ = {};
++    }
+     if (deviceResources_ != nullptr && textureRtvs_)
+     {
+         deviceResources_->rtv_heap().Free(textureRtvs_);
+@@ -612,12 +1125,14 @@ void Renderer::Shutdown(lgp::framework::DeviceResources &) noexcept
+         deviceResources_->shader_visible_cbv_srv_uav_heap().Free(textureDescriptors_);
+         textureDescriptors_ = {};
+     }
+-    pipelines_ = {};
+-    rootSignature_.Reset();
++    directTimestampHeap_.Reset();
++    computeTimestampHeap_.Reset();
+     frameSlots_.clear();
+     computeFence_.Reset();
+     computeQueue_.Reset();
++    pipelines_ = {};
++    rootSignature_.Reset();
+     deviceResources_ = nullptr;
+ }
+ 
+-} // namespace ch10::pass_scheduling::starter
++} // namespace ch10::pass_scheduling::solution
+diff --git a/chapters/pass-scheduling-and-multi-queue-execution/Starter/Renderer.hpp b/chapters/pass-scheduling-and-multi-queue-execution/Starter/Renderer.hpp
+index 522dfa759384505d471488427a51965b5ffb1dfa..a13460e62036ea4c1672ed4865b328e131aa3463 100644
+--- a/chapters/pass-scheduling-and-multi-queue-execution/Starter/Renderer.hpp
++++ b/chapters/pass-scheduling-and-multi-queue-execution/Starter/Renderer.hpp
+@@ -3,15 +3,17 @@
+ #include "../Common/GpuLabSupport.hpp"
+ 
+ #include <lgp/framework/application.hpp>
++#include <lgp/framework/buffer.hpp>
+ #include <lgp/framework/descriptors.hpp>
+ 
+ #include <wrl/client.h>
+ 
+ #include <array>
++#include <cstdint>
+ #include <optional>
+ #include <vector>
+ 
+-namespace ch10::pass_scheduling::starter
++namespace ch10::pass_scheduling::solution
+ {
+ 
+ class Renderer final : public lgp::framework::IChapterRenderer
+@@ -29,34 +31,52 @@ class Renderer final : public lgp::framework::IChapterRenderer
+     [[nodiscard]] SchedulePlan const *AsyncSchedule() const noexcept;
+     [[nodiscard]] gpu::PhysicalTextureByteSizes const *PhysicalByteSizes() const noexcept;
+     [[nodiscard]] std::vector<gpu::QueueExecutionTraceRecord> const &LastExecutionTrace() const noexcept;
++    [[nodiscard]] std::vector<gpu::ExecutedTextureBarrier> const &LastProducerBarrierTrace() const noexcept;
++    [[nodiscard]] std::optional<gpu::GpuTimingSample> const &LastGpuTimingSample() const noexcept;
++    [[nodiscard]] std::vector<gpu::FrameSlotUsageRecord> const &FrameSlotUsageHistory() const noexcept;
+ 
+   private:
+-    struct FrameSlotTextures final
++    struct FrameSlotResources final
+     {
+         Microsoft::WRL::ComPtr<ID3D12CommandAllocator> computeAllocator{};
+         Microsoft::WRL::ComPtr<ID3D12GraphicsCommandList7> computeList{};
+         Microsoft::WRL::ComPtr<ID3D12CommandAllocator> directAllocator{};
+         Microsoft::WRL::ComPtr<ID3D12GraphicsCommandList7> directList{};
+         std::array<Microsoft::WRL::ComPtr<ID3D12Resource>, gpu::kLabTextureCount> textures{};
++        lgp::framework::Buffer computeTimestampReadback{};
++        lgp::framework::Buffer directTimestampReadback{};
++        std::uint64_t submittedFrameIndex{};
++        gpu::GpuSubmissionCalibration submissionCalibration{};
++        bool timingPending{};
+     };
+ 
+     [[nodiscard]] lgp::framework::Status CreateDeviceObjects();
+-    [[nodiscard]] lgp::framework::Status CreateComputeQueueObjects();
++    [[nodiscard]] lgp::framework::Status CreateQueueObjects();
+     [[nodiscard]] lgp::framework::Status CreateFrameCommandObjects();
++    [[nodiscard]] lgp::framework::Status CreateTimestampObjects();
+     [[nodiscard]] lgp::framework::Status CreateSizeDependentResources(lgp::framework::Extent2D size);
+-    [[nodiscard]] lgp::framework::Status RecordComputeBranch(lgp::framework::FrameContext const &frameContext,
+-                                                             FrameSlotTextures &slot);
+-    [[nodiscard]] lgp::framework::Status RecordGraphicsBranch(lgp::framework::FrameContext const &frameContext,
+-                                                              FrameSlotTextures &slot);
++    [[nodiscard]] lgp::framework::Status InitializeImGui();
+     [[nodiscard]] lgp::framework::Status ValidateConcreteAsyncPlan() const;
++    void CaptureSubmissionCalibration(std::uint64_t frameIndex, FrameSlotResources &slot) noexcept;
++    [[nodiscard]] lgp::framework::Status ReadCompletedTimingSample(UINT frameSlot);
++    [[nodiscard]] lgp::framework::Status RecordComputeBranch(lgp::framework::FrameContext const &frameContext,
++                                                             FrameSlotResources &slot);
++    [[nodiscard]] lgp::framework::Status RecordIndependentGraphicsBranch(
++        lgp::framework::FrameContext const &frameContext, FrameSlotResources &slot);
++    [[nodiscard]] lgp::framework::Status RecordComposite(lgp::framework::FrameContext const &frameContext,
++                                                         FrameSlotResources &slot);
+     void ReleaseSizeDependentResources() noexcept;
++    void BuildDiagnosticsWindow() const;
+     void DrawTo(ID3D12GraphicsCommandList7 &commandList, ID3D12PipelineState &pipeline,
+                 D3D12_CPU_DESCRIPTOR_HANDLE renderTarget) const;
+     void Dispatch(ID3D12GraphicsCommandList7 &commandList, ID3D12PipelineState &pipeline,
+                   lgp::framework::Extent2D size) const;
++    void DrainComputeQueueForShutdown() noexcept;
+ 
+     [[nodiscard]] UINT DescriptorIndex(UINT frameSlot, UINT withinSlot) const noexcept;
+     [[nodiscard]] UINT RtvIndex(UINT frameSlot, UINT withinSlot) const noexcept;
++    [[nodiscard]] UINT ComputeQueryIndex(UINT frameSlot, UINT withinSlot) const noexcept;
++    [[nodiscard]] UINT DirectQueryIndex(UINT frameSlot, UINT withinSlot) const noexcept;
+ 
+     lgp::framework::DeviceResources *deviceResources_{};
+     gpu::LabShaders shaders_{};
+@@ -64,16 +84,24 @@ class Renderer final : public lgp::framework::IChapterRenderer
+     gpu::LabPipelines pipelines_{};
+     lgp::framework::DescriptorAllocation textureDescriptors_{};
+     lgp::framework::DescriptorAllocation textureRtvs_{};
++    lgp::framework::DescriptorAllocation imguiFontDescriptor_{};
+     Microsoft::WRL::ComPtr<ID3D12CommandQueue> computeQueue_{};
+     Microsoft::WRL::ComPtr<ID3D12Fence> computeFence_{};
+-    std::vector<FrameSlotTextures> frameSlots_{};
++    Microsoft::WRL::ComPtr<ID3D12QueryHeap> computeTimestampHeap_{};
++    Microsoft::WRL::ComPtr<ID3D12QueryHeap> directTimestampHeap_{};
++    std::vector<FrameSlotResources> frameSlots_{};
+     std::optional<gpu::LabGraph> graph_{};
+     std::optional<gpu::PhysicalTextureByteSizes> physicalByteSizes_{};
+-    std::optional<SchedulePlan> serialSchedule_{};
+-    std::optional<SchedulePlan> asyncSchedule_{};
++    std::optional<gpu::ScheduleComparison> schedules_{};
+     std::vector<gpu::QueueExecutionTraceRecord> lastExecutionTrace_{};
++    std::vector<gpu::ExecutedTextureBarrier> lastProducerBarrierTrace_{};
++    std::optional<gpu::GpuTimingSample> lastGpuTimingSample_{};
++    std::vector<gpu::FrameSlotUsageRecord> frameSlotUsageHistory_{};
+     std::uint64_t nextComputeFenceValue_{1U};
+     std::uint64_t lastSignaledComputeFenceValue_{};
++    bool headless_{};
++    bool imguiInitialized_{};
++    bool imguiFrameBegun_{};
+ };
+ 
+-} // namespace ch10::pass_scheduling::starter
++} // namespace ch10::pass_scheduling::solution

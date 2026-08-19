@@ -1,0 +1,59 @@
+diff --git a/chapters/tiled-forward-plus-and-clustered-lighting/Starter/ClusteredLightingLab.hlsl b/chapters/tiled-forward-plus-and-clustered-lighting/Starter/ClusteredLightingLab.hlsl
+index 9a4782d..4e8886c 100644
+--- a/chapters/tiled-forward-plus-and-clustered-lighting/Starter/ClusteredLightingLab.hlsl
++++ b/chapters/tiled-forward-plus-and-clustered-lighting/Starter/ClusteredLightingLab.hlsl
+@@ -289,6 +289,35 @@ void CountLightsCS(uint3 dispatchThreadId : SV_DispatchThreadID)
+ [numthreads(1, 1, 1)]
+ void PrefixCellsCS(uint3 dispatchThreadId : SV_DispatchThreadID)
+ {
++    if (dispatchThreadId.x != 0u)
++    {
++        return;
++    }
++
++    uint cursor = 0u;
++    uint totalAttempted = 0u;
++    uint totalOverflow = 0u;
++    [loop]
++    for (uint cellIndex = 0u; cellIndex < gFrame.counts.z; ++cellIndex)
++    {
++        uint attemptedCount = gCountsUav[cellIndex];
++        uint remaining = cursor < gFrame.counts.w ? gFrame.counts.w - cursor : 0u;
++        uint emittedCount = min(attemptedCount, remaining);
++        uint overflowCount = attemptedCount - emittedCount;
++        CellLightRange range;
++        range.offset = cursor;
++        range.count = emittedCount;
++        range.attemptedCount = attemptedCount;
++        range.overflowCount = overflowCount;
++        gCellsUav[cellIndex] = range;
++        cursor += emittedCount;
++        totalAttempted += attemptedCount;
++        totalOverflow += overflowCount;
++    }
++    gStatisticsUav[0] = totalAttempted;
++    gStatisticsUav[1] = cursor;
++    gStatisticsUav[2] = totalOverflow;
++    gStatisticsUav[3] = gFrame.counts.z;
+ }
+ 
+ [numthreads(ThreadCount, 1, 1)]
+diff --git a/chapters/tiled-forward-plus-and-clustered-lighting/Starter/Renderer.cpp b/chapters/tiled-forward-plus-and-clustered-lighting/Starter/Renderer.cpp
+index 60b5165..b4c44cf 100644
+--- a/chapters/tiled-forward-plus-and-clustered-lighting/Starter/Renderer.cpp
++++ b/chapters/tiled-forward-plus-and-clustered-lighting/Starter/Renderer.cpp
+@@ -824,6 +824,14 @@ lgp::framework::Status Renderer::Render(lgp::framework::FrameContext const &fram
+     commandList.SetPipelineState(countPipeline_.Get());
+     commandList.Dispatch((tiles->tileCount + 63U) / 64U, 1U, 1U);
+ 
++    bufferBarriers = {
++        gpu::MakeBufferBarrier(*slot.counts.Get(), gpu::ComputeUnorderedAccessState(),
++                               gpu::ComputeUnorderedAccessState()),
++    };
++    gpu::SubmitBufferBarriers(commandList, bufferBarriers);
++    commandList.SetPipelineState(prefixPipeline_.Get());
++    commandList.Dispatch(1U, 1U, 1U);
++
+     textureBarriers = {
+         gpu::MakeTextureBarrier(*slot.depth.Get(), gpu::ComputeShaderResourceState(), gpu::DepthReadState()),
+     };

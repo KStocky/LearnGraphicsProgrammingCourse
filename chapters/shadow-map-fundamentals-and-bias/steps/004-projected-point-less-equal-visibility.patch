@@ -1,0 +1,77 @@
+diff --git a/chapters/shadow-map-fundamentals-and-bias/CMakeLists.txt b/chapters/shadow-map-fundamentals-and-bias/CMakeLists.txt
+--- a/chapters/shadow-map-fundamentals-and-bias/CMakeLists.txt
++++ b/chapters/shadow-map-fundamentals-and-bias/CMakeLists.txt
+@@ -43,2 +43,2 @@
+-set(LGP_CH07_STARTER_STAGE 3)
++set(LGP_CH07_STARTER_STAGE 4)
+ set_source_files_properties(
+diff --git a/chapters/shadow-map-fundamentals-and-bias/Starter/DirectionalBaseline.hlsl b/chapters/shadow-map-fundamentals-and-bias/Starter/DirectionalBaseline.hlsl
+index 0918b9b..5a26c83 100644
+--- a/chapters/shadow-map-fundamentals-and-bias/Starter/DirectionalBaseline.hlsl
++++ b/chapters/shadow-map-fundamentals-and-bias/Starter/DirectionalBaseline.hlsl
+@@ -138,8 +138,28 @@ float4 LightingPS(LitVertex input) : SV_Target
+     float3 shadowNdc = shadowClip.xyz / shadowClip.w;
+     float2 shadowUv = float2((shadowNdc.x * 0.5) + 0.5, 0.5 - (shadowNdc.y * 0.5));
+     bool inFrustum = IsInShadowFrustum(shadowNdc);
+-    float storedDepth = inFrustum ? shadowMap.SampleLevel(shadowPointSampler, shadowUv, 0.0) : 1.0;
+-    return float4(storedDepth.xxx, 1.0);
++    float visibility = !inFrustum
++        ? 1.0
++        : shadowMap.SampleCmpLevelZero(shadowComparisonSampler, shadowUv, shadowNdc.z);
++    float3 viewDirection = normalize(lighting.cameraPosition - input.worldPosition);
++    float nDotL = saturate(dot(normal, lightDirection));
++    float nDotV = saturate(dot(normal, viewDirection));
++    float3 halfVector = normalize(viewDirection + lightDirection);
++    float nDotH = saturate(dot(normal, halfVector));
++    float vDotH = saturate(dot(viewDirection, halfVector));
++    float3 f0 = lerp(float3(0.04, 0.04, 0.04), baseColor, metalness);
++    float3 fresnel = SchlickFresnel(f0, vDotH);
++    float distribution = GgxDistribution(nDotH, roughness);
++    float geometry = SmithG1(nDotV, roughness) * SmithG1(nDotL, roughness);
++    float denominator = max(4.0 * nDotV * nDotL, 1.0e-6);
++    float3 specularBrdf = nDotL > 0.0 && nDotV > 0.0
++        ? fresnel * distribution * geometry / denominator
++        : 0.0;
++    float3 diffuseWeight =
++        (1.0 - SchlickFresnel(f0, nDotV)) * (1.0 - SchlickFresnel(f0, nDotL)) * (1.0 - metalness);
++    float3 diffuseBrdf = diffuseWeight * baseColor / Pi;
++    float3 directLight = lighting.intensity * nDotL * (diffuseBrdf + specularBrdf);
++    return float4(visibility * directLight, 1.0);
+ }
+ 
+ FullscreenVertex FullscreenVS(uint vertexId : SV_VertexID)
+@@ -166,7 +186,7 @@ float SrgbEncode(float value)
+ float4 DisplayPS(FullscreenVertex input) : SV_Target
+ {
+     float3 hdr = hdrInput.SampleLevel(linearClampSampler, input.uv, 0.0).rgb;
+-    float3 displayLinear = saturate(hdr);
++    float3 displayLinear = AcesFit(max(hdr * exp2(lighting.exposure), 0.0));
+     return float4(saturate(float3(SrgbEncode(displayLinear.r), SrgbEncode(displayLinear.g),
+                                   SrgbEncode(displayLinear.b))), 1.0);
+ }
+diff --git a/chapters/shadow-map-fundamentals-and-bias/Starter/Renderer.cpp b/chapters/shadow-map-fundamentals-and-bias/Starter/Renderer.cpp
+index 37834ce..187c991 100644
+--- a/chapters/shadow-map-fundamentals-and-bias/Starter/Renderer.cpp
++++ b/chapters/shadow-map-fundamentals-and-bias/Starter/Renderer.cpp
+@@ -185,7 +185,7 @@ class Renderer::Impl final
+     float rasterSlopeBias{};
+     float rasterBiasClamp{};
+     bool shadowEnabled{true};
+-    ShadowVisualization visualization{ShadowVisualization::ShadowDepth};
++    ShadowVisualization visualization{ShadowVisualization::Final};
+     float orbitAzimuth{};
+     float orbitElevation{0.34F};
+     float orbitRadius{20.0F};
+diff --git a/chapters/shadow-map-fundamentals-and-bias/Starter/Renderer.hpp b/chapters/shadow-map-fundamentals-and-bias/Starter/Renderer.hpp
+index ddbe5df..2de47bd 100644
+--- a/chapters/shadow-map-fundamentals-and-bias/Starter/Renderer.hpp
++++ b/chapters/shadow-map-fundamentals-and-bias/Starter/Renderer.hpp
+@@ -42,7 +42,7 @@ struct HeadlessTestConfiguration final
+     float receiverDepthBias{};
+     float receiverNormalOffsetWorld{};
+     bool shadowEnabled{true};
+-    ShadowVisualization visualization{ShadowVisualization::ShadowDepth};
++    ShadowVisualization visualization{ShadowVisualization::Final};
+ };
+ 
+ class Renderer final : public lgp::framework::IChapterRenderer

@@ -1,0 +1,79 @@
+diff --git a/chapters/surface-frames-material-textures-and-normal-mapping/Starter/Renderer.cpp b/chapters/surface-frames-material-textures-and-normal-mapping/Starter/Renderer.cpp
+index 15839b2..b8c5ba1 100644
+--- a/chapters/surface-frames-material-textures-and-normal-mapping/Starter/Renderer.cpp
++++ b/chapters/surface-frames-material-textures-and-normal-mapping/Starter/Renderer.cpp
+@@ -806,7 +806,7 @@ lgp::framework::Status Renderer::Impl::Update(lgp::framework::UpdateContext cons
+         1.2F + (lighting.directionToLight.y * lightDistance),
+         lighting.directionToLight.z * lightDistance,
+     };
+-    lighting.materialFlags = 3U;
++    lighting.materialFlags = 7U;
+     return {};
+ }
+
+diff --git a/chapters/surface-frames-material-textures-and-normal-mapping/Starter/SurfaceBaseline.hlsl b/chapters/surface-frames-material-textures-and-normal-mapping/Starter/SurfaceBaseline.hlsl
+index c34d9fa..a59b269 100644
+--- a/chapters/surface-frames-material-textures-and-normal-mapping/Starter/SurfaceBaseline.hlsl
++++ b/chapters/surface-frames-material-textures-and-normal-mapping/Starter/SurfaceBaseline.hlsl
+@@ -140,7 +140,16 @@ float4 LightingPS(LitVertex input, bool frontFace : SV_IsFrontFace) : SV_Target
+         metalness = lighting.overrideMetalness;
+     }
+
+-    float3 mappedNormal = interpolatedNormal;
++    float3 encodedNormal = lighting.overrideNormalSample != 0U
++        ? lighting.overrideNormal
++        : normalTexture.Sample(materialSampler, input.uv).xyz;
++    float3 tangentNormal = encodedNormal * 2.0 - 1.0;
++    tangentNormal.y *= lighting.invertNormalGreen != 0U ? -1.0 : 1.0;
++    tangentNormal = normalize(lerp(float3(0.0, 0.0, 1.0), tangentNormal, lighting.normalStrength));
++    float3 mappedNormal = (lighting.materialFlags & 4U) != 0U
++        ? normalize((tangent * tangentNormal.x) + (bitangent * tangentNormal.y) +
++                    (interpolatedNormal * tangentNormal.z))
++        : interpolatedNormal;
+
+     float3 viewDirection = normalize(lighting.cameraPosition - input.worldPosition);
+     float3 lightDirection = normalize(lighting.directionToLight);
+@@ -174,6 +183,33 @@ float4 LightingPS(LitVertex input, bool frontFace : SV_IsFrontFace) : SV_Target
+     float3 specular = irradiance * specularBrdf;
+     float3 color = diffuse + specular;
+
++    if (lighting.visualization == 1U) color = float3(frac(input.uv), 0.0);
++    else if (lighting.visualization == 2U) color = geometricNormal * 0.5 + 0.5;
++    else if (lighting.visualization == 3U) color = interpolatedNormal * 0.5 + 0.5;
++    else if (lighting.visualization == 4U) color = mappedNormal * 0.5 + 0.5;
++    else if (lighting.visualization == 5U) color = tangent * 0.5 + 0.5;
++    else if (lighting.visualization == 6U) color = bitangent * 0.5 + 0.5;
++    else if (lighting.visualization == 7U) color = handedness < 0.0 ? float3(1.0, 0.12, 0.05) : float3(0.05, 0.35, 1.0);
++    else if (lighting.visualization == 8U) color = baseColor;
++    else if (lighting.visualization == 9U) color = roughness.xxx;
++    else if (lighting.visualization == 10U) color = metalness.xxx;
++    else if (lighting.visualization == 11U) color = diffuse;
++    else if (lighting.visualization == 12U) color = specular;
++    else if (lighting.visualization == 13U)
++    {
++        if (objectData.objectId == 1U) color = float3(0.85, 0.12, 0.08);
++        else if (objectData.objectId == 2U) color = float3(0.08, 0.72, 0.16);
++        else if (objectData.objectId == 3U) color = float3(0.08, 0.22, 0.9);
++        else if (objectData.objectId == 4U) color = float3(0.82, 0.68, 0.08);
++        else color = float3(1.0, 0.0, 0.8);
++    }
++    else if (lighting.visualization == 14U)
++    {
++        bool finite = all(isfinite(baseColor)) && isfinite(roughness) && isfinite(metalness) &&
++                      all(isfinite(tangentNormal)) && all(isfinite(mappedNormal)) && all(isfinite(diffuse)) &&
++                      all(isfinite(specular)) && all(isfinite(color));
++        color = finite ? float3(0.05, 0.8, 0.12) : float3(1.0, 0.0, 0.8);
++    }
+     return float4(color, 1.0);
+ }
+
+@@ -201,6 +237,8 @@ float SrgbEncode(float value)
+ float4 DisplayPS(FullscreenVertex input) : SV_Target
+ {
+     float3 hdr = hdrInput.SampleLevel(linearClampSampler, input.uv, 0.0).rgb;
+-    float3 mapped = AcesFit(max(hdr * exp2(outputData.exposure), 0.0));
++    float3 mapped = outputData.applyHdrDisplayTransform != 0U
++        ? AcesFit(max(hdr * exp2(outputData.exposure), 0.0))
++        : saturate(hdr);
+     return float4(saturate(float3(SrgbEncode(mapped.r), SrgbEncode(mapped.g), SrgbEncode(mapped.b))), 1.0);
+ }

@@ -1,0 +1,100 @@
+diff --git a/chapters/frame-graph-and-resource-lifetimes/Starter/Renderer.cpp b/chapters/frame-graph-and-resource-lifetimes/Starter/Renderer.cpp
+index 070f1a3..33da3ff 100644
+--- a/chapters/frame-graph-and-resource-lifetimes/Starter/Renderer.cpp
++++ b/chapters/frame-graph-and-resource-lifetimes/Starter/Renderer.cpp
+@@ -116,20 +116,6 @@ enum RootParameter : UINT
+     return message;
+ }
+ 
+-
+-[[nodiscard]] CompiledPass const *FindCompiledPass(CompiledPassGraph const &graph, PassId passId) noexcept
+-{
+-    for (CompiledPass const &pass : graph.scheduledPasses)
+-    {
+-        if (pass.id == passId)
+-        {
+-            return &pass;
+-        }
+-    }
+-
+-    return nullptr;
+-}
+-
+ } // namespace
+ 
+ lgp::framework::Status Renderer::CreateShaders()
+@@ -470,7 +456,6 @@ lgp::framework::Status Renderer::Update(lgp::framework::UpdateContext const &)
+     return {};
+ }
+ 
+-
+ lgp::framework::Status Renderer::Render(lgp::framework::FrameContext const &frameContext)
+ {
+     if (frameContext.commandList == nullptr || frameContext.renderTarget == nullptr || hdrIntermediate_ == nullptr)
+@@ -487,15 +472,6 @@ lgp::framework::Status Renderer::Render(lgp::framework::FrameContext const &fram
+     FrameGraphPlan plan = std::move(*planResult);
+     lastCompiledGraph_ = plan.compiledGraph;
+ 
+-    CompiledPass const *analyticPass = FindCompiledPass(plan.compiledGraph, plan.analyticPassId);
+-    CompiledPass const *displayPass = FindCompiledPass(plan.compiledGraph, plan.displayPassId);
+-    CompiledPass const *frameBoundaryPass = FindCompiledPass(plan.compiledGraph, plan.frameBoundaryPassId);
+-    if (analyticPass == nullptr || displayPass == nullptr || frameBoundaryPass == nullptr)
+-    {
+-        return std::unexpected(lgp::framework::MakeError(
+-            "Renderer::Render", "Compiled graph did not produce the expected Chapter 8 starter passes."));
+-    }
+-
+     std::vector<ID3D12Resource *> resources(plan.compiledGraph.textureResources.size(), nullptr);
+     resources[plan.hdrResourceId.value] = hdrIntermediate_.Get();
+     resources[plan.frameTargetResourceId.value] = frameContext.renderTarget;
+@@ -506,30 +482,35 @@ lgp::framework::Status Renderer::Render(lgp::framework::FrameContext const &fram
+     commandList.IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+     commandList.SetGraphicsRootSignature(rootSignature_.Get());
+ 
+-    for (TextureBarrierGroup const &barrierGroup : analyticPass->barrierGroups)
++    for (CompiledPass const &pass : plan.compiledGraph.scheduledPasses)
+     {
+-        if (auto status = ApplyBarrierGroup(commandList, barrierGroup, resources); !status)
++        for (TextureBarrierGroup const &barrierGroup : pass.barrierGroups)
+         {
+-            return status;
++            if (auto status = ApplyBarrierGroup(commandList, barrierGroup, resources); !status)
++            {
++                return status;
++            }
+         }
+-    }
+-    ExecuteAnalyticPass(commandList);
+ 
+-    for (TextureBarrierGroup const &barrierGroup : displayPass->barrierGroups)
+-    {
+-        if (auto status = ApplyBarrierGroup(commandList, barrierGroup, resources); !status)
++        if (pass.id == plan.analyticPassId)
+         {
+-            return status;
++            ExecuteAnalyticPass(commandList);
++            continue;
+         }
+-    }
+-    ExecuteDisplayPass(frameContext);
+ 
+-    for (TextureBarrierGroup const &barrierGroup : frameBoundaryPass->barrierGroups)
+-    {
+-        if (auto status = ApplyBarrierGroup(commandList, barrierGroup, resources); !status)
++        if (pass.id == plan.displayPassId)
+         {
+-            return status;
++            ExecuteDisplayPass(frameContext);
++            continue;
+         }
++
++        if (pass.id == plan.frameBoundaryPassId)
++        {
++            continue;
++        }
++
++        return std::unexpected(lgp::framework::MakeError(
++            "Renderer::Render", "Encountered an unexpected compiled pass while executing the Chapter 8 starter."));
+     }
+ 
+     return {};

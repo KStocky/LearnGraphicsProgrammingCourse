@@ -1,0 +1,82 @@
+diff --git a/chapters/gpu-work-distribution-and-indirect-execution/Starter/Renderer.cpp b/chapters/gpu-work-distribution-and-indirect-execution/Starter/Renderer.cpp
+index 5c0c319..9e88c7e 100644
+--- a/chapters/gpu-work-distribution-and-indirect-execution/Starter/Renderer.cpp
++++ b/chapters/gpu-work-distribution-and-indirect-execution/Starter/Renderer.cpp
+@@ -570,6 +570,7 @@ lgp::framework::Status Renderer::Render(lgp::framework::FrameContext const &fram
+         return std::unexpected(lgp::framework::MakeError("Render", "The Chapter 13 frame slot is out of range."));
+     }
+ 
++    gpu::LabConfiguration const configuration = ActiveConfiguration();
+     FrameSlotResources &slot = frameSlots_[frameContext.frameSlot];
+     auto const writeStatus =
+         gpu::WriteBuffer(slot.candidateBuffer, std::span<gpu::CandidateData const>{currentReference_.candidates});
+@@ -579,9 +580,41 @@ lgp::framework::Status Renderer::Render(lgp::framework::FrameContext const &fram
+     }
+ 
+     ID3D12GraphicsCommandList7 &commandList = *frameContext.commandList;
++    ID3D12DescriptorHeap *const heaps[]{frameContext.shaderVisibleCbvSrvUavHeap};
++    commandList.SetDescriptorHeaps(1U, heaps);
++
++    std::vector<D3D12_BUFFER_BARRIER> bufferBarriers{};
++    gpu::BufferBarrierState const writableBefore =
++        slot.writableStateInitialized ? gpu::ComputeUnorderedAccessState() : gpu::NoAccessState();
++    bufferBarriers.push_back(gpu::MakeBufferBarrier(*slot.flags.Get(), writableBefore, gpu::ComputeUnorderedAccessState()));
++    bufferBarriers.push_back(gpu::MakeBufferBarrier(*slot.emittedIndices.Get(), writableBefore, gpu::ComputeUnorderedAccessState()));
++    bufferBarriers.push_back(gpu::MakeBufferBarrier(*slot.indirectCommands.Get(), writableBefore, gpu::ComputeUnorderedAccessState()));
++    bufferBarriers.push_back(gpu::MakeBufferBarrier(*slot.indirectCount.Get(), writableBefore, gpu::ComputeUnorderedAccessState()));
++    bufferBarriers.push_back(gpu::MakeBufferBarrier(*slot.statistics.Get(), writableBefore, gpu::ComputeUnorderedAccessState()));
++    gpu::SubmitBufferBarriers(commandList, bufferBarriers);
++
++    DispatchConstants const dispatchConstants{configuration.capacity, gpu::kCandidateCount, gpu::kVertexCountPerQuad, 0U};
++    commandList.SetComputeRootSignature(computeRootSignature_.Get());
++    commandList.SetComputeRoot32BitConstants(DispatchRootConstants, sizeof(DispatchConstants) / sizeof(std::uint32_t), &dispatchConstants, 0U);
++    commandList.SetComputeRootDescriptorTable(ComputeSrvTable, slot.descriptors.GpuHandle(CandidateSrv));
++    commandList.SetComputeRootDescriptorTable(ComputeUavTable, slot.descriptors.GpuHandle(FlagsUav));
++    commandList.SetPipelineState(resetPipeline_.Get());
++    commandList.Dispatch(1U, 1U, 1U);
++
++    bufferBarriers = {
++        gpu::MakeBufferBarrier(*slot.flags.Get(), gpu::ComputeUnorderedAccessState(), gpu::ComputeUnorderedAccessState()),
++        gpu::MakeBufferBarrier(*slot.emittedIndices.Get(), gpu::ComputeUnorderedAccessState(), gpu::ComputeUnorderedAccessState()),
++        gpu::MakeBufferBarrier(*slot.indirectCommands.Get(), gpu::ComputeUnorderedAccessState(), gpu::ComputeUnorderedAccessState()),
++        gpu::MakeBufferBarrier(*slot.indirectCount.Get(), gpu::ComputeUnorderedAccessState(), gpu::ComputeUnorderedAccessState()),
++        gpu::MakeBufferBarrier(*slot.statistics.Get(), gpu::ComputeUnorderedAccessState(), gpu::ComputeUnorderedAccessState()),
++    };
++    gpu::SubmitBufferBarriers(commandList, bufferBarriers);
++
++    commandList.SetPipelineState(classifyPipeline_.Get());
++    commandList.Dispatch(1U, 1U, 1U);
++
+     std::vector<D3D12_TEXTURE_BARRIER> textureBarriers{
+-        gpu::MakeTextureBarrier(*frameContext.renderTarget, gpu::FrameStartState(frameContext),
+-                                gpu::RenderTargetState()),
++        gpu::MakeTextureBarrier(*frameContext.renderTarget, gpu::FrameStartState(frameContext), gpu::RenderTargetState()),
+     };
+     gpu::SubmitTextureBarriers(commandList, textureBarriers);
+ 
+@@ -593,16 +626,12 @@ lgp::framework::Status Renderer::Render(lgp::framework::FrameContext const &fram
+     commandList.IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+     commandList.SetGraphicsRootSignature(graphicsRootSignature_.Get());
+     commandList.SetPipelineState(graphicsPipeline_.Get());
+-
+-    ID3D12DescriptorHeap *const heaps[]{frameContext.shaderVisibleCbvSrvUavHeap};
+-    commandList.SetDescriptorHeaps(1U, heaps);
+     commandList.SetGraphicsRootDescriptorTable(CandidateSrvTable, slot.descriptors.GpuHandle(CandidateSrv));
+ 
+     for (IndirectDrawCommand const &command : currentReference_.indirectCommands)
+     {
+         commandList.SetGraphicsRoot32BitConstant(CandidateRootConstant, command.candidateIndex, 0U);
+-        commandList.DrawInstanced(command.draw.vertexCountPerInstance, command.draw.instanceCount,
+-                                  command.draw.startVertexLocation, command.draw.startInstanceLocation);
++        commandList.DrawInstanced(command.draw.vertexCountPerInstance, command.draw.instanceCount, command.draw.startVertexLocation, command.draw.startInstanceLocation);
+     }
+ 
+     textureBarriers = {
+@@ -610,6 +639,7 @@ lgp::framework::Status Renderer::Render(lgp::framework::FrameContext const &fram
+     };
+     gpu::SubmitTextureBarriers(commandList, textureBarriers);
+ 
++    slot.writableStateInitialized = true;
+     lastRenderedFrameSlot_ = frameContext.frameSlot;
+     return {};
+ }

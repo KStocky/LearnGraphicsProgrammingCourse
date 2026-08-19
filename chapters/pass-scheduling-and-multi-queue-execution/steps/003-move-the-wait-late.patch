@@ -1,0 +1,297 @@
+diff --git a/chapters/pass-scheduling-and-multi-queue-execution/Starter/Renderer.cpp b/chapters/pass-scheduling-and-multi-queue-execution/Starter/Renderer.cpp
+index 87f189f4037fa8d282d4e995fa36c5ef3e6383b3..eca6c88140ebf7aece856da90beedf88effd2652 100644
+--- a/chapters/pass-scheduling-and-multi-queue-execution/Starter/Renderer.cpp
++++ b/chapters/pass-scheduling-and-multi-queue-execution/Starter/Renderer.cpp
+@@ -4,6 +4,8 @@
+ 
+ #include <array>
+ #include <filesystem>
++#include <ranges>
++#include <tuple>
+ #include <utility>
+ 
+ namespace ch10::pass_scheduling::starter
+@@ -30,6 +32,12 @@ inline constexpr UINT kComputeFinalUav = 5U;
+     return static_cast<std::size_t>(index);
+ }
+ 
++[[nodiscard]] ScheduledPass const *FindPass(SchedulePlan const &plan, ch08::frame_graph::PassId passId) noexcept
++{
++    auto const pass = std::ranges::find(plan.passes, passId, &ScheduledPass::passId);
++    return pass == plan.passes.end() ? nullptr : &*pass;
++}
++
+ } // namespace
+ 
+ UINT Renderer::DescriptorIndex(UINT frameSlot, UINT withinSlot) const noexcept
+@@ -112,6 +120,27 @@ lgp::framework::Status Renderer::CreateFrameCommandObjects()
+             return std::unexpected(lgp::framework::MakeHResultError(
+                 "ID3D12GraphicsCommandList::Close", result, "Failed to close a new compute command list."));
+         }
++        result = deviceResources_->device()->CreateCommandAllocator(
++            D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(slot.directAllocator.ReleaseAndGetAddressOf()));
++        if (FAILED(result))
++        {
++            return std::unexpected(lgp::framework::MakeHResultError(
++                "ID3D12Device::CreateCommandAllocator", result, "Failed to create a per-slot direct allocator."));
++        }
++        result = deviceResources_->device()->CreateCommandList(
++            0U, D3D12_COMMAND_LIST_TYPE_DIRECT, slot.directAllocator.Get(), nullptr,
++            IID_PPV_ARGS(slot.directList.ReleaseAndGetAddressOf()));
++        if (FAILED(result))
++        {
++            return std::unexpected(lgp::framework::MakeHResultError(
++                "ID3D12Device::CreateCommandList", result, "Failed to create a per-slot direct command list."));
++        }
++        result = slot.directList->Close();
++        if (FAILED(result))
++        {
++            return std::unexpected(lgp::framework::MakeHResultError(
++                "ID3D12GraphicsCommandList::Close", result, "Failed to close a new direct command list."));
++        }
+     }
+     return {};
+ }
+@@ -247,6 +276,46 @@ lgp::framework::Status Renderer::CreateSizeDependentResources(lgp::framework::Ex
+     physicalByteSizes_ = *sizesResult;
+     serialSchedule_ = std::move(schedulesResult->serial);
+     asyncSchedule_ = std::move(schedulesResult->async);
++    return ValidateConcreteAsyncPlan();
++}
++
++lgp::framework::Status Renderer::ValidateConcreteAsyncPlan() const
++{
++    if (!graph_ || !asyncSchedule_)
++    {
++        return std::unexpected(
++            lgp::framework::MakeError("Renderer::ValidateConcreteAsyncPlan", "The async plan is unavailable."));
++    }
++    std::array<std::tuple<ch08::frame_graph::PassId, QueueKind, std::uint32_t>, 5U> const expected{{
++        {graph_->computeGenerate, QueueKind::Compute, 0U},
++        {graph_->computeCollapse, QueueKind::Compute, 1U},
++        {graph_->graphicsGeometry, QueueKind::Direct, 0U},
++        {graph_->graphicsResolve, QueueKind::Direct, 1U},
++        {graph_->composite, QueueKind::Direct, 2U},
++    }};
++    for (auto const &[passId, queue, queuePosition] : expected)
++    {
++        ScheduledPass const *pass = FindPass(*asyncSchedule_, passId);
++        if (pass == nullptr || pass->queue != queue || pass->queuePosition != queuePosition)
++        {
++            return std::unexpected(lgp::framework::MakeError(
++                "Renderer::ValidateConcreteAsyncPlan", "A pass queue or position does not match runtime recording."));
++        }
++    }
++    if (asyncSchedule_->crossQueueFenceDependencies.size() != 1U)
++    {
++        return std::unexpected(lgp::framework::MakeError("Renderer::ValidateConcreteAsyncPlan",
++                                                         "The async plan must have exactly one fence dependency."));
++    }
++    CrossQueueFenceDependency const &fence = asyncSchedule_->crossQueueFenceDependencies.front();
++    bool const reasonMatches = fence.reasons.size() == 1U && fence.reasons.front().resourceId == graph_->computeFinal;
++    if (fence.producerPassId != graph_->computeCollapse || fence.consumerPassId != graph_->composite ||
++        fence.producerQueue != QueueKind::Compute || fence.consumerQueue != QueueKind::Direct ||
++        fence.signalAfterProducerQueuePosition != 1U || fence.waitBeforeConsumerQueuePosition != 2U || !reasonMatches)
++    {
++        return std::unexpected(lgp::framework::MakeError(
++            "Renderer::ValidateConcreteAsyncPlan", "The planned compute-to-composite fence does not match runtime."));
++    }
+     return {};
+ }
+ 
+@@ -323,6 +392,65 @@ lgp::framework::Status Renderer::RecordComputeBranch(lgp::framework::FrameContex
+     return {};
+ }
+ 
++lgp::framework::Status Renderer::RecordGraphicsBranch(lgp::framework::FrameContext const &frameContext,
++                                                      FrameSlotTextures &slot)
++{
++    HRESULT result = slot.directAllocator->Reset();
++    if (FAILED(result))
++    {
++        return std::unexpected(lgp::framework::MakeHResultError(
++            "ID3D12CommandAllocator::Reset", result, "Failed to reset the Chapter 10 direct allocator."));
++    }
++    result = slot.directList->Reset(slot.directAllocator.Get(), nullptr);
++    if (FAILED(result))
++    {
++        return std::unexpected(lgp::framework::MakeHResultError(
++            "ID3D12GraphicsCommandList::Reset", result, "Failed to reset the Chapter 10 direct command list."));
++    }
++
++    ID3D12GraphicsCommandList7 &commandList = *slot.directList.Get();
++    ID3D12DescriptorHeap *const descriptorHeaps[]{frameContext.shaderVisibleCbvSrvUavHeap};
++    commandList.SetDescriptorHeaps(1U, descriptorHeaps);
++    commandList.SetGraphicsRootSignature(rootSignature_.Get());
++    commandList.RSSetViewports(1U, &frameContext.viewport);
++    commandList.RSSetScissorRects(1U, &frameContext.scissorRect);
++    commandList.IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
++
++    ID3D12Resource &graphicsScratch = *slot.textures[TextureIndex(gpu::LabTextureIndex::GraphicsScratch)].Get();
++    ID3D12Resource &graphicsFinal = *slot.textures[TextureIndex(gpu::LabTextureIndex::GraphicsFinal)].Get();
++    std::vector<D3D12_TEXTURE_BARRIER> barriers{
++        gpu::MakeTextureBarrier(graphicsScratch, gpu::UndefinedState(), gpu::RenderTargetState(),
++                                D3D12_TEXTURE_BARRIER_FLAG_DISCARD),
++    };
++    gpu::SubmitTextureBarriers(commandList, barriers);
++    DrawTo(commandList, *pipelines_.graphicsGeometry.Get(),
++           textureRtvs_.CpuHandle(RtvIndex(frameContext.frameSlot, 0U)));
++
++    barriers = {
++        gpu::MakeTextureBarrier(graphicsScratch, gpu::RenderTargetState(), gpu::PixelShaderResourceState()),
++        gpu::MakeTextureBarrier(graphicsFinal, gpu::UndefinedState(), gpu::RenderTargetState(),
++                                D3D12_TEXTURE_BARRIER_FLAG_DISCARD),
++    };
++    gpu::SubmitTextureBarriers(commandList, barriers);
++    commandList.SetGraphicsRootDescriptorTable(
++        0U, textureDescriptors_.GpuHandle(DescriptorIndex(frameContext.frameSlot, kGraphicsScratchSrv)));
++    DrawTo(commandList, *pipelines_.graphicsResolve.Get(),
++           textureRtvs_.CpuHandle(RtvIndex(frameContext.frameSlot, 1U)));
++
++    barriers = {
++        gpu::MakeTextureBarrier(graphicsScratch, gpu::PixelShaderResourceState(), gpu::UndefinedState()),
++        gpu::MakeTextureBarrier(graphicsFinal, gpu::RenderTargetState(), gpu::PixelShaderResourceState()),
++    };
++    gpu::SubmitTextureBarriers(commandList, barriers);
++    result = commandList.Close();
++    if (FAILED(result))
++    {
++        return std::unexpected(lgp::framework::MakeHResultError(
++            "ID3D12GraphicsCommandList::Close", result, "Failed to close the Chapter 10 direct command list."));
++    }
++    return {};
++}
++
+ lgp::framework::Status Renderer::Initialize(lgp::framework::ApplicationInitContext const &context)
+ {
+     deviceResources_ = &context.deviceResources;
+@@ -376,27 +504,12 @@ lgp::framework::Status Renderer::Render(lgp::framework::FrameContext const &fram
+     }
+     lastExecutionTrace_.push_back(
+         {gpu::QueueExecutionTraceKind::ComputeBranchRecorded, QueueKind::Compute, std::nullopt});
+-
+-    ID3D12CommandList *computeLists[]{slot.computeList.Get()};
+-    computeQueue_->ExecuteCommandLists(1U, computeLists);
+-    lastExecutionTrace_.push_back({gpu::QueueExecutionTraceKind::ComputeExecute, QueueKind::Compute, std::nullopt});
+-    std::uint64_t const fenceValue = nextComputeFenceValue_++;
+-    HRESULT result = computeQueue_->Signal(computeFence_.Get(), fenceValue);
+-    if (FAILED(result))
+-    {
+-        return std::unexpected(lgp::framework::MakeHResultError(
+-            "ID3D12CommandQueue::Signal", result, "Failed to signal the Chapter 10 compute fence."));
+-    }
+-    lastSignaledComputeFenceValue_ = fenceValue;
+-    lastExecutionTrace_.push_back({gpu::QueueExecutionTraceKind::ComputeSignal, QueueKind::Compute, fenceValue});
+-    result = deviceResources_->graphics_queue()->Wait(computeFence_.Get(), fenceValue);
+-    if (FAILED(result))
++    if (auto status = RecordGraphicsBranch(frameContext, slot); !status)
+     {
+-        return std::unexpected(lgp::framework::MakeHResultError(
+-            "ID3D12CommandQueue::Wait", result, "Failed to queue the Chapter 10 compute dependency."));
++        return status;
+     }
+     lastExecutionTrace_.push_back(
+-        {gpu::QueueExecutionTraceKind::DirectWaitBeforeComposite, QueueKind::Direct, fenceValue});
++        {gpu::QueueExecutionTraceKind::IndependentGraphicsBranchRecorded, QueueKind::Direct, std::nullopt});
+ 
+     ID3D12GraphicsCommandList7 &commandList = *frameContext.commandList;
+     ID3D12DescriptorHeap *const descriptorHeaps[]{frameContext.shaderVisibleCbvSrvUavHeap};
+@@ -411,33 +524,8 @@ lgp::framework::Status Renderer::Render(lgp::framework::FrameContext const &fram
+                                              L"Ch10 Early Wait"};
+ 
+     ID3D12Resource &computeFinal = *slot.textures[TextureIndex(gpu::LabTextureIndex::ComputeFinal)].Get();
+-    ID3D12Resource &graphicsScratch = *slot.textures[TextureIndex(gpu::LabTextureIndex::GraphicsScratch)].Get();
+     ID3D12Resource &graphicsFinal = *slot.textures[TextureIndex(gpu::LabTextureIndex::GraphicsFinal)].Get();
+-
+     std::vector<D3D12_TEXTURE_BARRIER> barriers{
+-        gpu::MakeTextureBarrier(graphicsScratch, gpu::UndefinedState(), gpu::RenderTargetState(),
+-                                D3D12_TEXTURE_BARRIER_FLAG_DISCARD),
+-    };
+-    gpu::SubmitTextureBarriers(commandList, barriers);
+-    lastExecutionTrace_.push_back(
+-        {gpu::QueueExecutionTraceKind::IndependentGraphicsBranchRecorded, QueueKind::Direct, std::nullopt});
+-    DrawTo(commandList, *pipelines_.graphicsGeometry.Get(),
+-           textureRtvs_.CpuHandle(RtvIndex(frameContext.frameSlot, 0U)));
+-
+-    barriers = {
+-        gpu::MakeTextureBarrier(graphicsScratch, gpu::RenderTargetState(), gpu::PixelShaderResourceState()),
+-        gpu::MakeTextureBarrier(graphicsFinal, gpu::UndefinedState(), gpu::RenderTargetState(),
+-                                D3D12_TEXTURE_BARRIER_FLAG_DISCARD),
+-    };
+-    gpu::SubmitTextureBarriers(commandList, barriers);
+-    commandList.SetGraphicsRootDescriptorTable(
+-        0U, textureDescriptors_.GpuHandle(DescriptorIndex(frameContext.frameSlot, kGraphicsScratchSrv)));
+-    DrawTo(commandList, *pipelines_.graphicsResolve.Get(),
+-           textureRtvs_.CpuHandle(RtvIndex(frameContext.frameSlot, 1U)));
+-
+-    barriers = {
+-        gpu::MakeTextureBarrier(graphicsScratch, gpu::PixelShaderResourceState(), gpu::UndefinedState()),
+-        gpu::MakeTextureBarrier(graphicsFinal, gpu::RenderTargetState(), gpu::PixelShaderResourceState()),
+         gpu::MakeTextureBarrier(*frameContext.renderTarget, gpu::FrameStartState(frameContext.headless),
+                                 gpu::RenderTargetState()),
+     };
+@@ -448,7 +536,7 @@ lgp::framework::Status Renderer::Render(lgp::framework::FrameContext const &fram
+         1U, textureDescriptors_.GpuHandle(DescriptorIndex(frameContext.frameSlot, kGraphicsFinalSrv)));
+     DrawTo(commandList, *pipelines_.composite.Get(), frameContext.renderTargetView);
+     lastExecutionTrace_.push_back(
+-        {gpu::QueueExecutionTraceKind::CompositeRecordedForFrameworkSubmission, QueueKind::Direct, fenceValue});
++        {gpu::QueueExecutionTraceKind::CompositeRecordedForFrameworkSubmission, QueueKind::Direct, std::nullopt});
+ 
+     barriers = {
+         gpu::MakeTextureBarrier(computeFinal, gpu::ComputeProducedSharedShaderResourceState(), gpu::UndefinedState()),
+@@ -457,6 +545,32 @@ lgp::framework::Status Renderer::Render(lgp::framework::FrameContext const &fram
+                                 gpu::FrameEndState(frameContext.headless)),
+     };
+     gpu::SubmitTextureBarriers(commandList, barriers);
++
++    ID3D12CommandList *computeLists[]{slot.computeList.Get()};
++    computeQueue_->ExecuteCommandLists(1U, computeLists);
++    lastExecutionTrace_.push_back({gpu::QueueExecutionTraceKind::ComputeExecute, QueueKind::Compute, std::nullopt});
++    std::uint64_t const fenceValue = nextComputeFenceValue_++;
++    HRESULT result = computeQueue_->Signal(computeFence_.Get(), fenceValue);
++    if (FAILED(result))
++    {
++        return std::unexpected(lgp::framework::MakeHResultError(
++            "ID3D12CommandQueue::Signal", result, "Failed to signal the Chapter 10 compute fence."));
++    }
++    lastSignaledComputeFenceValue_ = fenceValue;
++    lastExecutionTrace_.push_back({gpu::QueueExecutionTraceKind::ComputeSignal, QueueKind::Compute, fenceValue});
++
++    ID3D12CommandList *directLists[]{slot.directList.Get()};
++    deviceResources_->graphics_queue()->ExecuteCommandLists(1U, directLists);
++    lastExecutionTrace_.push_back(
++        {gpu::QueueExecutionTraceKind::IndependentDirectExecute, QueueKind::Direct, std::nullopt});
++    result = deviceResources_->graphics_queue()->Wait(computeFence_.Get(), fenceValue);
++    if (FAILED(result))
++    {
++        return std::unexpected(lgp::framework::MakeHResultError(
++            "ID3D12CommandQueue::Wait", result, "Failed to queue the Chapter 10 compute dependency."));
++    }
++    lastExecutionTrace_.push_back(
++        {gpu::QueueExecutionTraceKind::DirectWaitBeforeComposite, QueueKind::Direct, fenceValue});
+     return {};
+ }
+ 
+diff --git a/chapters/pass-scheduling-and-multi-queue-execution/Starter/Renderer.hpp b/chapters/pass-scheduling-and-multi-queue-execution/Starter/Renderer.hpp
+index 3ec0d581b4a0161a46ad83367a4a6e8d98c1e691..522dfa759384505d471488427a51965b5ffb1dfa 100644
+--- a/chapters/pass-scheduling-and-multi-queue-execution/Starter/Renderer.hpp
++++ b/chapters/pass-scheduling-and-multi-queue-execution/Starter/Renderer.hpp
+@@ -35,6 +35,8 @@ class Renderer final : public lgp::framework::IChapterRenderer
+     {
+         Microsoft::WRL::ComPtr<ID3D12CommandAllocator> computeAllocator{};
+         Microsoft::WRL::ComPtr<ID3D12GraphicsCommandList7> computeList{};
++        Microsoft::WRL::ComPtr<ID3D12CommandAllocator> directAllocator{};
++        Microsoft::WRL::ComPtr<ID3D12GraphicsCommandList7> directList{};
+         std::array<Microsoft::WRL::ComPtr<ID3D12Resource>, gpu::kLabTextureCount> textures{};
+     };
+ 
+@@ -44,6 +46,9 @@ class Renderer final : public lgp::framework::IChapterRenderer
+     [[nodiscard]] lgp::framework::Status CreateSizeDependentResources(lgp::framework::Extent2D size);
+     [[nodiscard]] lgp::framework::Status RecordComputeBranch(lgp::framework::FrameContext const &frameContext,
+                                                              FrameSlotTextures &slot);
++    [[nodiscard]] lgp::framework::Status RecordGraphicsBranch(lgp::framework::FrameContext const &frameContext,
++                                                              FrameSlotTextures &slot);
++    [[nodiscard]] lgp::framework::Status ValidateConcreteAsyncPlan() const;
+     void ReleaseSizeDependentResources() noexcept;
+     void DrawTo(ID3D12GraphicsCommandList7 &commandList, ID3D12PipelineState &pipeline,
+                 D3D12_CPU_DESCRIPTOR_HANDLE renderTarget) const;

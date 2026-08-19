@@ -1,0 +1,68 @@
+diff --git a/chapters/graphics-math-coordinate-transforms/Starter/DemoLogic.cpp b/chapters/graphics-math-coordinate-transforms/Starter/DemoLogic.cpp
+--- a/chapters/graphics-math-coordinate-transforms/Starter/DemoLogic.cpp
++++ b/chapters/graphics-math-coordinate-transforms/Starter/DemoLogic.cpp
+@@ -30,7 +30,7 @@ class StarterLogic final : public IChapterLogic
+         controls.showCameraAxes = true;
+         controls.showFrustum = false;
+         controls.showWrongOrder = true;
+-        controls.showComparisonOrientation = false;
++        controls.showComparisonOrientation = true;
+         controls.showNormalVectors = true;
+         controls.demonstrateIncorrectNormal = true;
+         controls.omitPerspectiveDivide = true;
+diff --git a/chapters/graphics-math-coordinate-transforms/Starter/Scene.cpp b/chapters/graphics-math-coordinate-transforms/Starter/Scene.cpp
+--- a/chapters/graphics-math-coordinate-transforms/Starter/Scene.cpp
++++ b/chapters/graphics-math-coordinate-transforms/Starter/Scene.cpp
+@@ -86,10 +86,27 @@ lgp::framework::Result<ChapterDerivedScene> BuildScene(ChapterControls const &co
+                                   : 1.0F;
+     DirectX::XMMATRIX const projectionMatrix = ChooseProjection(sanitizedControls, aspectRatio);
+
+-    DirectX::XMMATRIX const activeRotationMatrix = BuildEulerRotationMatrixFromDegrees(sanitizedControls.eulerDegrees);
++    DirectX::XMMATRIX const eulerRotationMatrix = BuildEulerRotationMatrixFromDegrees(sanitizedControls.eulerDegrees);
++    DirectX::XMMATRIX const quaternionRotationMatrix =
++        BuildQuaternionRotationMatrixFromDegrees(sanitizedControls.quaternionDegrees);
++
++    DirectX::XMMATRIX activeRotationMatrix = eulerRotationMatrix;
++    switch (sanitizedControls.orientationMode)
++    {
++    case OrientationMode::Euler:
++        activeRotationMatrix = eulerRotationMatrix;
++        break;
++    case OrientationMode::Quaternion:
++        activeRotationMatrix = quaternionRotationMatrix;
++        break;
++    case OrientationMode::Slerp:
++        activeRotationMatrix = quaternionRotationMatrix;
++        break;
++    }
++
+     DirectX::XMMATRIX const modelMatrix =
+         ComposeModelMatrix(sanitizedControls.translation, sanitizedControls.scale, activeRotationMatrix);
+-    DirectX::XMMATRIX const comparisonModelMatrix = modelMatrix;
++    DirectX::XMMATRIX const comparisonModelMatrix = BuildComparisonModelMatrix(sanitizedControls);
+     DirectX::XMMATRIX const wrongOrderModelMatrix =
+         ComposeWrongOrderModelMatrix(sanitizedControls.translation, sanitizedControls.scale, activeRotationMatrix);
+     DirectX::XMMATRIX const viewProjectionMatrix = viewMatrix * projectionMatrix;
+@@ -98,10 +115,10 @@ lgp::framework::Result<ChapterDerivedScene> BuildScene(ChapterControls const &co
+
+     ChapterDerivedScene scene{};
+     scene.capabilities = {
+-        true, true, true, true, true, true, false, false, false, true,
++        true, true, true, true, true, true, true, false, false, true,
+     };
+-    scene.implementationNote = "Step 10: normals now use the inverse-transpose path so non-uniform scale can be "
+-                               "compared against the incorrect transform.";
++    scene.implementationNote =
++        "Step 11: Euler and quaternion orientations can now be compared with matching model and comparison transforms.";
+     scene.model = StoreMatrix(modelMatrix);
+     scene.comparisonModel = StoreMatrix(comparisonModelMatrix);
+     scene.wrongOrderModel = StoreMatrix(wrongOrderModelMatrix);
+@@ -115,7 +132,7 @@ lgp::framework::Result<ChapterDerivedScene> BuildScene(ChapterControls const &co
+     scene.cameraRight = cameraFrame.right;
+     scene.cameraUp = cameraFrame.up;
+     scene.cameraForward = cameraFrame.forward;
+-    scene.hasComparisonModel = false;
++    scene.hasComparisonModel = sanitizedControls.showComparisonOrientation;
+     scene.hasWrongOrderModel = sanitizedControls.showWrongOrder;
+
+     std::span<XMFLOAT3 const> const objectVertices = ObjectVertices();

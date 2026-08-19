@@ -1,0 +1,393 @@
+diff --git a/chapters/graphics-math-coordinate-transforms/Starter/MathTransforms.cpp b/chapters/graphics-math-coordinate-transforms/Starter/MathTransforms.cpp
+--- a/chapters/graphics-math-coordinate-transforms/Starter/MathTransforms.cpp
++++ b/chapters/graphics-math-coordinate-transforms/Starter/MathTransforms.cpp
+@@ -1,7 +1,5 @@
+ #include "MathTransforms.hpp"
+
+-#include <DirectXMath.h>
+-
+ #include <algorithm>
+ #include <cmath>
+
+@@ -11,22 +9,80 @@ namespace
+ {
+
+ using DirectX::XMMatrixIdentity;
++using DirectX::XMMatrixInverse;
++using DirectX::XMMatrixOrthographicLH;
+ using DirectX::XMMatrixPerspectiveFovLH;
++using DirectX::XMMatrixRotationQuaternion;
++using DirectX::XMMatrixRotationRollPitchYaw;
++using DirectX::XMMatrixScaling;
++using DirectX::XMMatrixTranslation;
++using DirectX::XMMatrixTranspose;
++using DirectX::XMQuaternionNormalize;
++using DirectX::XMQuaternionRotationRollPitchYaw;
++using DirectX::XMStoreFloat3;
+ using DirectX::XMStoreFloat4;
+ using DirectX::XMStoreFloat4x4;
++using DirectX::XMVector3Normalize;
+ using DirectX::XMVector4Transform;
+ using DirectX::XMVectorSet;
+
+ } // namespace
+
+-DirectX::XMMATRIX BuildModelMatrixStub() noexcept
++DirectX::XMFLOAT3 DegreesVectorToRadians(DirectX::XMFLOAT3 degrees) noexcept
++{
++    return {
++        DegreesToRadians(degrees.x),
++        DegreesToRadians(degrees.y),
++        DegreesToRadians(degrees.z),
++    };
++}
++
++DirectX::XMMATRIX BuildEulerRotationMatrixFromDegrees(DirectX::XMFLOAT3 degrees) noexcept
++{
++    DirectX::XMFLOAT3 const radians = DegreesVectorToRadians(degrees);
++    return XMMatrixRotationRollPitchYaw(radians.x, radians.y, radians.z);
++}
++
++DirectX::XMVECTOR BuildQuaternionFromDegrees(DirectX::XMFLOAT3 degrees) noexcept
++{
++    DirectX::XMFLOAT3 const radians = DegreesVectorToRadians(degrees);
++    return XMQuaternionNormalize(XMQuaternionRotationRollPitchYaw(radians.x, radians.y, radians.z));
++}
++
++DirectX::XMMATRIX BuildQuaternionRotationMatrixFromDegrees(DirectX::XMFLOAT3 degrees) noexcept
++{
++    return XMMatrixRotationQuaternion(BuildQuaternionFromDegrees(degrees));
++}
++
++DirectX::XMVECTOR SlerpQuaternion(DirectX::XMVECTOR start, DirectX::XMVECTOR end, float interpolation) noexcept
++{
++    float const clampedInterpolation = std::clamp(interpolation, 0.0F, 1.0F);
++    return DirectX::XMQuaternionSlerp(start, end, clampedInterpolation);
++}
++
++DirectX::XMMATRIX BuildSlerpRotationMatrixFromDegrees(DirectX::XMFLOAT3 startDegrees, DirectX::XMFLOAT3 endDegrees,
++                                                      float interpolation) noexcept
+ {
+-    // TODO: Build translation, rotation, and scale matrices from the UI state.
+-    return XMMatrixIdentity();
++    return XMMatrixRotationQuaternion(SlerpQuaternion(BuildQuaternionFromDegrees(startDegrees),
++                                                      BuildQuaternionFromDegrees(endDegrees), interpolation));
+ }
+
+-DirectX::XMMATRIX BuildPerspectiveProjectionStub(float verticalFieldOfViewDegrees, float aspectRatio, float nearPlane,
+-                                                 float farPlane) noexcept
++DirectX::XMMATRIX ComposeModelMatrix(DirectX::XMFLOAT3 translation, DirectX::XMFLOAT3 scale,
++                                     DirectX::XMMATRIX rotationMatrix) noexcept
++{
++    return XMMatrixScaling(scale.x, scale.y, scale.z) * rotationMatrix *
++           XMMatrixTranslation(translation.x, translation.y, translation.z);
++}
++
++DirectX::XMMATRIX ComposeWrongOrderModelMatrix(DirectX::XMFLOAT3 translation, DirectX::XMFLOAT3 scale,
++                                               DirectX::XMMATRIX rotationMatrix) noexcept
++{
++    return XMMatrixTranslation(translation.x, translation.y, translation.z) * rotationMatrix *
++           XMMatrixScaling(scale.x, scale.y, scale.z);
++}
++
++DirectX::XMMATRIX BuildPerspectiveProjection(float verticalFieldOfViewDegrees, float aspectRatio, float nearPlane,
++                                             float farPlane) noexcept
+ {
+     float const clampedAspect = aspectRatio > 0.0F ? aspectRatio : 1.0F;
+     float const clampedNear = std::max(nearPlane, 0.1F);
+@@ -35,14 +91,31 @@ DirectX::XMMATRIX BuildPerspectiveProjectionStub(float verticalFieldOfViewDegree
+                                     clampedFar);
+ }
+
+-DirectX::XMFLOAT4 TransformPointStub(DirectX::XMFLOAT3 point, DirectX::XMMATRIX transform) noexcept
++DirectX::XMMATRIX BuildOrthographicProjection(float height, float aspectRatio, float nearPlane, float farPlane) noexcept
++{
++    float const clampedHeight = std::max(height, 0.05F);
++    float const clampedAspect = aspectRatio > 0.0F ? aspectRatio : 1.0F;
++    float const clampedNear = std::max(nearPlane, 0.001F);
++    float const clampedFar = std::max(farPlane, clampedNear + 0.001F);
++    return XMMatrixOrthographicLH(clampedHeight * clampedAspect, clampedHeight, clampedNear, clampedFar);
++}
++
++DirectX::XMFLOAT4 TransformPoint(DirectX::XMFLOAT3 point, DirectX::XMMATRIX transform) noexcept
+ {
+     DirectX::XMFLOAT4 transformedPoint{};
+     XMStoreFloat4(&transformedPoint, XMVector4Transform(XMVectorSet(point.x, point.y, point.z, 1.0F), transform));
+     return transformedPoint;
+ }
+
+-DirectX::XMFLOAT3 HomogeneousDivideStub(DirectX::XMFLOAT4 clipCoordinates) noexcept
++DirectX::XMFLOAT3 TransformDirection(DirectX::XMFLOAT3 direction, DirectX::XMMATRIX transform) noexcept
++{
++    DirectX::XMFLOAT3 transformedDirection{};
++    XMStoreFloat3(&transformedDirection,
++                  XMVector4Transform(XMVectorSet(direction.x, direction.y, direction.z, 0.0F), transform));
++    return transformedDirection;
++}
++
++DirectX::XMFLOAT3 HomogeneousDivide(DirectX::XMFLOAT4 clipCoordinates) noexcept
+ {
+     float const reciprocalW = (std::fabs(clipCoordinates.w) > 1.0e-6F) ? (1.0F / clipCoordinates.w) : 0.0F;
+     return {
+@@ -52,7 +125,7 @@ DirectX::XMFLOAT3 HomogeneousDivideStub(DirectX::XMFLOAT4 clipCoordinates) noexc
+     };
+ }
+
+-DirectX::XMFLOAT2 ViewportMapStub(DirectX::XMFLOAT3 ndcCoordinates, lgp::framework::Extent2D viewport) noexcept
++DirectX::XMFLOAT2 ViewportMap(DirectX::XMFLOAT3 ndcCoordinates, lgp::framework::Extent2D viewport) noexcept
+ {
+     if (viewport.width == 0U || viewport.height == 0U)
+     {
+@@ -65,7 +138,14 @@ DirectX::XMFLOAT2 ViewportMapStub(DirectX::XMFLOAT3 ndcCoordinates, lgp::framewo
+     };
+ }
+
+-DirectX::XMFLOAT4X4 StoreMatrixStub(DirectX::XMMATRIX matrix) noexcept
++DirectX::XMMATRIX BuildNormalMatrix(DirectX::XMMATRIX modelMatrix) noexcept
++{
++    DirectX::XMMATRIX linearTransform = modelMatrix;
++    linearTransform.r[3] = XMVectorSet(0.0F, 0.0F, 0.0F, 1.0F);
++    return XMMatrixTranspose(XMMatrixInverse(nullptr, linearTransform));
++}
++
++DirectX::XMFLOAT4X4 StoreMatrix(DirectX::XMMATRIX matrix) noexcept
+ {
+     DirectX::XMFLOAT4X4 storedMatrix{};
+     XMStoreFloat4x4(&storedMatrix, matrix);
+diff --git a/chapters/graphics-math-coordinate-transforms/Starter/MathTransforms.hpp b/chapters/graphics-math-coordinate-transforms/Starter/MathTransforms.hpp
+--- a/chapters/graphics-math-coordinate-transforms/Starter/MathTransforms.hpp
++++ b/chapters/graphics-math-coordinate-transforms/Starter/MathTransforms.hpp
+@@ -7,13 +7,29 @@
+ namespace ch01::graphics_math::starter
+ {
+
+-[[nodiscard]] DirectX::XMMATRIX BuildModelMatrixStub() noexcept;
+-[[nodiscard]] DirectX::XMMATRIX BuildPerspectiveProjectionStub(float verticalFieldOfViewDegrees, float aspectRatio,
+-                                                               float nearPlane, float farPlane) noexcept;
+-[[nodiscard]] DirectX::XMFLOAT4 TransformPointStub(DirectX::XMFLOAT3 point, DirectX::XMMATRIX transform) noexcept;
+-[[nodiscard]] DirectX::XMFLOAT3 HomogeneousDivideStub(DirectX::XMFLOAT4 clipCoordinates) noexcept;
+-[[nodiscard]] DirectX::XMFLOAT2 ViewportMapStub(DirectX::XMFLOAT3 ndcCoordinates,
+-                                                lgp::framework::Extent2D viewport) noexcept;
+-[[nodiscard]] DirectX::XMFLOAT4X4 StoreMatrixStub(DirectX::XMMATRIX matrix) noexcept;
++[[nodiscard]] DirectX::XMFLOAT3 DegreesVectorToRadians(DirectX::XMFLOAT3 degrees) noexcept;
++[[nodiscard]] DirectX::XMMATRIX BuildEulerRotationMatrixFromDegrees(DirectX::XMFLOAT3 degrees) noexcept;
++[[nodiscard]] DirectX::XMVECTOR BuildQuaternionFromDegrees(DirectX::XMFLOAT3 degrees) noexcept;
++[[nodiscard]] DirectX::XMMATRIX BuildQuaternionRotationMatrixFromDegrees(DirectX::XMFLOAT3 degrees) noexcept;
++[[nodiscard]] DirectX::XMVECTOR SlerpQuaternion(DirectX::XMVECTOR start, DirectX::XMVECTOR end,
++                                                float interpolation) noexcept;
++[[nodiscard]] DirectX::XMMATRIX BuildSlerpRotationMatrixFromDegrees(DirectX::XMFLOAT3 startDegrees,
++                                                                    DirectX::XMFLOAT3 endDegrees,
++                                                                    float interpolation) noexcept;
++[[nodiscard]] DirectX::XMMATRIX ComposeModelMatrix(DirectX::XMFLOAT3 translation, DirectX::XMFLOAT3 scale,
++                                                   DirectX::XMMATRIX rotationMatrix) noexcept;
++[[nodiscard]] DirectX::XMMATRIX ComposeWrongOrderModelMatrix(DirectX::XMFLOAT3 translation, DirectX::XMFLOAT3 scale,
++                                                             DirectX::XMMATRIX rotationMatrix) noexcept;
++[[nodiscard]] DirectX::XMMATRIX BuildPerspectiveProjection(float verticalFieldOfViewDegrees, float aspectRatio,
++                                                           float nearPlane, float farPlane) noexcept;
++[[nodiscard]] DirectX::XMMATRIX BuildOrthographicProjection(float height, float aspectRatio, float nearPlane,
++                                                            float farPlane) noexcept;
++[[nodiscard]] DirectX::XMFLOAT4 TransformPoint(DirectX::XMFLOAT3 point, DirectX::XMMATRIX transform) noexcept;
++[[nodiscard]] DirectX::XMFLOAT3 TransformDirection(DirectX::XMFLOAT3 direction, DirectX::XMMATRIX transform) noexcept;
++[[nodiscard]] DirectX::XMFLOAT3 HomogeneousDivide(DirectX::XMFLOAT4 clipCoordinates) noexcept;
++[[nodiscard]] DirectX::XMFLOAT2 ViewportMap(DirectX::XMFLOAT3 ndcCoordinates,
++                                            lgp::framework::Extent2D viewport) noexcept;
++[[nodiscard]] DirectX::XMMATRIX BuildNormalMatrix(DirectX::XMMATRIX modelMatrix) noexcept;
++[[nodiscard]] DirectX::XMFLOAT4X4 StoreMatrix(DirectX::XMMATRIX matrix) noexcept;
+
+ } // namespace ch01::graphics_math::starter
+diff --git a/chapters/graphics-math-coordinate-transforms/Starter/Scene.cpp b/chapters/graphics-math-coordinate-transforms/Starter/Scene.cpp
+--- a/chapters/graphics-math-coordinate-transforms/Starter/Scene.cpp
++++ b/chapters/graphics-math-coordinate-transforms/Starter/Scene.cpp
+@@ -7,85 +7,156 @@
+
+ #include <DirectXMath.h>
+
++#include <algorithm>
++#include <string>
++
+ namespace ch01::graphics_math::starter
+ {
+ namespace
+ {
+
+ using DirectX::XMLoadFloat4x4;
+-using DirectX::XMMatrixInverse;
++using DirectX::XMMatrixIdentity;
++using DirectX::XMStoreFloat3;
++using DirectX::XMVector3Normalize;
++using DirectX::XMVectorScale;
++using DirectX::XMVectorSet;
++
++[[nodiscard]] XMFLOAT3 ClampScale(XMFLOAT3 scale) noexcept
++{
++    auto const clampAxis = [](float value) noexcept
++    {
++        float const sign = value < 0.0F ? -1.0F : 1.0F;
++        float const magnitude = std::max(std::abs(value), 0.05F);
++        return sign * magnitude;
++    };
++
++    return {clampAxis(scale.x), clampAxis(scale.y), clampAxis(scale.z)};
++}
++
++[[nodiscard]] DirectX::XMMATRIX BuildIncorrectNormalMatrix(DirectX::XMMATRIX modelMatrix) noexcept
++{
++    DirectX::XMMATRIX incorrectNormalMatrix = modelMatrix;
++    incorrectNormalMatrix.r[3] = XMVectorSet(0.0F, 0.0F, 0.0F, 1.0F);
++    return incorrectNormalMatrix;
++}
++
++[[nodiscard]] DirectX::XMMATRIX ChooseProjection(ChapterControls const &controls, float aspectRatio) noexcept
++{
++    if (controls.projectionMode == ProjectionMode::Orthographic)
++    {
++        return BuildOrthographicProjection(controls.orthographicHeight, aspectRatio, controls.nearPlane,
++                                           controls.farPlane);
++    }
++
++    return BuildPerspectiveProjection(controls.verticalFieldOfViewDegrees, aspectRatio, controls.nearPlane,
++                                      controls.farPlane);
++}
++
++[[nodiscard]] DirectX::XMMATRIX BuildComparisonModelMatrix(ChapterControls const &controls) noexcept
++{
++    switch (controls.orientationMode)
++    {
++    case OrientationMode::Euler:
++        return ComposeModelMatrix(controls.translation, controls.scale,
++                                  BuildQuaternionRotationMatrixFromDegrees(controls.quaternionDegrees));
++    case OrientationMode::Quaternion:
++        return ComposeModelMatrix(controls.translation, controls.scale,
++                                  BuildEulerRotationMatrixFromDegrees(controls.eulerDegrees));
++    case OrientationMode::Slerp:
++        return ComposeModelMatrix(controls.translation, controls.scale,
++                                  BuildQuaternionRotationMatrixFromDegrees(controls.slerpEndDegrees));
++    }
++
++    return XMMatrixIdentity();
++}
+
+ } // namespace
+
+ lgp::framework::Result<ChapterDerivedScene> BuildScene(ChapterControls const &controls,
+                                                        lgp::framework::Extent2D viewport, double)
+ {
+-    CameraFrame const cameraFrame = BuildCameraFrame(controls);
++    ChapterControls sanitizedControls = controls;
++    sanitizedControls.selectedVertex = ClampVertexIndex(controls.selectedVertex);
++
++    CameraFrame const cameraFrame = BuildCameraFrame(sanitizedControls);
+     DirectX::XMMATRIX const viewMatrix = XMLoadFloat4x4(&cameraFrame.viewMatrix);
+     float const aspectRatio = (viewport.width != 0U && viewport.height != 0U)
+                                   ? (static_cast<float>(viewport.width) / static_cast<float>(viewport.height))
+                                   : 1.0F;
+-    DirectX::XMMATRIX const projectionMatrix = BuildPerspectiveProjectionStub(
+-        controls.verticalFieldOfViewDegrees, aspectRatio, controls.nearPlane, controls.farPlane);
+-    DirectX::XMMATRIX const modelMatrix = BuildModelMatrixStub();
++    DirectX::XMMATRIX const projectionMatrix =
++        BuildPerspectiveProjection(sanitizedControls.verticalFieldOfViewDegrees, aspectRatio,
++                                   sanitizedControls.nearPlane, sanitizedControls.farPlane);
++
++    DirectX::XMMATRIX const activeRotationMatrix = XMMatrixIdentity();
++    DirectX::XMMATRIX const modelMatrix =
++        ComposeModelMatrix({0.0F, 0.0F, 0.0F}, {1.0F, 1.0F, 1.0F}, activeRotationMatrix);
++    DirectX::XMMATRIX const comparisonModelMatrix = modelMatrix;
++    DirectX::XMMATRIX const wrongOrderModelMatrix = modelMatrix;
+     DirectX::XMMATRIX const viewProjectionMatrix = viewMatrix * projectionMatrix;
+-    DirectX::XMMATRIX const modelViewProjectionMatrix = modelMatrix * viewProjectionMatrix;
++    DirectX::XMMATRIX const normalMatrix = modelMatrix;
++    DirectX::XMMATRIX const incorrectNormalMatrix = modelMatrix;
+
+     ChapterDerivedScene scene{};
+     scene.capabilities = {
+         false, false, false, false, false, false, false, false, false, false,
+     };
+-    scene.implementationNote = "Starter: the host plumbing and debug view are live, but the learner-owned transform "
+-                               "chain is intentionally stubbed. "
+-                               "Implement Camera.cpp, MathTransforms.cpp, and Scene.cpp to match the Solution.";
+-    scene.model = StoreMatrixStub(modelMatrix);
+-    scene.comparisonModel = StoreMatrixStub(modelMatrix);
+-    scene.wrongOrderModel = StoreMatrixStub(modelMatrix);
++    scene.implementationNote = "Step 1: shared conventions are live, and the model matrix starts at identity while "
++                               "later controls stay disabled.";
++    scene.model = StoreMatrix(modelMatrix);
++    scene.comparisonModel = StoreMatrix(comparisonModelMatrix);
++    scene.wrongOrderModel = StoreMatrix(wrongOrderModelMatrix);
+     scene.view = cameraFrame.viewMatrix;
+-    scene.projection = StoreMatrixStub(projectionMatrix);
+-    scene.viewProjection = StoreMatrixStub(viewProjectionMatrix);
+-    scene.inverseViewProjection = StoreMatrixStub(XMMatrixInverse(nullptr, viewProjectionMatrix));
+-    scene.normalMatrix = StoreMatrixStub(modelMatrix);
+-    scene.incorrectNormalMatrix = StoreMatrixStub(modelMatrix);
++    scene.projection = StoreMatrix(projectionMatrix);
++    scene.viewProjection = StoreMatrix(viewProjectionMatrix);
++    scene.inverseViewProjection = StoreMatrix(DirectX::XMMatrixInverse(nullptr, viewProjectionMatrix));
++    scene.normalMatrix = StoreMatrix(normalMatrix);
++    scene.incorrectNormalMatrix = StoreMatrix(incorrectNormalMatrix);
+     scene.cameraPosition = cameraFrame.position;
+     scene.cameraRight = cameraFrame.right;
+     scene.cameraUp = cameraFrame.up;
+     scene.cameraForward = cameraFrame.forward;
++    scene.hasComparisonModel = false;
++    scene.hasWrongOrderModel = false;
++
++    std::span<XMFLOAT3 const> const objectVertices = ObjectVertices();
++    DirectX::XMMATRIX const modelViewMatrix = modelMatrix * viewMatrix;
++    DirectX::XMMATRIX const modelViewProjectionMatrix = modelViewMatrix * projectionMatrix;
+
+-    auto const objectVertices = ObjectVertices();
+     for (std::size_t vertexIndex = 0; vertexIndex < objectVertices.size(); ++vertexIndex)
+     {
+-        scene.worldVertices[vertexIndex] = TransformPointStub(objectVertices[vertexIndex], modelMatrix);
+-        scene.viewVertices[vertexIndex] = TransformPointStub(
+-            {
+-                scene.worldVertices[vertexIndex].x,
+-                scene.worldVertices[vertexIndex].y,
+-                scene.worldVertices[vertexIndex].z,
+-            },
+-            viewMatrix);
+-        scene.clipVertices[vertexIndex] = TransformPointStub(objectVertices[vertexIndex], modelViewProjectionMatrix);
+-        scene.ndcVertices[vertexIndex] = HomogeneousDivideStub(scene.clipVertices[vertexIndex]);
+-        scene.screenVertices[vertexIndex] = ViewportMapStub(scene.ndcVertices[vertexIndex], viewport);
++        XMFLOAT3 const objectVertex = objectVertices[vertexIndex];
++        scene.worldVertices[vertexIndex] = TransformPoint(objectVertex, modelMatrix);
++        scene.viewVertices[vertexIndex] =
++            TransformPoint({scene.worldVertices[vertexIndex].x, scene.worldVertices[vertexIndex].y,
++                            scene.worldVertices[vertexIndex].z},
++                           viewMatrix);
++        scene.clipVertices[vertexIndex] = TransformPoint(objectVertex, modelViewProjectionMatrix);
++        scene.ndcVertices[vertexIndex] = {
++            scene.clipVertices[vertexIndex].x,
++            scene.clipVertices[vertexIndex].y,
++            scene.clipVertices[vertexIndex].z,
++        };
++        scene.screenVertices[vertexIndex] = {scene.ndcVertices[vertexIndex].x, scene.ndcVertices[vertexIndex].y};
+     }
+
+-    int const selectedVertex = ClampVertexIndex(controls.selectedVertex);
+-    scene.inspection.object = {
+-        objectVertices[static_cast<std::size_t>(selectedVertex)].x,
+-        objectVertices[static_cast<std::size_t>(selectedVertex)].y,
+-        objectVertices[static_cast<std::size_t>(selectedVertex)].z,
+-        1.0F,
+-    };
++    int const selectedVertex = sanitizedControls.selectedVertex;
++    XMFLOAT3 const selectedObjectVertex = objectVertices[static_cast<std::size_t>(selectedVertex)];
++
++    scene.inspection.object = {selectedObjectVertex.x, selectedObjectVertex.y, selectedObjectVertex.z, 1.0F};
+     scene.inspection.world = scene.worldVertices[static_cast<std::size_t>(selectedVertex)];
+     scene.inspection.view = scene.viewVertices[static_cast<std::size_t>(selectedVertex)];
+     scene.inspection.clip = scene.clipVertices[static_cast<std::size_t>(selectedVertex)];
+     scene.inspection.ndc = scene.ndcVertices[static_cast<std::size_t>(selectedVertex)];
+     scene.inspection.screen = scene.screenVertices[static_cast<std::size_t>(selectedVertex)];
+     scene.inspection.screenWithoutDivide = scene.inspection.screen;
++
+     scene.normalOriginWorld = {
+         scene.inspection.world.x,
+         scene.inspection.world.y,
+         scene.inspection.world.z,
+     };
++
+     scene.correctNormalWorld = kReferenceNormalObject;
+     scene.incorrectNormalWorld = kReferenceNormalObject;
+

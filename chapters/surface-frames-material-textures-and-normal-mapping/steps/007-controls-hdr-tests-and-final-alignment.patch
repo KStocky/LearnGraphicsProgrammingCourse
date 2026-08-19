@@ -1,0 +1,570 @@
+diff --git a/chapters/surface-frames-material-textures-and-normal-mapping/CMakeLists.txt b/chapters/surface-frames-material-textures-and-normal-mapping/CMakeLists.txt
+index 40a4f46..179c331 100644
+--- a/chapters/surface-frames-material-textures-and-normal-mapping/CMakeLists.txt
++++ b/chapters/surface-frames-material-textures-and-normal-mapping/CMakeLists.txt
+@@ -50,14 +50,25 @@ set_source_files_properties(
+     PROPERTIES
+         HEADER_FILE_ONLY TRUE)
+
+-add_library(ch06_surface_frames_starter_logic STATIC ${LGP_CH06_STARTER_SOURCES})
++add_library(
++    ch06_surface_frames_starter_logic
++    STATIC
++        ${LGP_CH06_STARTER_SOURCES}
++        "${LGP_CH06_IMGUI_DX12_BACKEND}")
+ target_link_libraries(
+     ch06_surface_frames_starter_logic
+     PUBLIC
++        DearImGui::DearImGui
+         LGP::Ch06SurfaceFrameContracts
+         LGP::Framework
+         Microsoft::DirectXMath)
+-target_include_directories(ch06_surface_frames_starter_logic PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}")
++target_include_directories(
++    ch06_surface_frames_starter_logic
++    PUBLIC
++        "${CMAKE_CURRENT_SOURCE_DIR}"
++        "${LGP_CH06_IMGUI_ROOT}"
++        "${LGP_CH06_IMGUI_ROOT}/backends")
++target_compile_definitions(ch06_surface_frames_starter_logic PRIVATE IMGUI_IMPL_WIN32_DISABLE_GAMEPAD)
+ set_target_properties(
+     ch06_surface_frames_starter_logic
+     PROPERTIES
+@@ -66,6 +77,7 @@ set_target_properties(
+         CXX_EXTENSIONS NO
+         FOLDER "Chapters/SurfaceFrames")
+ source_group(TREE "${CMAKE_CURRENT_SOURCE_DIR}" FILES ${LGP_CH06_STARTER_SOURCES})
++source_group("ThirdParty\\ImGuiBackends" FILES "${LGP_CH06_IMGUI_DX12_BACKEND}")
+
+ add_library(
+     ch06_surface_frames_solution_logic
+diff --git a/chapters/surface-frames-material-textures-and-normal-mapping/Starter/Main.cpp b/chapters/surface-frames-material-textures-and-normal-mapping/Starter/Main.cpp
+index 038690e..a6e3780 100644
+--- a/chapters/surface-frames-material-textures-and-normal-mapping/Starter/Main.cpp
++++ b/chapters/surface-frames-material-textures-and-normal-mapping/Starter/Main.cpp
+@@ -4,9 +4,9 @@
+
+ int wmain(int argc, wchar_t **argv)
+ {
+-    ch06::surface_frames::starter::Renderer renderer{};
++    ch06::surface_frames::solution::Renderer renderer{};
+     lgp::framework::ApplicationConfiguration configuration{};
+-    configuration.title = L"Ch06 Surface Frames Starter";
++    configuration.title = L"Ch06 Surface Frames Solution";
+     configuration.width = 1600U;
+     configuration.height = 900U;
+
+diff --git a/chapters/surface-frames-material-textures-and-normal-mapping/Starter/Renderer.cpp b/chapters/surface-frames-material-textures-and-normal-mapping/Starter/Renderer.cpp
+index d771ca9..11d6d9b 100644
+--- a/chapters/surface-frames-material-textures-and-normal-mapping/Starter/Renderer.cpp
++++ b/chapters/surface-frames-material-textures-and-normal-mapping/Starter/Renderer.cpp
+@@ -10,6 +10,8 @@
+
+ #include "../Common/ChapterGeometry.hpp"
+
++#include <imgui.h>
++#include <imgui_impl_dx12.h>
+ #include <wrl/client.h>
+
+ #include <DirectXMath.h>
+@@ -23,6 +25,7 @@
+ #include <cstring>
+ #include <filesystem>
+ #include <memory>
++#include <optional>
+ #include <span>
+ #include <string>
+ #include <utility>
+@@ -32,7 +35,7 @@
+ #include <lgp/framework/descriptors.hpp>
+ #include <lgp/framework/shader_compiler.hpp>
+
+-namespace ch06::surface_frames::starter
++namespace ch06::surface_frames::solution
+ {
+ namespace
+ {
+@@ -178,6 +181,31 @@ lgp::framework::TextureBarrierState constexpr kCopyDestinationState{
+     return static_cast<std::uint8_t>(std::clamp(std::lround(value * 255.0F), 0L, 255L));
+ }
+
++[[nodiscard]] bool UsesHdrDisplayTransform(std::uint32_t visualization) noexcept
++{
++    switch (static_cast<HeadlessVisualization>(visualization))
++    {
++    case HeadlessVisualization::Uv:
++    case HeadlessVisualization::GeometricNormal:
++    case HeadlessVisualization::InterpolatedNormal:
++    case HeadlessVisualization::MappedNormal:
++    case HeadlessVisualization::Tangent:
++    case HeadlessVisualization::Bitangent:
++    case HeadlessVisualization::Handedness:
++    case HeadlessVisualization::BaseColor:
++    case HeadlessVisualization::Roughness:
++    case HeadlessVisualization::Metalness:
++    case HeadlessVisualization::ObjectId:
++    case HeadlessVisualization::FiniteValidation:
++        return false;
++    case HeadlessVisualization::Final:
++    case HeadlessVisualization::Diffuse:
++    case HeadlessVisualization::Specular:
++    default:
++        return true;
++    }
++}
++
+ [[nodiscard]] TexturePixels GenerateMaterialTextures()
+ {
+     std::size_t const byteCount = static_cast<std::size_t>(kTextureSize) * kTextureSize * 4U;
+@@ -264,6 +292,7 @@ class Renderer::Impl final
+     lgp::framework::DescriptorAllocation hdrRtv{};
+     lgp::framework::DescriptorAllocation hdrSrv{};
+     lgp::framework::DescriptorAllocation materialSrvs{};
++    lgp::framework::DescriptorAllocation imguiFontDescriptor{};
+     ComPtr<ID3D12Resource> depthTarget{};
+     ComPtr<ID3D12Resource> hdrTarget{};
+     std::array<ComPtr<ID3D12Resource>, 3U> materialTextures{};
+@@ -276,6 +305,16 @@ class Renderer::Impl final
+     float orbitAzimuth{};
+     float orbitElevation{0.28F};
+     float orbitRadius{15.5F};
++    bool useBaseColorTexture{true};
++    bool usePackedMaterialTexture{true};
++    bool useNormalTexture{true};
++    bool invertNormalGreen{};
++    bool sampleBaseColorAsLinear{};
++    bool materialOverride{};
++    bool headless{};
++    bool imguiInitialized{};
++    bool imguiFrameBegun{};
++    std::optional<HeadlessTestConfiguration> headlessTest{};
+
+     [[nodiscard]] lgp::framework::Status Initialize(lgp::framework::ApplicationInitContext const &context);
+     [[nodiscard]] lgp::framework::Status CreateShaders();
+@@ -285,7 +324,9 @@ class Renderer::Impl final
+                                                            MeshBuffers &buffers);
+     [[nodiscard]] lgp::framework::Status CreateMaterialTextures();
+     [[nodiscard]] lgp::framework::Status CreateSizeDependentTargets(lgp::framework::Extent2D size);
++    [[nodiscard]] lgp::framework::Status InitializeImGui();
+     [[nodiscard]] lgp::framework::Status Update(lgp::framework::UpdateContext const &context);
++    [[nodiscard]] lgp::framework::Status BuildUi(lgp::framework::UpdateContext const &context);
+     [[nodiscard]] lgp::framework::Status Render(lgp::framework::FrameContext const &frameContext);
+     void DrawMesh(ID3D12GraphicsCommandList &commandList, MeshBuffers const &mesh,
+                   ObjectConstants const &object) const noexcept;
+@@ -616,8 +657,8 @@ lgp::framework::Status Renderer::Impl::CreateMaterialTextures()
+         source.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+         source.PlacedFootprint = footprints[textureIndex];
+         commandList->CopyTextureRegion(&destination, 0U, 0U, 0U, &source, nullptr);
+-        lgp::framework::TransitionTexture(*commandList.Get(), *materialTextures[textureIndex].Get(), kCopyDestinationState,
+-                                          kShaderResourceState);
++        lgp::framework::TransitionTexture(*commandList.Get(), *materialTextures[textureIndex].Get(),
++                                          kCopyDestinationState, kShaderResourceState);
+     }
+     HRESULT const closeResult = commandList->Close();
+     if (FAILED(closeResult))
+@@ -708,9 +749,39 @@ lgp::framework::Status Renderer::Impl::CreateSizeDependentTargets(lgp::framework
+     return {};
+ }
+
++lgp::framework::Status Renderer::Impl::InitializeImGui()
++{
++    auto descriptorResult = deviceResources->shader_visible_cbv_srv_uav_heap().Allocate(1U);
++    if (!descriptorResult)
++    {
++        return std::unexpected(std::move(descriptorResult.error()));
++    }
++    imguiFontDescriptor = descriptorResult.value();
++    IMGUI_CHECKVERSION();
++    ImGui::CreateContext();
++    ImGui::StyleColorsDark();
++    ImGui::GetIO().BackendPlatformName = "LGP.ManualInput";
++    ImGui_ImplDX12_InitInfo info{};
++    info.Device = deviceResources->device();
++    info.CommandQueue = deviceResources->graphics_queue();
++    info.NumFramesInFlight = static_cast<int>(deviceResources->back_buffer_count());
++    info.RTVFormat = deviceResources->back_buffer_format();
++    info.DSVFormat = kDepthFormat;
++    info.SrvDescriptorHeap = deviceResources->shader_visible_cbv_srv_uav_heap().Get();
++    info.LegacySingleSrvCpuDescriptor = imguiFontDescriptor.cpuHandle;
++    info.LegacySingleSrvGpuDescriptor = imguiFontDescriptor.gpuHandle;
++    if (!ImGui_ImplDX12_Init(&info))
++    {
++        return std::unexpected(lgp::framework::MakeError("ImGui_ImplDX12_Init", "Failed to initialize the lab UI."));
++    }
++    imguiInitialized = true;
++    return {};
++}
++
+ lgp::framework::Status Renderer::Impl::Initialize(lgp::framework::ApplicationInitContext const &context)
+ {
+     deviceResources = &context.deviceResources;
++    headless = context.commandLine.headless;
+     auto sphereResult = GenerateUvSphere(0.72F, 24U, 48U);
+     auto planeResult = GenerateGroundPlane(18.0F, 14.0F);
+     if (!sphereResult || !planeResult)
+@@ -777,18 +848,32 @@ lgp::framework::Status Renderer::Impl::Initialize(lgp::framework::ApplicationIni
+     {
+         return status;
+     }
++    if (!headless)
++    {
++        return InitializeImGui();
++    }
+     return {};
+ }
+
+ lgp::framework::Status Renderer::Impl::Update(lgp::framework::UpdateContext const &context)
+ {
+-    if (context.input.mouse.IsButtonDown(lgp::framework::MouseButton::Right))
++    if (headless && headlessTest.has_value())
++    {
++        HeadlessTestConfiguration const &test = *headlessTest;
++        orbitAzimuth = test.cameraAzimuth;
++        orbitElevation = std::clamp(test.cameraElevation, -0.15F, 1.15F);
++        orbitRadius = std::clamp(test.cameraDistance, 8.0F, 24.0F);
++    }
++    if (!headless && context.input.mouse.IsButtonDown(lgp::framework::MouseButton::Right))
+     {
+         orbitAzimuth += static_cast<float>(context.input.mouse.deltaX) * 0.006F;
+         orbitElevation =
+             std::clamp(orbitElevation - (static_cast<float>(context.input.mouse.deltaY) * 0.006F), -0.15F, 1.15F);
+     }
+-    orbitRadius = std::clamp(orbitRadius - context.input.mouse.wheelDelta, 8.0F, 24.0F);
++    if (!headless)
++    {
++        orbitRadius = std::clamp(orbitRadius - context.input.mouse.wheelDelta, 8.0F, 24.0F);
++    }
+     float const horizontalRadius = orbitRadius * std::cos(orbitElevation);
+     DirectX::XMFLOAT3 const cameraPosition{
+         horizontalRadius * std::sin(orbitAzimuth),
+@@ -804,15 +889,107 @@ lgp::framework::Status Renderer::Impl::Update(lgp::framework::UpdateContext cons
+     DirectX::XMMATRIX const projection = DirectX::XMMatrixPerspectiveFovLH(0.78F, aspect, 0.1F, 100.0F);
+     DirectX::XMStoreFloat4x4(&lighting.viewProjection, view * projection);
+     lighting.cameraPosition = cameraPosition;
+-    lighting.lightType = 0U;
+     lighting.directionToLight = NormalizeDirection(lightDirection);
+-    lighting.intensity = directionalLux;
++    lighting.intensity = lighting.lightType == 0U ? directionalLux : pointCandela;
+     lighting.lightPosition = {
+         lighting.directionToLight.x * lightDistance,
+         1.2F + (lighting.directionToLight.y * lightDistance),
+         lighting.directionToLight.z * lightDistance,
+     };
+-    lighting.materialFlags = 7U;
++    lighting.materialFlags = (useBaseColorTexture ? 1U : 0U) | (usePackedMaterialTexture ? 2U : 0U) |
++                             (useNormalTexture ? 4U : 0U) | (sampleBaseColorAsLinear ? 8U : 0U) |
++                             (materialOverride ? 16U : 0U);
++    lighting.invertNormalGreen = invertNormalGreen ? 1U : 0U;
++    lighting.normalStrength = std::clamp(lighting.normalStrength, 0.0F, 1.0F);
++    if (headless && headlessTest.has_value())
++    {
++        HeadlessTestConfiguration const &test = *headlessTest;
++        lighting.visualization = static_cast<std::uint32_t>(test.visualization);
++        lighting.materialFlags = (test.useBaseColorTexture ? 1U : 0U) | (test.usePackedMaterialTexture ? 2U : 0U) |
++                                 (test.useNormalTexture ? 4U : 0U) | (test.sampleBaseColorAsLinear ? 8U : 0U) |
++                                 (test.overrideMaterial ? 16U : 0U);
++        lighting.invertNormalGreen = test.invertNormalGreen ? 1U : 0U;
++        lighting.overrideNormalSample = test.overrideNormalSample ? 1U : 0U;
++        lighting.normalStrength = std::clamp(test.normalStrength, 0.0F, 1.0F);
++        lighting.overrideNormal = {
++            std::clamp(test.normalSampleR, 0.0F, 1.0F),
++            std::clamp(test.normalSampleG, 0.0F, 1.0F),
++            std::clamp(test.normalSampleB, 0.0F, 1.0F),
++        };
++        lighting.overrideBaseColor = {
++            std::clamp(test.baseColorR, 0.0F, 1.0F),
++            std::clamp(test.baseColorG, 0.0F, 1.0F),
++            std::clamp(test.baseColorB, 0.0F, 1.0F),
++        };
++        lighting.overrideRoughness = std::clamp(test.roughness, 0.0F, 1.0F);
++        lighting.overrideMetalness = std::clamp(test.metalness, 0.0F, 1.0F);
++        lighting.directionToLight =
++            NormalizeDirection({test.directionToLightX, test.directionToLightY, test.directionToLightZ});
++        lighting.intensity = std::max(test.lightIntensity, 0.0F);
++        output.exposure = test.exposure;
++    }
++    return {};
++}
++
++lgp::framework::Status Renderer::Impl::BuildUi(lgp::framework::UpdateContext const &context)
++{
++    if (headless || !imguiInitialized)
++    {
++        return {};
++    }
++    ImGuiIO &io = ImGui::GetIO();
++    io.DisplaySize = {static_cast<float>(context.drawableSize.width), static_cast<float>(context.drawableSize.height)};
++    io.DeltaTime = static_cast<float>(std::max(context.deltaSeconds, 1.0 / 240.0));
++    io.AddMousePosEvent(static_cast<float>(context.input.mouse.x), static_cast<float>(context.input.mouse.y));
++    io.AddMouseButtonEvent(0, context.input.mouse.IsButtonDown(lgp::framework::MouseButton::Left));
++    io.AddMouseButtonEvent(1, context.input.mouse.IsButtonDown(lgp::framework::MouseButton::Right));
++    io.AddMouseWheelEvent(0.0F, context.input.mouse.wheelDelta);
++    ImGui_ImplDX12_NewFrame();
++    ImGui::NewFrame();
++    imguiFrameBegun = true;
++
++    ImGui::Begin("Surface frames and material textures");
++    ImGui::Checkbox("Base-color texture", &useBaseColorTexture);
++    ImGui::Checkbox("Roughness / metalness texture", &usePackedMaterialTexture);
++    ImGui::Checkbox("Normal texture", &useNormalTexture);
++    ImGui::SliderFloat("Normal strength", &lighting.normalStrength, 0.0F, 1.0F, "%.2f");
++    ImGui::Checkbox("Invert normal green channel", &invertNormalGreen);
++    ImGui::Checkbox("Interpret base-color bytes as linear", &sampleBaseColorAsLinear);
++    ImGui::Separator();
++    ImGui::Checkbox("Override sampled material", &materialOverride);
++    ImGui::ColorEdit3("Override base color", &lighting.overrideBaseColor.x);
++    ImGui::SliderFloat("Override roughness", &lighting.overrideRoughness, 0.0F, 1.0F);
++    ImGui::SliderFloat("Override metalness", &lighting.overrideMetalness, 0.0F, 1.0F);
++    ImGui::Separator();
++    int lightType = static_cast<int>(lighting.lightType);
++    ImGui::Combo("Light type", &lightType, "Directional\0Point\0");
++    lighting.lightType = static_cast<std::uint32_t>(lightType);
++    if (lighting.lightType == 0U)
++    {
++        ImGui::SliderFloat("Normal illuminance", &directionalLux, 0.0F, 10000.0F, "%.0f lux");
++    }
++    else
++    {
++        ImGui::SliderFloat("Luminous intensity", &pointCandela, 0.0F, 20000.0F, "%.0f cd");
++        ImGui::SliderFloat("Light distance", &lightDistance, 2.0F, 15.0F, "%.2f m");
++    }
++    ImGui::SliderFloat3("Direction to light", &lightDirection.x, -1.0F, 1.0F);
++    ImGui::ColorEdit3("Light tint", &lighting.lightColor.x);
++    ImGui::SliderFloat("Exposure", &output.exposure, -10.0F, 4.0F, "%.2f EV");
++    ImGui::SliderAngle("Camera azimuth", &orbitAzimuth, -180.0F, 180.0F);
++    ImGui::SliderAngle("Camera elevation", &orbitElevation, -8.0F, 66.0F);
++    ImGui::SliderFloat("Camera distance", &orbitRadius, 8.0F, 24.0F, "%.2f m");
++    int visualization = static_cast<int>(lighting.visualization);
++    ImGui::Combo("Debug output", &visualization,
++                 "Final shading\0UV (R=U, G=V)\0Geometric normal (-1..1 encoded 0..1)\0Interpolated normal "
++                 "(-1..1 encoded 0..1)\0Mapped normal (-1..1 encoded 0..1)\0Tangent (-1..1 encoded "
++                 "0..1)\0Bitangent (-1..1 encoded 0..1)\0Handedness (red=-1, blue=+1)\0Base color (linear "
++                 "0..1)\0Roughness (0..1)\0Metalness (0..1)\0Diffuse HDR\0Specular HDR\0");
++    lighting.visualization = static_cast<std::uint32_t>(visualization);
++    ImGui::TextWrapped("The plane and every sphere contain mirrored UV islands. Green seam bands and the handedness "
++                       "view make the split explicit; correct tangent.w handling keeps mapped bumps continuous.");
++    ImGui::TextWrapped("Right-drag orbits the camera; the wheel dollies.");
++    ImGui::End();
+     return {};
+ }
+
+@@ -831,6 +1008,11 @@ lgp::framework::Status Renderer::Impl::Render(lgp::framework::FrameContext const
+     if (frameContext.commandList == nullptr || frameContext.renderTarget == nullptr || hdrTarget == nullptr ||
+         depthTarget == nullptr)
+     {
++        if (imguiFrameBegun)
++        {
++            ImGui::EndFrame();
++            imguiFrameBegun = false;
++        }
+         return {};
+     }
+     ID3D12GraphicsCommandList7 &commandList = *frameContext.commandList;
+@@ -859,28 +1041,41 @@ lgp::framework::Status Renderer::Impl::Render(lgp::framework::FrameContext const
+     object.metalness = 0.0F;
+     object.dielectricF0 = {0.04F, 0.04F, 0.04F};
+     object.objectId = 1U;
+-    DrawMesh(commandList, plane, object);
++    HeadlessScene const scene = headless && headlessTest.has_value() ? headlessTest->scene : HeadlessScene::Full;
++    if (scene == HeadlessScene::Full || scene == HeadlessScene::GroundOnly)
++    {
++        DrawMesh(commandList, plane, object);
++    }
+     object.translation = {-1.9F, 0.75F, 0.5F};
+     object.uvScale = 1.0F;
+     object.baseColor = {0.72F, 0.12F, 0.055F};
+     object.roughness = 0.28F;
+     object.metalness = 0.0F;
+     object.objectId = 2U;
+-    DrawMesh(commandList, sphere, object);
++    if (scene == HeadlessScene::Full)
++    {
++        DrawMesh(commandList, sphere, object);
++    }
+
+     object.translation = {0.0F, 0.75F, 0.5F};
+     object.baseColor = {0.95F, 0.64F, 0.18F};
+     object.roughness = 0.22F;
+     object.metalness = 1.0F;
+     object.objectId = 3U;
+-    DrawMesh(commandList, sphere, object);
++    if (scene == HeadlessScene::Full || scene == HeadlessScene::CenterSphereOnly)
++    {
++        DrawMesh(commandList, sphere, object);
++    }
+
+     object.translation = {1.9F, 0.75F, 0.5F};
+     object.baseColor = {0.08F, 0.32F, 0.82F};
+     object.roughness = 0.68F;
+     object.metalness = 0.0F;
+     object.objectId = 4U;
+-    DrawMesh(commandList, sphere, object);
++    if (scene == HeadlessScene::Full)
++    {
++        DrawMesh(commandList, sphere, object);
++    }
+
+     lgp::framework::TransitionTexture(commandList, *hdrTarget.Get(), kRenderTargetState, kShaderResourceState);
+
+@@ -890,11 +1085,17 @@ lgp::framework::Status Renderer::Impl::Render(lgp::framework::FrameContext const
+     commandList.OMSetRenderTargets(1U, &frameContext.renderTargetView, FALSE, nullptr);
+     commandList.ClearRenderTargetView(frameContext.renderTargetView, displayClear, 0U, nullptr);
+     commandList.SetPipelineState(displayPipeline.Get());
+-    output.applyHdrDisplayTransform = 1U;
++    output.applyHdrDisplayTransform = UsesHdrDisplayTransform(lighting.visualization) ? 1U : 0U;
+     commandList.SetGraphicsRoot32BitConstants(OutputRootConstants, sizeof(OutputConstants) / sizeof(std::uint32_t),
+                                               &output, 0U);
+     commandList.SetGraphicsRootDescriptorTable(HdrTexture, hdrSrv.gpuHandle);
+     commandList.DrawInstanced(3U, 1U, 0U, 0U);
++    if (imguiFrameBegun)
++    {
++        ImGui::Render();
++        ImGui_ImplDX12_RenderDrawData(ImGui::GetDrawData(), &commandList);
++        imguiFrameBegun = false;
++    }
+     lgp::framework::TransitionTexture(commandList, *frameContext.renderTarget, kRenderTargetState,
+                                       FrameEndState(frameContext));
+     return {};
+@@ -902,6 +1103,21 @@ lgp::framework::Status Renderer::Impl::Render(lgp::framework::FrameContext const
+
+ void Renderer::Impl::Shutdown() noexcept
+ {
++    if (imguiFrameBegun)
++    {
++        ImGui::EndFrame();
++        imguiFrameBegun = false;
++    }
++    if (imguiInitialized)
++    {
++        ImGui_ImplDX12_Shutdown();
++        ImGui::DestroyContext();
++        imguiInitialized = false;
++    }
++    if (deviceResources != nullptr && imguiFontDescriptor)
++    {
++        deviceResources->shader_visible_cbv_srv_uav_heap().Free(imguiFontDescriptor);
++    }
+     depthTarget.Reset();
+     hdrTarget.Reset();
+     for (ComPtr<ID3D12Resource> &texture : materialTextures)
+@@ -928,6 +1144,7 @@ void Renderer::Impl::Shutdown() noexcept
+     hdrRtv = {};
+     hdrSrv = {};
+     materialSrvs = {};
++    imguiFontDescriptor = {};
+     dsvHeap = {};
+     sphere = {};
+     plane = {};
+@@ -957,6 +1174,11 @@ lgp::framework::Status Renderer::Update(lgp::framework::UpdateContext const &con
+     return impl_->Update(context);
+ }
+
++lgp::framework::Status Renderer::BuildUi(lgp::framework::UpdateContext const &context)
++{
++    return impl_->BuildUi(context);
++}
++
+ lgp::framework::Status Renderer::Render(lgp::framework::FrameContext const &frameContext)
+ {
+     return impl_->Render(frameContext);
+@@ -967,4 +1189,9 @@ void Renderer::Shutdown(lgp::framework::DeviceResources &) noexcept
+     impl_->Shutdown();
+ }
+
+-} // namespace ch06::surface_frames::starter
++void Renderer::ConfigureHeadlessTest(HeadlessTestConfiguration const &configuration) noexcept
++{
++    impl_->headlessTest = configuration;
++}
++
++} // namespace ch06::surface_frames::solution
+diff --git a/chapters/surface-frames-material-textures-and-normal-mapping/Starter/Renderer.hpp b/chapters/surface-frames-material-textures-and-normal-mapping/Starter/Renderer.hpp
+index 65effda..37e4128 100644
+--- a/chapters/surface-frames-material-textures-and-normal-mapping/Starter/Renderer.hpp
++++ b/chapters/surface-frames-material-textures-and-normal-mapping/Starter/Renderer.hpp
+@@ -2,11 +2,68 @@
+
+ #include <lgp/framework/application.hpp>
+
++#include <cstdint>
+ #include <memory>
+
+-namespace ch06::surface_frames::starter
++namespace ch06::surface_frames::solution
+ {
+
++enum class HeadlessVisualization : std::uint32_t
++{
++    Final = 0U,
++    Uv = 1U,
++    GeometricNormal = 2U,
++    InterpolatedNormal = 3U,
++    MappedNormal = 4U,
++    Tangent = 5U,
++    Bitangent = 6U,
++    Handedness = 7U,
++    BaseColor = 8U,
++    Roughness = 9U,
++    Metalness = 10U,
++    Diffuse = 11U,
++    Specular = 12U,
++    ObjectId = 13U,
++    FiniteValidation = 14U,
++};
++
++enum class HeadlessScene : std::uint32_t
++{
++    Full = 0U,
++    GroundOnly = 1U,
++    CenterSphereOnly = 2U,
++};
++
++struct HeadlessTestConfiguration final
++{
++    HeadlessVisualization visualization{HeadlessVisualization::Final};
++    HeadlessScene scene{HeadlessScene::Full};
++    bool useBaseColorTexture{true};
++    bool usePackedMaterialTexture{true};
++    bool useNormalTexture{true};
++    bool invertNormalGreen{false};
++    bool sampleBaseColorAsLinear{false};
++    bool overrideMaterial{false};
++    bool overrideNormalSample{false};
++    float normalStrength{1.0F};
++    float normalSampleR{0.5F};
++    float normalSampleG{0.5F};
++    float normalSampleB{1.0F};
++    float baseColorR{0.72F};
++    float baseColorG{0.18F};
++    float baseColorB{0.08F};
++    float roughness{0.45F};
++    float metalness{};
++    float directionToLightX{-0.45F};
++    float directionToLightY{0.82F};
++    float directionToLightZ{-0.35F};
++    float lightIntensity{1200.0F};
++    float cameraAzimuth{};
++    float cameraElevation{0.28F};
++    float cameraDistance{15.5F};
++    float exposure{-4.0F};
++};
++
+ class Renderer final : public lgp::framework::IChapterRenderer
+ {
+   public:
+@@ -22,12 +79,14 @@ class Renderer final : public lgp::framework::IChapterRenderer
+     [[nodiscard]] lgp::framework::Status OnResize(lgp::framework::DeviceResources &deviceResources,
+                                                   lgp::framework::Extent2D drawableSize) override;
+     [[nodiscard]] lgp::framework::Status Update(lgp::framework::UpdateContext const &context) override;
++    [[nodiscard]] lgp::framework::Status BuildUi(lgp::framework::UpdateContext const &context) override;
+     [[nodiscard]] lgp::framework::Status Render(lgp::framework::FrameContext const &frameContext) override;
+     void Shutdown(lgp::framework::DeviceResources &deviceResources) noexcept override;
++    void ConfigureHeadlessTest(HeadlessTestConfiguration const &configuration) noexcept;
+
+   private:
+     class Impl;
+     std::unique_ptr<Impl> impl_;
+ };
+
+-} // namespace ch06::surface_frames::starter
++} // namespace ch06::surface_frames::solution

@@ -1,0 +1,322 @@
+From 92afc5f19643ce69ebf56f640df14b5cbd28e792 Mon Sep 17 00:00:00 2001
+From: Copilot <copilot@example.com>
+Date: Mon, 17 Aug 2026 08:06:20 +0100
+Subject: [PATCH 5/5] Stage 5 final alignment
+
+---
+ .../CMakeLists.txt                            |  12 ++
+ .../Starter/Main.cpp                          |   2 +-
+ .../Starter/Renderer.cpp                      | 165 +++++++++++++++++-
+ .../Starter/Renderer.hpp                      |   1 +
+ 4 files changed, 177 insertions(+), 3 deletions(-)
+
+diff --git a/chapters/gbuffer-and-deferred-shading/CMakeLists.txt b/chapters/gbuffer-and-deferred-shading/CMakeLists.txt
+index f9e1982..6308c7c 100644
+--- a/chapters/gbuffer-and-deferred-shading/CMakeLists.txt
++++ b/chapters/gbuffer-and-deferred-shading/CMakeLists.txt
+@@ -72,6 +72,7 @@ set_target_properties(
+         CXX_EXTENSIONS NO
+         FOLDER "Chapters/GBuffer")
+ source_group(TREE "${CMAKE_CURRENT_SOURCE_DIR}" FILES ${LGP_CH12_STARTER_SOURCES})
++source_group("ThirdParty\\\\ImGuiBackends" FILES "${LGP_CH12_IMGUI_DX12_BACKEND}")
+ 
+ get_target_property(LGP_CH12_IMGUI_INCLUDE_DIRS DearImGui::DearImGui INTERFACE_INCLUDE_DIRECTORIES)
+ list(GET LGP_CH12_IMGUI_INCLUDE_DIRS 0 LGP_CH12_IMGUI_ROOT)
+@@ -86,6 +87,16 @@ elseif(MSVC)
+     set_source_files_properties("${LGP_CH12_IMGUI_DX12_BACKEND}" PROPERTIES COMPILE_FLAGS "/wd4189")
+ endif()
+ 
++target_sources(ch12_gbuffer_starter_logic PRIVATE "${LGP_CH12_IMGUI_DX12_BACKEND}")
++target_link_libraries(ch12_gbuffer_starter_logic PUBLIC DearImGui::DearImGui)
++target_include_directories(
++    ch12_gbuffer_starter_logic
++    PUBLIC
++        "${LGP_CH12_IMGUI_ROOT}"
++        "${LGP_CH12_IMGUI_ROOT}/backends")
++target_compile_definitions(ch12_gbuffer_starter_logic PRIVATE IMGUI_IMPL_WIN32_DISABLE_GAMEPAD)
++source_group("ThirdParty\\ImGuiBackends" FILES "${LGP_CH12_IMGUI_DX12_BACKEND}")
++
+ add_library(
+     ch12_gbuffer_solution_logic
+     STATIC
+@@ -126,6 +137,7 @@ set_target_properties(
+ source_group(TREE "${CMAKE_CURRENT_SOURCE_DIR}" FILES "${CMAKE_CURRENT_SOURCE_DIR}/Starter/Main.cpp")
+ lgp_configure_framework_chapter_app(
+     TARGET Ch12_GBufferDeferred_Starter
++    ENABLE_IMGUI
+     EXTRA_DEPENDENCIES ch12_gbuffer_starter_logic)
+ 
+ add_executable(Ch12_GBufferDeferred_Solution "${CMAKE_CURRENT_SOURCE_DIR}/Solution/Main.cpp")
+diff --git a/chapters/gbuffer-and-deferred-shading/Starter/Main.cpp b/chapters/gbuffer-and-deferred-shading/Starter/Main.cpp
+index 2a87368..f993389 100644
+--- a/chapters/gbuffer-and-deferred-shading/Starter/Main.cpp
++++ b/chapters/gbuffer-and-deferred-shading/Starter/Main.cpp
+@@ -7,7 +7,7 @@ int wmain(int argc, wchar_t **argv)
+     ch12::gbuffer::solution::Renderer renderer{};
+ 
+     lgp::framework::ApplicationConfiguration configuration{};
+-    configuration.title = L"Ch12 G-buffer and Deferred Shading Starter";
++    configuration.title = L"Ch12 G-buffer and Deferred Shading Solution";
+     configuration.width = 1600U;
+     configuration.height = 900U;
+     configuration.enableDebugLayer = false;
+diff --git a/chapters/gbuffer-and-deferred-shading/Starter/Renderer.cpp b/chapters/gbuffer-and-deferred-shading/Starter/Renderer.cpp
+index c7ab968..4a337c7 100644
+--- a/chapters/gbuffer-and-deferred-shading/Starter/Renderer.cpp
++++ b/chapters/gbuffer-and-deferred-shading/Starter/Renderer.cpp
+@@ -13,6 +13,9 @@
+ #include <ChapterGeometry.hpp>
+ #include <SurfaceFrame.hpp>
+ 
++#include <imgui.h>
++#include <imgui_impl_dx12.h>
++
+ #include <DirectXMath.h>
+ #include <d3d12.h>
+ #include <wrl/client.h>
+@@ -299,11 +302,16 @@ class Renderer::Impl final
+     MeshBuffers ground_{};
+     MeshBuffers quad_{};
+     lgp::framework::DescriptorHeap dsvHeap_{};
++    lgp::framework::DescriptorAllocation imguiFontDescriptor_{};
+     std::vector<FrameSlotResources> frameSlots_{};
+     SceneState sceneState_{};
+     std::optional<HeadlessTestConfiguration> headlessConfiguration_{};
++    DepthConvention uiDepthConvention_{DepthConvention::Forward};
++    gpu::DebugView uiDebugView_{gpu::DebugView::Final};
+     UINT lastRenderedFrameSlot_{0U};
+     bool headless_{false};
++    bool imguiInitialized_{false};
++    bool imguiFrameBegun_{false};
+ 
+     [[nodiscard]] lgp::framework::Status Initialize(lgp::framework::ApplicationInitContext const &context);
+     [[nodiscard]] lgp::framework::Status CreateShaders();
+@@ -314,7 +322,9 @@ class Renderer::Impl final
+     [[nodiscard]] lgp::framework::Status CreateMeshBuffers(GeometryMesh const &mesh, std::wstring_view name,
+                                                            MeshBuffers &buffers);
+     [[nodiscard]] lgp::framework::Status CreateSizeDependentResources(lgp::framework::Extent2D drawableSize);
++    [[nodiscard]] lgp::framework::Status InitializeImGui();
+     [[nodiscard]] lgp::framework::Status Update(lgp::framework::UpdateContext const &context);
++    [[nodiscard]] lgp::framework::Status BuildUi(lgp::framework::UpdateContext const &context);
+     [[nodiscard]] lgp::framework::Status Render(lgp::framework::FrameContext const &frameContext);
+     [[nodiscard]] std::expected<ReadbackOutputs, lgp::framework::Error> ReadBackOutputs() const;
+     void ReleaseSizeDependentResources() noexcept;
+@@ -743,6 +753,38 @@ lgp::framework::Status Renderer::Impl::CreateSizeDependentResources(lgp::framewo
+     return {};
+ }
+ 
++lgp::framework::Status Renderer::Impl::InitializeImGui()
++{
++    auto descriptorResult = deviceResources_->shader_visible_cbv_srv_uav_heap().Allocate(1U);
++    if (!descriptorResult)
++    {
++        return std::unexpected(std::move(descriptorResult.error()));
++    }
++    imguiFontDescriptor_ = *descriptorResult;
++
++    IMGUI_CHECKVERSION();
++    ImGui::CreateContext();
++    ImGui::StyleColorsDark();
++    ImGui::GetIO().BackendPlatformName = "LGP.ManualInput";
++
++    ImGui_ImplDX12_InitInfo info{};
++    info.Device = deviceResources_->device();
++    info.CommandQueue = deviceResources_->graphics_queue();
++    info.NumFramesInFlight = static_cast<int>(deviceResources_->back_buffer_count());
++    info.RTVFormat = deviceResources_->back_buffer_format();
++    info.DSVFormat = gpu::kDepthDsvFormat;
++    info.SrvDescriptorHeap = deviceResources_->shader_visible_cbv_srv_uav_heap().Get();
++    info.LegacySingleSrvCpuDescriptor = imguiFontDescriptor_.cpuHandle;
++    info.LegacySingleSrvGpuDescriptor = imguiFontDescriptor_.gpuHandle;
++    if (!ImGui_ImplDX12_Init(&info))
++    {
++        return std::unexpected(
++            lgp::framework::MakeError("ImGui_ImplDX12_Init", "Failed to initialize the Chapter 12 diagnostics UI."));
++    }
++    imguiInitialized_ = true;
++    return {};
++}
++
+ lgp::framework::Status Renderer::Impl::Initialize(lgp::framework::ApplicationInitContext const &context)
+ {
+     deviceResources_ = &context.deviceResources;
+@@ -789,21 +831,112 @@ lgp::framework::Status Renderer::Impl::Initialize(lgp::framework::ApplicationIni
+     {
+         return status;
+     }
+-    return CreateSizeDependentResources(context.drawableSize);
++    if (auto status = CreateSizeDependentResources(context.drawableSize); !status)
++    {
++        return status;
++    }
++    if (!headless_)
++    {
++        return InitializeImGui();
++    }
++    return {};
+ }
+ 
+ lgp::framework::Status Renderer::Impl::Update(lgp::framework::UpdateContext const &)
+ {
+-    sceneState_ = MakeSceneState(headless_, headlessConfiguration_, DepthConvention::Forward, gpu::DebugView::Final);
++    sceneState_ = MakeSceneState(headless_, headlessConfiguration_, uiDepthConvention_, uiDebugView_);
+     sceneState_.directionToLightWorld = Normalize(sceneState_.directionToLightWorld);
+     return {};
+ }
+ 
++lgp::framework::Status Renderer::Impl::BuildUi(lgp::framework::UpdateContext const &context)
++{
++    if (headless_ || !imguiInitialized_)
++    {
++        return {};
++    }
++
++    ImGuiIO &io = ImGui::GetIO();
++    io.DisplaySize = {static_cast<float>(context.drawableSize.width), static_cast<float>(context.drawableSize.height)};
++    io.DeltaTime = static_cast<float>(std::max(context.deltaSeconds, 1.0 / 240.0));
++    io.AddMousePosEvent(static_cast<float>(context.input.mouse.x), static_cast<float>(context.input.mouse.y));
++    io.AddMouseButtonEvent(0, context.input.mouse.IsButtonDown(lgp::framework::MouseButton::Left));
++    io.AddMouseButtonEvent(1, context.input.mouse.IsButtonDown(lgp::framework::MouseButton::Right));
++    io.AddMouseWheelEvent(0.0F, context.input.mouse.wheelDelta);
++
++    ImGui_ImplDX12_NewFrame();
++    ImGui::NewFrame();
++    imguiFrameBegun_ = true;
++
++    ImGui::Begin("Chapter 12 G-buffer diagnostics");
++    int depthMode = static_cast<int>(uiDepthConvention_);
++    ImGui::Combo("Depth mode", &depthMode, DepthModeItems());
++    uiDepthConvention_ = depthMode == 0 ? DepthConvention::Forward : DepthConvention::Reversed;
++
++    int debugView = static_cast<int>(uiDebugView_);
++    ImGui::Combo("Debug view", &debugView, DebugViewComboItems());
++    uiDebugView_ = static_cast<gpu::DebugView>(debugView);
++
++    std::array<AttachmentStorage, 4U> const coreAttachments{
++        AttachmentStorage{AttachmentSemantic::BaseColorMetalness, 4U},
++        AttachmentStorage{AttachmentSemantic::OctahedralNormal, 4U},
++        AttachmentStorage{AttachmentSemantic::Roughness, 1U},
++        AttachmentStorage{AttachmentSemantic::DeviceDepth, 4U},
++    };
++    std::array<AttachmentStorage, 6U> const fullAttachments{
++        AttachmentStorage{AttachmentSemantic::BaseColorMetalness, 4U},
++        AttachmentStorage{AttachmentSemantic::OctahedralNormal, 4U},
++        AttachmentStorage{AttachmentSemantic::Roughness, 1U},
++        AttachmentStorage{AttachmentSemantic::DeviceDepth, 4U},
++        AttachmentStorage{AttachmentSemantic::Motion, 4U},
++        AttachmentStorage{AttachmentSemantic::Identity, 4U},
++    };
++    auto const coreTraffic =
++        ComputeLogicalTraffic(context.drawableSize.width, context.drawableSize.height, coreAttachments);
++    auto const fullTraffic =
++        ComputeLogicalTraffic(context.drawableSize.width, context.drawableSize.height, fullAttachments);
++
++    ImGui::SeparatorText("Attachments");
++    ImGui::BulletText("BaseColor+Metalness: R8G8B8A8_TYPELESS, RTV/SRV = R8G8B8A8_UNORM_SRGB");
++    ImGui::BulletText("Oct Normal: R16G16_UNORM");
++    ImGui::BulletText("Roughness: R8_UNORM");
++    ImGui::BulletText("Depth: R32_TYPELESS with D32_FLOAT DSV and R32_FLOAT SRV");
++    ImGui::BulletText("Motion: R16G16_FLOAT");
++    ImGui::BulletText("Identity: R32_UINT (0 reserved for invalid/background)");
++
++    ImGui::SeparatorText("Nominal payload accounting");
++    ImGui::TextWrapped("These numbers are logical chapter payload bytes per pixel, not hardware bandwidth claims.");
++    ImGui::Text("Core G-buffer bytes/pixel: 13");
++    ImGui::Text("With motion + identity bytes/pixel: 21");
++    if (coreTraffic)
++    {
++        ImGui::Text("Core resident bytes: %llu", static_cast<unsigned long long>(coreTraffic->residentBytes));
++    }
++    if (fullTraffic)
++    {
++        ImGui::Text("Full resident bytes: %llu", static_cast<unsigned long long>(fullTraffic->residentBytes));
++        ImGui::Text("Full raster write bytes: %llu", static_cast<unsigned long long>(fullTraffic->rasterWriteBytes));
++        ImGui::Text("Full deferred read bytes: %llu", static_cast<unsigned long long>(fullTraffic->deferredReadBytes));
++        ImGui::Text("Full total payload bytes: %llu", static_cast<unsigned long long>(fullTraffic->totalPayloadBytes));
++    }
++
++    ImGui::SeparatorText("Notes");
++    ImGui::TextWrapped("Deferred reads use Texture.Load exact-pixel fetches. Motion and identity stay visible for the "
++                       "Chapter 11 connection, but this lab does not accumulate temporal history.");
++    ImGui::End();
++    return {};
++}
++
+ lgp::framework::Status Renderer::Impl::Render(lgp::framework::FrameContext const &frameContext)
+ {
+     if (frameContext.commandList == nullptr || frameContext.renderTarget == nullptr ||
+         frameContext.frameSlot >= frameSlots_.size())
+     {
++        if (imguiFrameBegun_)
++        {
++            ImGui::EndFrame();
++            imguiFrameBegun_ = false;
++        }
+         return {};
+     }
+ 
+@@ -970,6 +1103,13 @@ lgp::framework::Status Renderer::Impl::Render(lgp::framework::FrameContext const
+     commandList.SetGraphicsRootDescriptorTable(GBufferSrvTable, slot.srvs.gpuHandle);
+     commandList.DrawInstanced(3U, 1U, 0U, 0U);
+ 
++    if (imguiFrameBegun_)
++    {
++        ImGui::Render();
++        ImGui_ImplDX12_RenderDrawData(ImGui::GetDrawData(), &commandList);
++        imguiFrameBegun_ = false;
++    }
++
+     barriers.clear();
+     barriers.push_back(gpu::MakeTextureBarrier(*slot.textures[TextureIndex(AttachmentIndex::BaseColorMetalness)].Get(),
+                                                gpu::DirectQueueShaderResourceState(), gpu::CommonState()));
+@@ -1061,7 +1201,23 @@ std::expected<Renderer::ReadbackOutputs, lgp::framework::Error> Renderer::Impl::
+ 
+ void Renderer::Impl::Shutdown() noexcept
+ {
++    if (imguiFrameBegun_)
++    {
++        ImGui::EndFrame();
++        imguiFrameBegun_ = false;
++    }
++    if (imguiInitialized_)
++    {
++        ImGui_ImplDX12_Shutdown();
++        ImGui::DestroyContext();
++        imguiInitialized_ = false;
++    }
+     ReleaseSizeDependentResources();
++    if (deviceResources_ != nullptr && imguiFontDescriptor_)
++    {
++        deviceResources_->shader_visible_cbv_srv_uav_heap().Free(imguiFontDescriptor_);
++    }
++    imguiFontDescriptor_ = {};
+     dsvHeap_ = {};
+     quad_ = {};
+     ground_ = {};
+@@ -1094,6 +1250,11 @@ lgp::framework::Status Renderer::Update(lgp::framework::UpdateContext const &con
+     return impl_->Update(context);
+ }
+ 
++lgp::framework::Status Renderer::BuildUi(lgp::framework::UpdateContext const &context)
++{
++    return impl_->BuildUi(context);
++}
++
+ lgp::framework::Status Renderer::Render(lgp::framework::FrameContext const &frameContext)
+ {
+     return impl_->Render(frameContext);
+diff --git a/chapters/gbuffer-and-deferred-shading/Starter/Renderer.hpp b/chapters/gbuffer-and-deferred-shading/Starter/Renderer.hpp
+index 565790e..7573d76 100644
+--- a/chapters/gbuffer-and-deferred-shading/Starter/Renderer.hpp
++++ b/chapters/gbuffer-and-deferred-shading/Starter/Renderer.hpp
+@@ -43,6 +43,7 @@ class Renderer final : public lgp::framework::IChapterRenderer
+     [[nodiscard]] lgp::framework::Status OnResize(lgp::framework::DeviceResources &deviceResources,
+                                                   lgp::framework::Extent2D drawableSize) override;
+     [[nodiscard]] lgp::framework::Status Update(lgp::framework::UpdateContext const &context) override;
++    [[nodiscard]] lgp::framework::Status BuildUi(lgp::framework::UpdateContext const &context) override;
+     [[nodiscard]] lgp::framework::Status Render(lgp::framework::FrameContext const &frameContext) override;
+     void Shutdown(lgp::framework::DeviceResources &deviceResources) noexcept override;
+ 
+-- 
+2.55.0.windows.3
+

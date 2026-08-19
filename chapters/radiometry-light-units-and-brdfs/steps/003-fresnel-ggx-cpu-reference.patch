@@ -1,0 +1,119 @@
+diff --git a/chapters/radiometry-light-units-and-brdfs/Starter/DirectLighting.hlsl b/chapters/radiometry-light-units-and-brdfs/Starter/DirectLighting.hlsl
+index b64314b75d4bac0eeb2758eea5273334c0719f3f..e1a9bf2109f2f6f5cbac3581e25bbd45ce2c96cd 100644
+--- a/chapters/radiometry-light-units-and-brdfs/Starter/DirectLighting.hlsl
++++ b/chapters/radiometry-light-units-and-brdfs/Starter/DirectLighting.hlsl
+@@ -25,8 +25,17 @@ struct ObjectConstants
+     float3 dielectricF0;
+ };
+ 
++struct OutputConstants
++{
++    float exposure;
++    float3 padding;
++};
++
+ ConstantBuffer<LightingConstants> lighting : register(b0);
+ ConstantBuffer<ObjectConstants> objectData : register(b1);
++ConstantBuffer<OutputConstants> outputData : register(b2);
++Texture2D<float4> hdrInput : register(t0);
++SamplerState linearClampSampler : register(s0);
+ 
+ struct MeshVertex
+ {
+@@ -41,8 +50,14 @@ struct LitVertex
+     float3 worldNormal : NORMAL;
+ };
+ 
++struct FullscreenVertex
++{
++    float4 position : SV_Position;
++    float2 uv : TEXCOORD0;
++};
++
+ static const float Pi = 3.14159265358979323846;
+-static const float MinimumDistanceSquared = 1.0e-4;
++static const float MinimumRoughness = 0.045;
+ 
+ LitVertex LightingVS(MeshVertex input)
+ {
+@@ -54,28 +69,68 @@ LitVertex LightingVS(MeshVertex input)
+     return output;
+ }
+ 
+-float DirectionalNormalIlluminance(float illuminanceLux)
++float3 SchlickFresnel(float3 f0, float cosine)
+ {
+-    return max(illuminanceLux, 0.0);
++    float factor = pow(1.0 - saturate(cosine), 5.0);
++    return f0 + ((1.0 - f0) * factor);
+ }
+ 
+-float PointNormalIlluminance(float luminousIntensityCandela, float3 offsetToLight)
++float GgxDistribution(float nDotH, float roughness)
+ {
+-    float distanceSquared = max(dot(offsetToLight, offsetToLight), MinimumDistanceSquared);
+-    return max(luminousIntensityCandela, 0.0) / distanceSquared;
++    float effectiveRoughness = max(roughness, MinimumRoughness);
++    float alpha = effectiveRoughness * effectiveRoughness;
++    float alphaSquared = alpha * alpha;
++    float term = (nDotH * nDotH * (alphaSquared - 1.0)) + 1.0;
++    return alphaSquared / max(Pi * term * term, 1.0e-7);
+ }
+ 
+-float3 LambertDiffuse(float3 baseColor)
++float SmithG1(float nDotDirection, float roughness)
+ {
+-    return baseColor / Pi;
++    float cosine = saturate(nDotDirection);
++    if (cosine <= 0.0)
++    {
++        return 0.0;
++    }
++    float effectiveRoughness = max(roughness, MinimumRoughness);
++    float alpha = effectiveRoughness * effectiveRoughness;
++    float alphaSquared = alpha * alpha;
++    float root = sqrt(alphaSquared + ((1.0 - alphaSquared) * cosine * cosine));
++    return (2.0 * cosine) / max(cosine + root, 1.0e-7);
+ }
+ 
+ float4 LightingPS(LitVertex input) : SV_Target
+ {
++    float3 baseColor = lighting.useMaterialOverride != 0 ? lighting.overrideBaseColor : objectData.baseColor;
++    float roughness = lighting.useMaterialOverride != 0 ? lighting.overrideRoughness : objectData.roughness;
++    float metalness = lighting.useMaterialOverride != 0 ? lighting.overrideMetalness : objectData.metalness;
++
+     float3 normal = normalize(input.worldNormal);
+-    float3 directionToLight = normalize(lighting.directionToLight);
+-    float normalIlluminance = DirectionalNormalIlluminance(lighting.intensity);
+-    float nDotL = saturate(dot(normal, directionToLight));
+-    float3 irradiance = max(lighting.lightColor, 0.0) * normalIlluminance * nDotL;
+-    return float4(irradiance * LambertDiffuse(objectData.baseColor), 1.0);
++    float3 viewDirection = normalize(lighting.cameraPosition - input.worldPosition);
++    float3 lightDirection = normalize(lighting.directionToLight);
++    float normalIlluminance = lighting.intensity;
++
++    float nDotL = saturate(dot(normal, lightDirection));
++    float nDotV = saturate(dot(normal, viewDirection));
++    float3 halfVector = normalize(viewDirection + lightDirection);
++    float nDotH = saturate(dot(normal, halfVector));
++    float vDotH = saturate(dot(viewDirection, halfVector));
++    float3 f0 = lerp(objectData.dielectricF0, baseColor, metalness);
++    float3 fresnel = SchlickFresnel(f0, vDotH);
++    float distribution = GgxDistribution(nDotH, roughness);
++    float geometry = SmithG1(nDotV, roughness) * SmithG1(nDotL, roughness);
++    float denominator = max(4.0 * nDotV * nDotL, 1.0e-6);
++    float3 specularBrdf = nDotL > 0.0 && nDotV > 0.0
++        ? fresnel * distribution * geometry / denominator
++        : 0.0;
++
++    float3 viewTransmission = (1.0 - SchlickFresnel(f0, nDotV)) * (1.0 - metalness);
++    float3 lightTransmission = 1.0 - SchlickFresnel(f0, nDotL);
++    float3 diffuseWeight = viewTransmission * lightTransmission;
++    float3 diffuseBrdf = diffuseWeight * baseColor / Pi;
++    float3 irradiance = lighting.lightColor * normalIlluminance * nDotL;
++    float3 diffuse = irradiance * diffuseBrdf;
++    float3 specular = irradiance * specularBrdf;
++    float3 color = diffuse + specular;
++
++    return float4(color, 1.0);
+ }

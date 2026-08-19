@@ -1,0 +1,46 @@
+From 664bc4a25d03c3cb1188c6e89e1fba5cbce7cca8 Mon Sep 17 00:00:00 2001
+From: Patch Author <patch-author@example.invalid>
+Date: Sun, 16 Aug 2026 21:36:37 +0100
+Subject: [PATCH 3/5] Classify geometric reprojection failures
+
+---
+ .../Starter/ReprojectionLab.hlsl              | 25 ++++++++++++++++---
+ 1 file changed, 21 insertions(+), 4 deletions(-)
+
+diff --git a/chapters/motion-vectors-and-reprojection/Starter/ReprojectionLab.hlsl b/chapters/motion-vectors-and-reprojection/Starter/ReprojectionLab.hlsl
+index 38f72d6..48d7b44 100644
+--- a/chapters/motion-vectors-and-reprojection/Starter/ReprojectionLab.hlsl
++++ b/chapters/motion-vectors-and-reprojection/Starter/ReprojectionLab.hlsl
+@@ -188,11 +188,28 @@ void BaselineNoHistoryCS(uint3 dispatchThreadId : SV_DispatchThreadID)
+     }
+ 
+     float2 currentRasterUv = RasterUv(dispatchThreadId.xy);
+-    float2 motion = gMotionClipDepth.Load(int3(dispatchThreadId.xy, 0)).xy;
+-    gPreviousHistoryUvUav[dispatchThreadId.xy] =
+-        currentRasterUv + motion + gPreviousJitterExposure.xy - gCurrentJitterExposure.xy;
++    float4 motionClipDepth = gMotionClipDepth.Load(int3(dispatchThreadId.xy, 0));
++    float2 previousHistoryUv =
++        currentRasterUv + motionClipDepth.xy + gPreviousJitterExposure.xy - gCurrentJitterExposure.xy;
++    uint reasons = kRejectNoHistory;
++    if (!all(isfinite(previousHistoryUv)) || !isfinite(motionClipDepth.z))
++    {
++        reasons |= kRejectNonFinite;
++    }
++    if (isfinite(motionClipDepth.z) && motionClipDepth.z <= 0.0f)
++    {
++        reasons |= kRejectPreviousW;
++    }
++    float2 halfTexel = 0.5f / float2(gHeader0.xy);
++    if (previousHistoryUv.x < halfTexel.x || previousHistoryUv.x > 1.0f - halfTexel.x ||
++        previousHistoryUv.y < halfTexel.y || previousHistoryUv.y > 1.0f - halfTexel.y)
++    {
++        reasons |= kRejectUvOutOfBounds;
++    }
++
++    gPreviousHistoryUvUav[dispatchThreadId.xy] = previousHistoryUv;
+     gReprojectedHistoryColorUav[dispatchThreadId.xy] = 0.0f.xxxx;
+-    gRejectionReasonsUav[dispatchThreadId.xy] = kRejectNoHistory;
++    gRejectionReasonsUav[dispatchThreadId.xy] = reasons;
+     gExposureScaleUav[dispatchThreadId.xy] = 1.0f;
+ }
+ 

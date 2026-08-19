@@ -1,0 +1,1096 @@
+From 794c8524cff6570136d4fc10b81c5592574cd474 Mon Sep 17 00:00:00 2001
+From: Patch Author <patch-author@example.invalid>
+Date: Sun, 16 Aug 2026 21:36:43 +0100
+Subject: [PATCH 4/5] Add history validation and diagnostics
+
+---
+ .../Starter/Main.cpp                          |   2 +-
+ .../Starter/Renderer.cpp                      | 528 +++++++++++++++---
+ .../Starter/Renderer.hpp                      |  60 +-
+ .../Starter/ReprojectionLab.hlsl              |  99 +++-
+ 4 files changed, 592 insertions(+), 97 deletions(-)
+
+diff --git a/chapters/motion-vectors-and-reprojection/Starter/Main.cpp b/chapters/motion-vectors-and-reprojection/Starter/Main.cpp
+index 6d09223..040e110 100644
+--- a/chapters/motion-vectors-and-reprojection/Starter/Main.cpp
++++ b/chapters/motion-vectors-and-reprojection/Starter/Main.cpp
+@@ -4,7 +4,7 @@
+ 
+ int wmain(int argc, wchar_t **argv)
+ {
+-    ch11::reprojection::starter::Renderer renderer{};
++    ch11::reprojection::solution::Renderer renderer{};
+ 
+     lgp::framework::ApplicationConfiguration configuration{};
+     configuration.title = L"Ch11 Motion Vectors and Reprojection Starter";
+diff --git a/chapters/motion-vectors-and-reprojection/Starter/Renderer.cpp b/chapters/motion-vectors-and-reprojection/Starter/Renderer.cpp
+index 9774148..0bacaa2 100644
+--- a/chapters/motion-vectors-and-reprojection/Starter/Renderer.cpp
++++ b/chapters/motion-vectors-and-reprojection/Starter/Renderer.cpp
+@@ -8,24 +8,29 @@
+ 
+ #include "Renderer.hpp"
+ 
+-#include "../Common/GpuLabSupport.hpp"
++#include <imgui.h>
++#include <imgui_impl_dx12.h>
+ 
+ #include <d3d12.h>
+ #include <wrl/client.h>
+ 
++#include <algorithm>
+ #include <array>
+ #include <cstddef>
+ #include <cstring>
+ #include <filesystem>
+ #include <string>
+ 
+-namespace ch11::reprojection::starter
++namespace ch11::reprojection::solution
+ {
+ namespace
+ {
+ 
+ using Microsoft::WRL::ComPtr;
+-using TextureIndex = Renderer::TextureIndex;
++
++inline constexpr UINT kSrvCount = 11U;
++inline constexpr UINT kUavCount = static_cast<UINT>(Renderer::TextureIndex::Count);
++inline constexpr UINT kDescriptorsPerSlot = kSrvCount + kUavCount;
+ 
+ struct alignas(16) SurfaceConstants final
+ {
+@@ -93,7 +98,7 @@ static_assert((sizeof(FrameConstants) % 16U) == 0U);
+     {
+         return std::unexpected(
+             lgp::framework::MakeHResultError("ID3D12Device::CreateComputePipelineState", result,
+-                                             std::string{"Failed to create "} + label + " for Chapter 11 Starter."));
++                                             std::string{"Failed to create "} + label + " for Chapter 11 Solution."));
+     }
+     return {};
+ }
+@@ -136,18 +141,81 @@ static_assert((sizeof(FrameConstants) % 16U) == 0U);
+     {
+         return std::unexpected(
+             lgp::framework::MakeHResultError("ID3D12Device::CreateGraphicsPipelineState", result,
+-                                             "Failed to create the Chapter 11 Starter composite pipeline."));
++                                             "Failed to create the Chapter 11 Solution composite pipeline."));
+     }
+     return {};
+ }
+ 
+-[[nodiscard]] std::uint32_t TextureCountU32() noexcept
++[[nodiscard]] DXGI_FORMAT TextureFormat(Renderer::TextureIndex texture) noexcept
+ {
+-    return static_cast<std::uint32_t>(TextureIndex::Count);
++    switch (texture)
++    {
++    case Renderer::TextureIndex::CurrentColor:
++    case Renderer::TextureIndex::ReprojectedHistoryColor:
++        return gpu::kColorFormat;
++    case Renderer::TextureIndex::CurrentDepth:
++        return gpu::kDepthFormat;
++    case Renderer::TextureIndex::CurrentIdentity:
++    case Renderer::TextureIndex::RejectionReasons:
++        return gpu::kIdentityFormat;
++    case Renderer::TextureIndex::MotionClipDepth:
++        return gpu::kMotionFormat;
++    case Renderer::TextureIndex::PreviousHistoryUv:
++        return gpu::kUvFormat;
++    case Renderer::TextureIndex::ExposureScale:
++        return gpu::kScalarFormat;
++    case Renderer::TextureIndex::Count:
++        break;
++    }
++    return DXGI_FORMAT_UNKNOWN;
++}
++
++[[nodiscard]] UINT TextureCountU32() noexcept
++{
++    return static_cast<UINT>(Renderer::TextureIndex::Count);
+ }
+ 
+ } // namespace
+ 
++void Renderer::SetScenario(gpu::Scenario scenario) noexcept
++{
++    scenario_ = scenario;
++}
++
++void Renderer::RequestHistoryReset() noexcept
++{
++    resetRequested_ = true;
++}
++
++void Renderer::EnsureDistinctHistoryIndices() noexcept
++{
++    historyReadIndex_ &= 1U;
++    historyWriteIndex_ &= 1U;
++    if (historyReadIndex_ == historyWriteIndex_)
++    {
++        historyWriteIndex_ = 1U - historyReadIndex_;
++    }
++}
++
++UINT Renderer::HistoryReadIndex() const noexcept
++{
++    return historyReadIndex_;
++}
++
++UINT Renderer::HistoryWriteIndex() const noexcept
++{
++    return historyWriteIndex_;
++}
++
++D3D12_GPU_VIRTUAL_ADDRESS Renderer::FrameConstantAddress(UINT frameSlot) const noexcept
++{
++    if (frameSlot >= frameSlots_.size())
++    {
++        return 0U;
++    }
++    return frameSlots_[frameSlot].frameConstants.gpu_virtual_address();
++}
++
+ lgp::framework::Status Renderer::CreateShaders()
+ {
+     auto compilerResult = lgp::framework::ShaderCompiler::Create();
+@@ -168,7 +236,7 @@ lgp::framework::Status Renderer::CreateShaders()
+     {
+         return status;
+     }
+-    if (auto status = Compile(compiler, options, L"BaselineNoHistoryCS", L"cs_6_0", baselineShader_); !status)
++    if (auto status = Compile(compiler, options, L"ValidateReprojectionCS", L"cs_6_0", validateShader_); !status)
+     {
+         return status;
+     }
+@@ -183,13 +251,13 @@ lgp::framework::Status Renderer::CreateRootSignature()
+ {
+     D3D12_DESCRIPTOR_RANGE srvRange{};
+     srvRange.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
+-    srvRange.NumDescriptors = TextureCountU32();
++    srvRange.NumDescriptors = kSrvCount;
+     srvRange.BaseShaderRegister = 0U;
+     srvRange.OffsetInDescriptorsFromTableStart = D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND;
+ 
+     D3D12_DESCRIPTOR_RANGE uavRange{};
+     uavRange.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_UAV;
+-    uavRange.NumDescriptors = TextureCountU32();
++    uavRange.NumDescriptors = kUavCount;
+     uavRange.BaseShaderRegister = 0U;
+     uavRange.OffsetInDescriptorsFromTableStart = D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND;
+ 
+@@ -208,9 +276,24 @@ lgp::framework::Status Renderer::CreateRootSignature()
+     parameters[2].DescriptorTable.pDescriptorRanges = &uavRange;
+     parameters[2].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+ 
++    D3D12_STATIC_SAMPLER_DESC samplers[2]{};
++    samplers[0].Filter = D3D12_FILTER_MIN_MAG_MIP_LINEAR;
++    samplers[0].AddressU = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
++    samplers[0].AddressV = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
++    samplers[0].AddressW = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
++    samplers[0].ShaderRegister = 0U;
++    samplers[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
++    samplers[0].MaxLOD = D3D12_FLOAT32_MAX;
++
++    samplers[1] = samplers[0];
++    samplers[1].Filter = D3D12_FILTER_MIN_MAG_MIP_POINT;
++    samplers[1].ShaderRegister = 1U;
++
+     D3D12_ROOT_SIGNATURE_DESC description{};
+     description.NumParameters = static_cast<UINT>(std::size(parameters));
+     description.pParameters = parameters;
++    description.NumStaticSamplers = static_cast<UINT>(std::size(samplers));
++    description.pStaticSamplers = samplers;
+     description.Flags = D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT |
+                         D3D12_ROOT_SIGNATURE_FLAG_DENY_HULL_SHADER_ROOT_ACCESS |
+                         D3D12_ROOT_SIGNATURE_FLAG_DENY_DOMAIN_SHADER_ROOT_ACCESS |
+@@ -234,7 +317,7 @@ lgp::framework::Status Renderer::CreateRootSignature()
+     {
+         return std::unexpected(
+             lgp::framework::MakeHResultError("ID3D12Device::CreateRootSignature", createResult,
+-                                             "Failed to create the Chapter 11 Starter root signature."));
++                                             "Failed to create the Chapter 11 Solution root signature."));
+     }
+     return {};
+ }
+@@ -247,8 +330,8 @@ lgp::framework::Status Renderer::CreatePipelines()
+     {
+         return status;
+     }
+-    if (auto status = CreateComputePipeline(*deviceResources_->device(), *rootSignature_.Get(), baselineShader_,
+-                                            "BaselineNoHistoryCS", baselinePipeline_);
++    if (auto status = CreateComputePipeline(*deviceResources_->device(), *rootSignature_.Get(), validateShader_,
++                                            "ValidateReprojectionCS", validatePipeline_);
+         !status)
+     {
+         return status;
+@@ -258,26 +341,51 @@ lgp::framework::Status Renderer::CreatePipelines()
+                                   compositePixelShader_, compositePipeline_);
+ }
+ 
+-UINT Renderer::DescriptorIndex(UINT frameSlot, UINT textureIndex, bool uav) const noexcept
++UINT Renderer::DescriptorIndex(UINT frameSlot, UINT descriptorIndex, bool uav) const noexcept
+ {
+-    UINT const perSlot = TextureCountU32() * 2U;
+-    return (frameSlot * perSlot) + (uav ? TextureCountU32() : 0U) + textureIndex;
++    return (frameSlot * kDescriptorsPerSlot) + (uav ? kSrvCount : 0U) + descriptorIndex;
+ }
+ 
+-D3D12_GPU_VIRTUAL_ADDRESS Renderer::WriteFrameConstants(UINT frameSlot, lgp::framework::Extent2D size)
++void Renderer::UpdateHistorySrvs(UINT frameSlot, UINT historyIndex)
+ {
++    D3D12_SHADER_RESOURCE_VIEW_DESC colorSrv{};
++    colorSrv.Format = gpu::kColorFormat;
++    colorSrv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
++    colorSrv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
++    colorSrv.Texture2D.MipLevels = 1U;
++
++    D3D12_SHADER_RESOURCE_VIEW_DESC depthSrv = colorSrv;
++    depthSrv.Format = gpu::kDepthFormat;
++
++    D3D12_SHADER_RESOURCE_VIEW_DESC identitySrv = colorSrv;
++    identitySrv.Format = gpu::kIdentityFormat;
++
++    deviceResources_->device()->CreateShaderResourceView(
++        history_[historyIndex].color.Get(), &colorSrv,
++        textureDescriptors_.CpuHandle(DescriptorIndex(frameSlot, 8U, false)));
++    deviceResources_->device()->CreateShaderResourceView(
++        history_[historyIndex].depth.Get(), &depthSrv,
++        textureDescriptors_.CpuHandle(DescriptorIndex(frameSlot, 9U, false)));
++    deviceResources_->device()->CreateShaderResourceView(
++        history_[historyIndex].identity.Get(), &identitySrv,
++        textureDescriptors_.CpuHandle(DescriptorIndex(frameSlot, 10U, false)));
++}
++
++D3D12_GPU_VIRTUAL_ADDRESS Renderer::WriteFrameConstants(UINT frameSlot, lgp::framework::Extent2D size,
++                                                        bool resetRequested)
++{
++    gpu::ScenarioState const scenarioState = gpu::MakeScenarioState(scenario_);
+     FrameConstants constants{};
+-    constants.header0 = {size.width, size.height, gpu::kMaxSurfaces, 0U};
+-    gpu::ScenarioState const scenario = gpu::MakeScenarioState(gpu::Scenario::MotionCurrent);
+-    constants.header0.z = scenario.surfaceCount;
+-    constants.currentJitterExposure = {scenario.currentJitterUv.x, scenario.currentJitterUv.y,
+-                                       scenario.currentPreExposure, 0.0F};
+-    constants.previousJitterExposure = {0.0F, 0.0F, 1.0F, 4.0F};
++    constants.header0 = {size.width, size.height, scenarioState.surfaceCount,
++                         (hasHistory_ ? 1U : 0U) | (resetRequested ? 2U : 0U)};
++    constants.currentJitterExposure = {scenarioState.currentJitterUv.x, scenarioState.currentJitterUv.y,
++                                       scenarioState.currentPreExposure, 0.0F};
++    constants.previousJitterExposure = {previousJitterUv_.x, previousJitterUv_.y, previousPreExposure_, 4.0F};
+     constants.depthSettings = {0.001F, 0.005F, 1.0F, 0.0F};
+ 
+-    for (std::uint32_t index = 0U; index < scenario.surfaceCount; ++index)
++    for (std::uint32_t index = 0U; index < scenarioState.surfaceCount; ++index)
+     {
+-        gpu::SurfaceState const &surface = scenario.surfaces[index];
++        gpu::SurfaceState const &surface = scenarioState.surfaces[index];
+         SurfaceConstants &destination = constants.surfaces[index];
+         destination.currentRectUv = surface.currentRectUv;
+         destination.currentColor = surface.currentColor;
+@@ -294,72 +402,130 @@ D3D12_GPU_VIRTUAL_ADDRESS Renderer::WriteFrameConstants(UINT frameSlot, lgp::fra
+ lgp::framework::Status Renderer::CreateSizeDependentResources(lgp::framework::Extent2D drawableSize)
+ {
+     ReleaseSizeDependentResources();
++    lastDrawableSize_ = drawableSize;
+     if (drawableSize.empty())
+     {
++        resetRequested_ = false;
++        hasHistory_ = false;
+         return {};
+     }
+ 
+-    UINT const frameSlotCount = deviceResources_->back_buffer_count();
+-    auto descriptors =
+-        deviceResources_->shader_visible_cbv_srv_uav_heap().Allocate(frameSlotCount * TextureCountU32() * 2U);
++    auto descriptors = deviceResources_->shader_visible_cbv_srv_uav_heap().Allocate(
++        deviceResources_->back_buffer_count() * kDescriptorsPerSlot);
+     if (!descriptors)
+     {
+         return std::unexpected(std::move(descriptors.error()));
+     }
+     textureDescriptors_ = *descriptors;
+-    frameSlots_.resize(frameSlotCount);
+ 
+     D3D12_HEAP_PROPERTIES heap{};
+     heap.Type = D3D12_HEAP_TYPE_DEFAULT;
+ 
+-    for (UINT frameSlot = 0U; frameSlot < frameSlotCount; ++frameSlot)
++    frameSlots_.resize(deviceResources_->back_buffer_count());
++    for (UINT frameSlot = 0U; frameSlot < deviceResources_->back_buffer_count(); ++frameSlot)
+     {
+-        auto &slot = frameSlots_[frameSlot];
+         auto constantsResult = lgp::framework::CreateUploadBuffer(*deviceResources_->device(), sizeof(FrameConstants),
+-                                                                  L"Ch11 Starter Frame Constants");
++                                                                  L"Ch11 Solution Frame Constants");
+         if (!constantsResult)
+         {
+             return std::unexpected(std::move(constantsResult.error()));
+         }
+-        slot.frameConstants = std::move(*constantsResult);
+-
+-        std::array<DXGI_FORMAT, static_cast<std::size_t>(TextureIndex::Count)> const formats{
+-            gpu::kColorFormat, gpu::kDepthFormat, gpu::kIdentityFormat, gpu::kMotionFormat,
+-            gpu::kUvFormat,    gpu::kColorFormat, gpu::kReasonFormat,   gpu::kScalarFormat,
+-        };
++        frameSlots_[frameSlot].frameConstants = std::move(*constantsResult);
+ 
+         for (UINT textureIndex = 0U; textureIndex < TextureCountU32(); ++textureIndex)
+         {
+-            D3D12_RESOURCE_DESC1 const description = gpu::MakeTextureDescription(
+-                drawableSize, formats[textureIndex], D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
++            DXGI_FORMAT const format = TextureFormat(static_cast<TextureIndex>(textureIndex));
++            D3D12_RESOURCE_DESC1 const description =
++                gpu::MakeTextureDescription(drawableSize, format, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
+             HRESULT const createResult = deviceResources_->device()->CreateCommittedResource3(
+                 &heap, D3D12_HEAP_FLAG_NONE, &description, D3D12_BARRIER_LAYOUT_COMMON, nullptr, nullptr, 0U, nullptr,
+-                IID_PPV_ARGS(slot.textures[textureIndex].ReleaseAndGetAddressOf()));
++                IID_PPV_ARGS(frameSlots_[frameSlot].textures[textureIndex].ReleaseAndGetAddressOf()));
+             if (FAILED(createResult))
+             {
+                 return std::unexpected(
+                     lgp::framework::MakeHResultError("ID3D12Device10::CreateCommittedResource3", createResult,
+-                                                     "Failed to create a Chapter 11 Starter texture."));
++                                                     "Failed to create a Chapter 11 Solution per-frame texture."));
+             }
+ 
+             D3D12_SHADER_RESOURCE_VIEW_DESC srv{};
+-            srv.Format = formats[textureIndex];
++            srv.Format = format;
+             srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+             srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+             srv.Texture2D.MipLevels = 1U;
+             deviceResources_->device()->CreateShaderResourceView(
+-                slot.textures[textureIndex].Get(), &srv,
++                frameSlots_[frameSlot].textures[textureIndex].Get(), &srv,
+                 textureDescriptors_.CpuHandle(DescriptorIndex(frameSlot, textureIndex, false)));
+ 
+             D3D12_UNORDERED_ACCESS_VIEW_DESC uav{};
+-            uav.Format = formats[textureIndex];
++            uav.Format = format;
+             uav.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
+             deviceResources_->device()->CreateUnorderedAccessView(
+-                slot.textures[textureIndex].Get(), nullptr, &uav,
++                frameSlots_[frameSlot].textures[textureIndex].Get(), nullptr, &uav,
+                 textureDescriptors_.CpuHandle(DescriptorIndex(frameSlot, textureIndex, true)));
+         }
+     }
+ 
++    for (auto &historyTextures : history_)
++    {
++        D3D12_RESOURCE_DESC1 const colorDescription =
++            gpu::MakeTextureDescription(drawableSize, gpu::kColorFormat, D3D12_RESOURCE_FLAG_NONE);
++        D3D12_RESOURCE_DESC1 const depthDescription =
++            gpu::MakeTextureDescription(drawableSize, gpu::kDepthFormat, D3D12_RESOURCE_FLAG_NONE);
++        D3D12_RESOURCE_DESC1 const identityDescription =
++            gpu::MakeTextureDescription(drawableSize, gpu::kIdentityFormat, D3D12_RESOURCE_FLAG_NONE);
++
++        HRESULT const colorResult = deviceResources_->device()->CreateCommittedResource3(
++            &heap, D3D12_HEAP_FLAG_NONE, &colorDescription, D3D12_BARRIER_LAYOUT_COMMON, nullptr, nullptr, 0U, nullptr,
++            IID_PPV_ARGS(historyTextures.color.ReleaseAndGetAddressOf()));
++        HRESULT const depthResult = deviceResources_->device()->CreateCommittedResource3(
++            &heap, D3D12_HEAP_FLAG_NONE, &depthDescription, D3D12_BARRIER_LAYOUT_COMMON, nullptr, nullptr, 0U, nullptr,
++            IID_PPV_ARGS(historyTextures.depth.ReleaseAndGetAddressOf()));
++        HRESULT const identityResult = deviceResources_->device()->CreateCommittedResource3(
++            &heap, D3D12_HEAP_FLAG_NONE, &identityDescription, D3D12_BARRIER_LAYOUT_COMMON, nullptr, nullptr, 0U,
++            nullptr, IID_PPV_ARGS(historyTextures.identity.ReleaseAndGetAddressOf()));
++        if (FAILED(colorResult) || FAILED(depthResult) || FAILED(identityResult))
++        {
++            return std::unexpected(lgp::framework::MakeError(
++                "CreateSizeDependentResources", "Failed to create a Chapter 11 Solution history texture."));
++        }
++    }
++
++    resetRequested_ = false;
++    hasHistory_ = false;
++    historyReadIndex_ = 0U;
++    historyWriteIndex_ = 1U;
++    EnsureDistinctHistoryIndices();
++    return {};
++}
++
++lgp::framework::Status Renderer::InitializeImGui()
++{
++    auto descriptor = deviceResources_->shader_visible_cbv_srv_uav_heap().Allocate(1U);
++    if (!descriptor)
++    {
++        return std::unexpected(std::move(descriptor.error()));
++    }
++    imguiFontDescriptor_ = *descriptor;
++
++    IMGUI_CHECKVERSION();
++    ImGui::CreateContext();
++    ImGui::StyleColorsDark();
++    ImGui::GetIO().BackendPlatformName = "LGP.ManualInput";
++
++    ImGui_ImplDX12_InitInfo info{};
++    info.Device = deviceResources_->device();
++    info.CommandQueue = deviceResources_->graphics_queue();
++    info.NumFramesInFlight = static_cast<int>(deviceResources_->back_buffer_count());
++    info.RTVFormat = deviceResources_->back_buffer_format();
++    info.SrvDescriptorHeap = deviceResources_->shader_visible_cbv_srv_uav_heap().Get();
++    info.LegacySingleSrvCpuDescriptor = imguiFontDescriptor_.cpuHandle;
++    info.LegacySingleSrvGpuDescriptor = imguiFontDescriptor_.gpuHandle;
++    if (!ImGui_ImplDX12_Init(&info))
++    {
++        return std::unexpected(
++            lgp::framework::MakeError("ImGui_ImplDX12_Init", "Failed to initialize Chapter 11 diagnostics."));
++    }
++    imguiInitialized_ = true;
+     return {};
+ }
+ 
+@@ -373,6 +539,12 @@ void Renderer::ReleaseSizeDependentResources() noexcept
+         }
+     }
+     frameSlots_.clear();
++    for (auto &historyTextures : history_)
++    {
++        historyTextures.color.Reset();
++        historyTextures.depth.Reset();
++        historyTextures.identity.Reset();
++    }
+     if (deviceResources_ != nullptr && textureDescriptors_)
+     {
+         deviceResources_->shader_visible_cbv_srv_uav_heap().Free(textureDescriptors_);
+@@ -383,6 +555,8 @@ void Renderer::ReleaseSizeDependentResources() noexcept
+ lgp::framework::Status Renderer::Initialize(lgp::framework::ApplicationInitContext const &context)
+ {
+     deviceResources_ = &context.deviceResources;
++    headless_ = context.commandLine.headless;
++
+     if (auto status = CreateShaders(); !status)
+     {
+         return status;
+@@ -395,7 +569,11 @@ lgp::framework::Status Renderer::Initialize(lgp::framework::ApplicationInitConte
+     {
+         return status;
+     }
+-    return CreateSizeDependentResources(context.drawableSize);
++    if (auto status = CreateSizeDependentResources(context.drawableSize); !status)
++    {
++        return status;
++    }
++    return headless_ ? lgp::framework::Status{} : InitializeImGui();
+ }
+ 
+ lgp::framework::Status Renderer::OnResize(lgp::framework::DeviceResources &, lgp::framework::Extent2D drawableSize)
+@@ -408,19 +586,65 @@ lgp::framework::Status Renderer::Update(lgp::framework::UpdateContext const &)
+     return {};
+ }
+ 
++lgp::framework::Status Renderer::BuildUi(lgp::framework::UpdateContext const &context)
++{
++    if (headless_ || !imguiInitialized_)
++    {
++        return {};
++    }
++
++    ImGuiIO &io = ImGui::GetIO();
++    io.DisplaySize = {static_cast<float>(context.drawableSize.width), static_cast<float>(context.drawableSize.height)};
++    io.DeltaTime = static_cast<float>((std::max)(context.deltaSeconds, 1.0 / 240.0));
++    io.AddMousePosEvent(static_cast<float>(context.input.mouse.x), static_cast<float>(context.input.mouse.y));
++    io.AddMouseButtonEvent(0, context.input.mouse.IsButtonDown(lgp::framework::MouseButton::Left));
++    io.AddMouseWheelEvent(0.0F, context.input.mouse.wheelDelta);
++
++    ImGui_ImplDX12_NewFrame();
++    ImGui::NewFrame();
++    imguiFrameBegun_ = true;
++
++    int scenarioIndex = static_cast<int>(scenario_);
++    char const *items =
++        "Static\0Jitter A\0Jitter B\0Motion Previous\0Motion Current\0Identity/Depth Previous\0Identity/Depth Current\0"
++        "Exposure Previous\0Exposure Valid\0Exposure Excessive\0Previous W Invalid\0";
++    ImGui::Begin("Reprojection diagnostics");
++    ImGui::Combo("Scenario", &scenarioIndex, items);
++    scenario_ = static_cast<gpu::Scenario>(scenarioIndex);
++    if (ImGui::Button("Reset history"))
++    {
++        resetRequested_ = true;
++    }
++    ImGui::Text("History: %s", hasHistory_ ? "available" : "empty");
++    ImGui::Text("Current jitter: (%.5f, %.5f)", gpu::MakeScenarioState(scenario_).currentJitterUv.x,
++                gpu::MakeScenarioState(scenario_).currentJitterUv.y);
++    ImGui::Text("Previous jitter: (%.5f, %.5f)", previousJitterUv_.x, previousJitterUv_.y);
++    ImGui::Text("Current exposure: %.3f", static_cast<double>(gpu::MakeScenarioState(scenario_).currentPreExposure));
++    ImGui::Text("Previous exposure: %.3f", static_cast<double>(previousPreExposure_));
++    ImGui::TextWrapped("The composite highlights valid reprojection in green. No-history and reset frames tint magenta "
++                       "so the missing temporal reservoir stays explicit.");
++    ImGui::End();
++    return {};
++}
++
+ lgp::framework::Status Renderer::Render(lgp::framework::FrameContext const &frameContext)
+ {
+     if (frameContext.commandList == nullptr || frameContext.renderTarget == nullptr)
+     {
+-        return std::unexpected(lgp::framework::MakeError("Starter::Renderer::Render",
++        return std::unexpected(lgp::framework::MakeError("Solution::Renderer::Render",
+                                                          "The frame context is missing required D3D12 handles."));
+     }
+     if (frameContext.drawableSize.empty() || frameContext.frameSlot >= frameSlots_.size())
+     {
+-        return std::unexpected(lgp::framework::MakeError("Starter::Renderer::Render",
+-                                                         "Size-dependent Starter resources are unavailable."));
++        return std::unexpected(lgp::framework::MakeError("Solution::Renderer::Render",
++                                                         "Size-dependent Solution resources are unavailable."));
+     }
+ 
++    bool const resetThisFrame = resetRequested_;
++    gpu::ScenarioState const scenarioState = gpu::MakeScenarioState(scenario_);
++    EnsureDistinctHistoryIndices();
++    UpdateHistorySrvs(frameContext.frameSlot, historyReadIndex_);
++
+     auto &slot = frameSlots_[frameContext.frameSlot];
+     ID3D12GraphicsCommandList7 &commandList = *frameContext.commandList;
+     ID3D12DescriptorHeap *const heaps[]{frameContext.shaderVisibleCbvSrvUavHeap};
+@@ -432,17 +656,23 @@ lgp::framework::Status Renderer::Render(lgp::framework::FrameContext const &fram
+     commandList.IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+ 
+     D3D12_GPU_VIRTUAL_ADDRESS const constantsAddress =
+-        WriteFrameConstants(frameContext.frameSlot, frameContext.drawableSize);
++        WriteFrameConstants(frameContext.frameSlot, frameContext.drawableSize, resetThisFrame);
+     commandList.SetComputeRootConstantBufferView(0U, constantsAddress);
+     commandList.SetGraphicsRootConstantBufferView(0U, constantsAddress);
++    commandList.SetComputeRootDescriptorTable(
++        1U, textureDescriptors_.GpuHandle(DescriptorIndex(frameContext.frameSlot, 0U, false)));
++    commandList.SetGraphicsRootDescriptorTable(
++        1U, textureDescriptors_.GpuHandle(DescriptorIndex(frameContext.frameSlot, 0U, false)));
++    commandList.SetComputeRootDescriptorTable(
++        2U, textureDescriptors_.GpuHandle(DescriptorIndex(frameContext.frameSlot, 0U, true)));
+ 
+-    std::vector<D3D12_TEXTURE_BARRIER> barriers{};
+-    barriers.reserve(TextureCountU32() + 1U);
+     lgp::framework::TextureBarrierState const commonState{
+         D3D12_BARRIER_SYNC_NONE,
+         D3D12_BARRIER_ACCESS_NO_ACCESS,
+         D3D12_BARRIER_LAYOUT_COMMON,
+     };
++    std::vector<D3D12_TEXTURE_BARRIER> barriers{};
++    barriers.reserve(TextureCountU32() + 4U);
+     for (UINT textureIndex = 0U; textureIndex < TextureCountU32(); ++textureIndex)
+     {
+         barriers.push_back(gpu::MakeTextureBarrier(*slot.textures[textureIndex].Get(), commonState,
+@@ -451,26 +680,33 @@ lgp::framework::Status Renderer::Render(lgp::framework::FrameContext const &fram
+     }
+     gpu::SubmitTextureBarriers(commandList, barriers);
+ 
+-    commandList.SetComputeRootDescriptorTable(
+-        2U, textureDescriptors_.GpuHandle(DescriptorIndex(frameContext.frameSlot, 0U, true)));
+     commandList.SetPipelineState(generatePipeline_.Get());
+     commandList.Dispatch((frameContext.drawableSize.width + gpu::kThreadsX - 1U) / gpu::kThreadsX,
+                          (frameContext.drawableSize.height + gpu::kThreadsY - 1U) / gpu::kThreadsY, 1U);
+ 
+     barriers.clear();
++    barriers.push_back(gpu::MakeTextureBarrier(*slot.textures[static_cast<UINT>(TextureIndex::CurrentColor)].Get(),
++                                               gpu::ComputeUnorderedAccessState(), gpu::ComputeShaderResourceState()));
++    barriers.push_back(gpu::MakeTextureBarrier(*slot.textures[static_cast<UINT>(TextureIndex::CurrentDepth)].Get(),
++                                               gpu::ComputeUnorderedAccessState(), gpu::ComputeShaderResourceState()));
++    barriers.push_back(gpu::MakeTextureBarrier(*slot.textures[static_cast<UINT>(TextureIndex::CurrentIdentity)].Get(),
++                                               gpu::ComputeUnorderedAccessState(), gpu::ComputeShaderResourceState()));
+     barriers.push_back(gpu::MakeTextureBarrier(*slot.textures[static_cast<UINT>(TextureIndex::MotionClipDepth)].Get(),
+                                                gpu::ComputeUnorderedAccessState(), gpu::ComputeShaderResourceState()));
++    barriers.push_back(gpu::MakeTextureBarrier(*history_[historyReadIndex_].color.Get(), commonState,
++                                               gpu::ComputeShaderResourceState()));
++    barriers.push_back(gpu::MakeTextureBarrier(*history_[historyReadIndex_].depth.Get(), commonState,
++                                               gpu::ComputeShaderResourceState()));
++    barriers.push_back(gpu::MakeTextureBarrier(*history_[historyReadIndex_].identity.Get(), commonState,
++                                               gpu::ComputeShaderResourceState()));
+     gpu::SubmitTextureBarriers(commandList, barriers);
+-    commandList.SetComputeRootDescriptorTable(
+-        1U, textureDescriptors_.GpuHandle(DescriptorIndex(frameContext.frameSlot, 0U, false)));
+-    commandList.SetPipelineState(baselinePipeline_.Get());
++
++    commandList.SetPipelineState(validatePipeline_.Get());
+     commandList.Dispatch((frameContext.drawableSize.width + gpu::kThreadsX - 1U) / gpu::kThreadsX,
+                          (frameContext.drawableSize.height + gpu::kThreadsY - 1U) / gpu::kThreadsY, 1U);
+ 
+     barriers.clear();
+     barriers.push_back(gpu::MakeTextureBarrier(*slot.textures[static_cast<UINT>(TextureIndex::CurrentColor)].Get(),
+-                                               gpu::ComputeUnorderedAccessState(), gpu::PixelShaderResourceState()));
+-    barriers.push_back(gpu::MakeTextureBarrier(*slot.textures[static_cast<UINT>(TextureIndex::MotionClipDepth)].Get(),
+                                                gpu::ComputeShaderResourceState(), gpu::PixelShaderResourceState()));
+     barriers.push_back(
+         gpu::MakeTextureBarrier(*slot.textures[static_cast<UINT>(TextureIndex::ReprojectedHistoryColor)].Get(),
+@@ -486,38 +722,178 @@ lgp::framework::Status Renderer::Render(lgp::framework::FrameContext const &fram
+     float const clearColor[]{0.0F, 0.0F, 0.0F, 1.0F};
+     commandList.OMSetRenderTargets(1U, &frameContext.renderTargetView, FALSE, nullptr);
+     commandList.ClearRenderTargetView(frameContext.renderTargetView, clearColor, 0U, nullptr);
+-    commandList.SetGraphicsRootDescriptorTable(
+-        1U, textureDescriptors_.GpuHandle(DescriptorIndex(frameContext.frameSlot, 0U, false)));
+     commandList.SetPipelineState(compositePipeline_.Get());
+     commandList.DrawInstanced(3U, 1U, 0U, 0U);
+ 
+-    barriers.clear();
+-    for (UINT textureIndex = 0U; textureIndex < TextureCountU32(); ++textureIndex)
++    if (imguiFrameBegun_)
+     {
+-        lgp::framework::TextureBarrierState before = gpu::ComputeUnorderedAccessState();
+-        if (textureIndex == static_cast<UINT>(TextureIndex::CurrentColor) ||
+-            textureIndex == static_cast<UINT>(TextureIndex::MotionClipDepth) ||
+-            textureIndex == static_cast<UINT>(TextureIndex::ReprojectedHistoryColor) ||
+-            textureIndex == static_cast<UINT>(TextureIndex::RejectionReasons) ||
+-            textureIndex == static_cast<UINT>(TextureIndex::ExposureScale))
+-        {
+-            before = gpu::PixelShaderResourceState();
+-        }
+-        barriers.push_back(gpu::MakeTextureBarrier(*slot.textures[textureIndex].Get(), before, commonState));
++        ImGui::Render();
++        ImGui_ImplDX12_RenderDrawData(ImGui::GetDrawData(), &commandList);
++        imguiFrameBegun_ = false;
+     }
++
++    barriers.clear();
++    barriers.push_back(gpu::MakeTextureBarrier(*slot.textures[static_cast<UINT>(TextureIndex::CurrentColor)].Get(),
++                                               gpu::PixelShaderResourceState(), gpu::CopySourceState()));
++    barriers.push_back(gpu::MakeTextureBarrier(*slot.textures[static_cast<UINT>(TextureIndex::CurrentDepth)].Get(),
++                                               gpu::ComputeShaderResourceState(), gpu::CopySourceState()));
++    barriers.push_back(gpu::MakeTextureBarrier(*slot.textures[static_cast<UINT>(TextureIndex::CurrentIdentity)].Get(),
++                                               gpu::ComputeShaderResourceState(), gpu::CopySourceState()));
++    barriers.push_back(gpu::MakeTextureBarrier(*history_[historyReadIndex_].color.Get(),
++                                               gpu::ComputeShaderResourceState(), commonState));
++    barriers.push_back(gpu::MakeTextureBarrier(*history_[historyReadIndex_].depth.Get(),
++                                               gpu::ComputeShaderResourceState(), commonState));
++    barriers.push_back(gpu::MakeTextureBarrier(*history_[historyReadIndex_].identity.Get(),
++                                               gpu::ComputeShaderResourceState(), commonState));
++    barriers.push_back(
++        gpu::MakeTextureBarrier(*history_[historyWriteIndex_].color.Get(), commonState, gpu::CopyDestState()));
++    barriers.push_back(
++        gpu::MakeTextureBarrier(*history_[historyWriteIndex_].depth.Get(), commonState, gpu::CopyDestState()));
++    barriers.push_back(
++        gpu::MakeTextureBarrier(*history_[historyWriteIndex_].identity.Get(), commonState, gpu::CopyDestState()));
++    gpu::SubmitTextureBarriers(commandList, barriers);
++
++    commandList.CopyResource(history_[historyWriteIndex_].color.Get(),
++                             slot.textures[static_cast<UINT>(TextureIndex::CurrentColor)].Get());
++    commandList.CopyResource(history_[historyWriteIndex_].depth.Get(),
++                             slot.textures[static_cast<UINT>(TextureIndex::CurrentDepth)].Get());
++    commandList.CopyResource(history_[historyWriteIndex_].identity.Get(),
++                             slot.textures[static_cast<UINT>(TextureIndex::CurrentIdentity)].Get());
++
++    barriers.clear();
++    barriers.push_back(gpu::MakeTextureBarrier(*slot.textures[static_cast<UINT>(TextureIndex::CurrentColor)].Get(),
++                                               gpu::CopySourceState(), commonState));
++    barriers.push_back(gpu::MakeTextureBarrier(*slot.textures[static_cast<UINT>(TextureIndex::CurrentDepth)].Get(),
++                                               gpu::CopySourceState(), commonState));
++    barriers.push_back(gpu::MakeTextureBarrier(*slot.textures[static_cast<UINT>(TextureIndex::CurrentIdentity)].Get(),
++                                               gpu::CopySourceState(), commonState));
++    barriers.push_back(gpu::MakeTextureBarrier(*slot.textures[static_cast<UINT>(TextureIndex::MotionClipDepth)].Get(),
++                                               gpu::ComputeShaderResourceState(), commonState));
++    barriers.push_back(gpu::MakeTextureBarrier(*slot.textures[static_cast<UINT>(TextureIndex::PreviousHistoryUv)].Get(),
++                                               gpu::ComputeUnorderedAccessState(), commonState));
++    barriers.push_back(
++        gpu::MakeTextureBarrier(*slot.textures[static_cast<UINT>(TextureIndex::ReprojectedHistoryColor)].Get(),
++                                gpu::PixelShaderResourceState(), commonState));
++    barriers.push_back(gpu::MakeTextureBarrier(*slot.textures[static_cast<UINT>(TextureIndex::RejectionReasons)].Get(),
++                                               gpu::PixelShaderResourceState(), commonState));
++    barriers.push_back(gpu::MakeTextureBarrier(*slot.textures[static_cast<UINT>(TextureIndex::ExposureScale)].Get(),
++                                               gpu::PixelShaderResourceState(), commonState));
++    barriers.push_back(
++        gpu::MakeTextureBarrier(*history_[historyWriteIndex_].color.Get(), gpu::CopyDestState(), commonState));
++    barriers.push_back(
++        gpu::MakeTextureBarrier(*history_[historyWriteIndex_].depth.Get(), gpu::CopyDestState(), commonState));
++    barriers.push_back(
++        gpu::MakeTextureBarrier(*history_[historyWriteIndex_].identity.Get(), gpu::CopyDestState(), commonState));
+     barriers.push_back(gpu::MakeTextureBarrier(*frameContext.renderTarget, gpu::RenderTargetState(),
+                                                gpu::FrameEndState(frameContext.headless)));
+     gpu::SubmitTextureBarriers(commandList, barriers);
++
++    previousJitterUv_ = scenarioState.currentJitterUv;
++    previousPreExposure_ = scenarioState.currentPreExposure;
++    hasHistory_ = true;
++    historyReadIndex_ = historyWriteIndex_;
++    historyWriteIndex_ = 1U - historyWriteIndex_;
++    EnsureDistinctHistoryIndices();
++    lastRenderedFrameSlot_ = frameContext.frameSlot;
++    resetRequested_ = false;
+     return {};
+ }
+ 
++std::expected<Renderer::ReadbackOutputs, lgp::framework::Error> Renderer::ReadBackOutputs() const
++{
++    if (frameSlots_.empty() || lastDrawableSize_.empty())
++    {
++        return std::unexpected(
++            lgp::framework::MakeError("Renderer::ReadBackOutputs", "No Solution frame has been rendered yet."));
++    }
++
++    ReadbackOutputs outputs{};
++    auto currentDepth = gpu::ReadBackTexture(
++        *deviceResources_,
++        *frameSlots_[lastRenderedFrameSlot_].textures[static_cast<UINT>(TextureIndex::CurrentDepth)].Get(),
++        gpu::FrameStartState(true));
++    if (!currentDepth)
++    {
++        return std::unexpected(std::move(currentDepth.error()));
++    }
++    outputs.currentDepth = std::move(*currentDepth);
++
++    auto currentIdentity = gpu::ReadBackTexture(
++        *deviceResources_,
++        *frameSlots_[lastRenderedFrameSlot_].textures[static_cast<UINT>(TextureIndex::CurrentIdentity)].Get(),
++        gpu::FrameStartState(true));
++    if (!currentIdentity)
++    {
++        return std::unexpected(std::move(currentIdentity.error()));
++    }
++    outputs.currentIdentity = std::move(*currentIdentity);
++
++    auto motionClipDepth = gpu::ReadBackTexture(
++        *deviceResources_,
++        *frameSlots_[lastRenderedFrameSlot_].textures[static_cast<UINT>(TextureIndex::MotionClipDepth)].Get(),
++        gpu::FrameStartState(true));
++    if (!motionClipDepth)
++    {
++        return std::unexpected(std::move(motionClipDepth.error()));
++    }
++    outputs.motionClipDepth = std::move(*motionClipDepth);
++
++    auto previousHistoryUv = gpu::ReadBackTexture(
++        *deviceResources_,
++        *frameSlots_[lastRenderedFrameSlot_].textures[static_cast<UINT>(TextureIndex::PreviousHistoryUv)].Get(),
++        gpu::FrameStartState(true));
++    if (!previousHistoryUv)
++    {
++        return std::unexpected(std::move(previousHistoryUv.error()));
++    }
++    outputs.previousHistoryUv = std::move(*previousHistoryUv);
++
++    auto rejectionReasons = gpu::ReadBackTexture(
++        *deviceResources_,
++        *frameSlots_[lastRenderedFrameSlot_].textures[static_cast<UINT>(TextureIndex::RejectionReasons)].Get(),
++        gpu::FrameStartState(true));
++    if (!rejectionReasons)
++    {
++        return std::unexpected(std::move(rejectionReasons.error()));
++    }
++    outputs.rejectionReasons = std::move(*rejectionReasons);
++
++    auto exposureScale = gpu::ReadBackTexture(
++        *deviceResources_,
++        *frameSlots_[lastRenderedFrameSlot_].textures[static_cast<UINT>(TextureIndex::ExposureScale)].Get(),
++        gpu::FrameStartState(true));
++    if (!exposureScale)
++    {
++        return std::unexpected(std::move(exposureScale.error()));
++    }
++    outputs.exposureScale = std::move(*exposureScale);
++    return outputs;
++}
++
+ void Renderer::Shutdown(lgp::framework::DeviceResources &) noexcept
+ {
++    if (imguiFrameBegun_)
++    {
++        ImGui::EndFrame();
++        imguiFrameBegun_ = false;
++    }
++    if (imguiInitialized_)
++    {
++        ImGui_ImplDX12_Shutdown();
++        ImGui::DestroyContext();
++        imguiInitialized_ = false;
++    }
++    if (deviceResources_ != nullptr && imguiFontDescriptor_)
++    {
++        deviceResources_->shader_visible_cbv_srv_uav_heap().Free(imguiFontDescriptor_);
++        imguiFontDescriptor_ = {};
++    }
++
+     ReleaseSizeDependentResources();
+     compositePipeline_.Reset();
+-    baselinePipeline_.Reset();
++    validatePipeline_.Reset();
+     generatePipeline_.Reset();
+     rootSignature_.Reset();
+ }
+ 
+-} // namespace ch11::reprojection::starter
++} // namespace ch11::reprojection::solution
+diff --git a/chapters/motion-vectors-and-reprojection/Starter/Renderer.hpp b/chapters/motion-vectors-and-reprojection/Starter/Renderer.hpp
+index 3162181..1a5df7a 100644
+--- a/chapters/motion-vectors-and-reprojection/Starter/Renderer.hpp
++++ b/chapters/motion-vectors-and-reprojection/Starter/Renderer.hpp
+@@ -1,5 +1,7 @@
+ #pragma once
+ 
++#include "../Common/GpuLabSupport.hpp"
++
+ #include <lgp/framework/application.hpp>
+ #include <lgp/framework/buffer.hpp>
+ #include <lgp/framework/descriptors.hpp>
+@@ -9,9 +11,10 @@
+ 
+ #include <array>
+ #include <cstdint>
++#include <expected>
+ #include <vector>
+ 
+-namespace ch11::reprojection::starter
++namespace ch11::reprojection::solution
+ {
+ 
+ class Renderer final : public lgp::framework::IChapterRenderer
+@@ -34,9 +37,28 @@ class Renderer final : public lgp::framework::IChapterRenderer
+     [[nodiscard]] lgp::framework::Status OnResize(lgp::framework::DeviceResources &deviceResources,
+                                                   lgp::framework::Extent2D drawableSize) override;
+     [[nodiscard]] lgp::framework::Status Update(lgp::framework::UpdateContext const &context) override;
++    [[nodiscard]] lgp::framework::Status BuildUi(lgp::framework::UpdateContext const &context) override;
+     [[nodiscard]] lgp::framework::Status Render(lgp::framework::FrameContext const &frameContext) override;
+     void Shutdown(lgp::framework::DeviceResources &deviceResources) noexcept override;
+ 
++    void SetScenario(gpu::Scenario scenario) noexcept;
++    void RequestHistoryReset() noexcept;
++    [[nodiscard]] UINT HistoryReadIndex() const noexcept;
++    [[nodiscard]] UINT HistoryWriteIndex() const noexcept;
++    [[nodiscard]] D3D12_GPU_VIRTUAL_ADDRESS FrameConstantAddress(UINT frameSlot) const noexcept;
++
++    struct ReadbackOutputs final
++    {
++        gpu::TextureReadback currentDepth{};
++        gpu::TextureReadback currentIdentity{};
++        gpu::TextureReadback motionClipDepth{};
++        gpu::TextureReadback previousHistoryUv{};
++        gpu::TextureReadback rejectionReasons{};
++        gpu::TextureReadback exposureScale{};
++    };
++
++    [[nodiscard]] std::expected<ReadbackOutputs, lgp::framework::Error> ReadBackOutputs() const;
++
+   private:
+     struct FrameSlotResources final
+     {
+@@ -44,26 +66,50 @@ class Renderer final : public lgp::framework::IChapterRenderer
+         lgp::framework::Buffer frameConstants{};
+     };
+ 
++    struct HistoryResources final
++    {
++        Microsoft::WRL::ComPtr<ID3D12Resource> color{};
++        Microsoft::WRL::ComPtr<ID3D12Resource> depth{};
++        Microsoft::WRL::ComPtr<ID3D12Resource> identity{};
++    };
++
+     [[nodiscard]] lgp::framework::Status CreateShaders();
+     [[nodiscard]] lgp::framework::Status CreateRootSignature();
+     [[nodiscard]] lgp::framework::Status CreatePipelines();
+     [[nodiscard]] lgp::framework::Status CreateSizeDependentResources(lgp::framework::Extent2D drawableSize);
++    [[nodiscard]] lgp::framework::Status InitializeImGui();
+     void ReleaseSizeDependentResources() noexcept;
+-
+-    [[nodiscard]] UINT DescriptorIndex(UINT frameSlot, UINT textureIndex, bool uav) const noexcept;
+-    [[nodiscard]] D3D12_GPU_VIRTUAL_ADDRESS WriteFrameConstants(UINT frameSlot, lgp::framework::Extent2D size);
++    void EnsureDistinctHistoryIndices() noexcept;
++    void UpdateHistorySrvs(UINT frameSlot, UINT historyIndex);
++    [[nodiscard]] UINT DescriptorIndex(UINT frameSlot, UINT descriptorIndex, bool uav) const noexcept;
++    [[nodiscard]] D3D12_GPU_VIRTUAL_ADDRESS WriteFrameConstants(UINT frameSlot, lgp::framework::Extent2D size,
++                                                                bool resetRequested);
+ 
+     lgp::framework::DeviceResources *deviceResources_{};
+     lgp::framework::CompiledShader generateShader_{};
+-    lgp::framework::CompiledShader baselineShader_{};
++    lgp::framework::CompiledShader validateShader_{};
+     lgp::framework::CompiledShader fullscreenVertexShader_{};
+     lgp::framework::CompiledShader compositePixelShader_{};
+     Microsoft::WRL::ComPtr<ID3D12RootSignature> rootSignature_{};
+     Microsoft::WRL::ComPtr<ID3D12PipelineState> generatePipeline_{};
+-    Microsoft::WRL::ComPtr<ID3D12PipelineState> baselinePipeline_{};
++    Microsoft::WRL::ComPtr<ID3D12PipelineState> validatePipeline_{};
+     Microsoft::WRL::ComPtr<ID3D12PipelineState> compositePipeline_{};
+     lgp::framework::DescriptorAllocation textureDescriptors_{};
++    lgp::framework::DescriptorAllocation imguiFontDescriptor_{};
+     std::vector<FrameSlotResources> frameSlots_{};
++    std::array<HistoryResources, 2U> history_{};
++    gpu::Scenario scenario_{gpu::Scenario::MotionCurrent};
++    Float2 previousJitterUv_{};
++    float previousPreExposure_{1.0F};
++    UINT historyReadIndex_{0U};
++    UINT historyWriteIndex_{1U};
++    UINT lastRenderedFrameSlot_{0U};
++    lgp::framework::Extent2D lastDrawableSize_{};
++    bool hasHistory_{false};
++    bool resetRequested_{false};
++    bool headless_{false};
++    bool imguiInitialized_{false};
++    bool imguiFrameBegun_{false};
+ };
+ 
+-} // namespace ch11::reprojection::starter
++} // namespace ch11::reprojection::solution
+diff --git a/chapters/motion-vectors-and-reprojection/Starter/ReprojectionLab.hlsl b/chapters/motion-vectors-and-reprojection/Starter/ReprojectionLab.hlsl
+index 48d7b44..e6948e3 100644
+--- a/chapters/motion-vectors-and-reprojection/Starter/ReprojectionLab.hlsl
++++ b/chapters/motion-vectors-and-reprojection/Starter/ReprojectionLab.hlsl
+@@ -18,10 +18,16 @@ cbuffer FrameConstants : register(b0)
+ };
+ 
+ Texture2D<float4> gCurrentColor : register(t0);
++Texture2D<float> gCurrentDepth : register(t1);
++Texture2D<uint> gCurrentIdentity : register(t2);
+ Texture2D<float4> gMotionClipDepth : register(t3);
++Texture2D<float2> gPreviousHistoryUv : register(t4);
+ Texture2D<float4> gReprojectedHistoryColor : register(t5);
+ Texture2D<uint> gRejectionReasons : register(t6);
+ Texture2D<float> gExposureScale : register(t7);
++Texture2D<float4> gHistoryColor : register(t8);
++Texture2D<float> gHistoryDepth : register(t9);
++Texture2D<uint> gHistoryIdentity : register(t10);
+ 
+ RWTexture2D<float4> gCurrentColorUav : register(u0);
+ RWTexture2D<float> gCurrentDepthUav : register(u1);
+@@ -32,6 +38,9 @@ RWTexture2D<float4> gReprojectedHistoryColorUav : register(u5);
+ RWTexture2D<uint> gRejectionReasonsUav : register(u6);
+ RWTexture2D<float> gExposureScaleUav : register(u7);
+ 
++SamplerState gLinearClamp : register(s0);
++SamplerState gPointClamp : register(s1);
++
+ static const uint kRejectNoHistory = 1u << 0u;
+ static const uint kRejectReset = 1u << 1u;
+ static const uint kRejectNonFinite = 1u << 2u;
+@@ -67,6 +76,16 @@ float4 TransformRows(float4 rows[4], float2 localUv)
+     return float4(dot(rows[0], localPoint), dot(rows[1], localPoint), dot(rows[2], localPoint), dot(rows[3], localPoint));
+ }
+ 
++bool IsFinite4(float4 value)
++{
++    return all(isfinite(value));
++}
++
++bool IsFinite2(float2 value)
++{
++    return all(isfinite(value));
++}
++
+ float2 ProjectUnjitteredUv(float4 clipPosition)
+ {
+     float inverseW = 1.0f / clipPosition.w;
+@@ -75,6 +94,25 @@ float2 ProjectUnjitteredUv(float4 clipPosition)
+     return float2((ndcX * 0.5f) + 0.5f, (-ndcY * 0.5f) + 0.5f);
+ }
+ 
++float DepthGradient(float2 uv)
++{
++    float2 texel = 1.0f / float2(gHeader0.xy);
++    float center = gHistoryDepth.SampleLevel(gPointClamp, uv, 0.0f);
++    float left = gHistoryDepth.SampleLevel(gPointClamp, uv + float2(-texel.x, 0.0f), 0.0f);
++    float right = gHistoryDepth.SampleLevel(gPointClamp, uv + float2(texel.x, 0.0f), 0.0f);
++    float up = gHistoryDepth.SampleLevel(gPointClamp, uv + float2(0.0f, -texel.y), 0.0f);
++    float down = gHistoryDepth.SampleLevel(gPointClamp, uv + float2(0.0f, texel.y), 0.0f);
++    return max(max(abs(center - left), abs(right - center)), max(abs(center - up), abs(down - center)));
++}
++
++uint PointSampleIdentity(float2 uv)
++{
++    float2 clampedUv = clamp(uv, 0.0f.xx, asfloat(0x3F7FFFFFu).xx);
++    uint2 pixel = uint2(clampedUv * float2(gHeader0.xy));
++    pixel = min(pixel, gHeader0.xy - uint2(1u, 1u));
++    return gHistoryIdentity.Load(int3(pixel, 0));
++}
++
+ uint PickRejectColor(uint reasons)
+ {
+     if ((reasons & (kRejectNoHistory | kRejectReset)) != 0u)
+@@ -180,19 +218,28 @@ void GenerateCurrentFrameCS(uint3 dispatchThreadId : SV_DispatchThreadID)
+ }
+ 
+ [numthreads(8, 8, 1)]
+-void BaselineNoHistoryCS(uint3 dispatchThreadId : SV_DispatchThreadID)
++void ValidateReprojectionCS(uint3 dispatchThreadId : SV_DispatchThreadID)
+ {
+     if (dispatchThreadId.x >= gHeader0.x || dispatchThreadId.y >= gHeader0.y)
+     {
+         return;
+     }
+ 
+-    float2 currentRasterUv = RasterUv(dispatchThreadId.xy);
++    float2 rasterUv = RasterUv(dispatchThreadId.xy);
+     float4 motionClipDepth = gMotionClipDepth.Load(int3(dispatchThreadId.xy, 0));
+     float2 previousHistoryUv =
+-        currentRasterUv + motionClipDepth.xy + gPreviousJitterExposure.xy - gCurrentJitterExposure.xy;
+-    uint reasons = kRejectNoHistory;
+-    if (!all(isfinite(previousHistoryUv)) || !isfinite(motionClipDepth.z))
++        rasterUv + motionClipDepth.xy + gPreviousJitterExposure.xy - gCurrentJitterExposure.xy;
++
++    uint reasons = 0u;
++    if ((gHeader0.w & 0x1u) == 0u)
++    {
++        reasons |= kRejectNoHistory;
++    }
++    if ((gHeader0.w & 0x2u) != 0u)
++    {
++        reasons |= kRejectReset;
++    }
++    if (!IsFinite2(previousHistoryUv) || !isfinite(motionClipDepth.z) || !isfinite(motionClipDepth.w))
+     {
+         reasons |= kRejectNonFinite;
+     }
+@@ -200,17 +247,46 @@ void BaselineNoHistoryCS(uint3 dispatchThreadId : SV_DispatchThreadID)
+     {
+         reasons |= kRejectPreviousW;
+     }
++
+     float2 halfTexel = 0.5f / float2(gHeader0.xy);
+-    if (previousHistoryUv.x < halfTexel.x || previousHistoryUv.x > 1.0f - halfTexel.x ||
+-        previousHistoryUv.y < halfTexel.y || previousHistoryUv.y > 1.0f - halfTexel.y)
++    if (previousHistoryUv.x < halfTexel.x || previousHistoryUv.x > (1.0f - halfTexel.x) ||
++        previousHistoryUv.y < halfTexel.y || previousHistoryUv.y > (1.0f - halfTexel.y))
+     {
+         reasons |= kRejectUvOutOfBounds;
+     }
+ 
++    float sampledPreviousDepth = gHistoryDepth.SampleLevel(gPointClamp, previousHistoryUv, 0.0f);
++    float localGradient = DepthGradient(previousHistoryUv);
++    float depthScale = max(abs(motionClipDepth.w), abs(sampledPreviousDepth));
++    float tolerance = max(max(gDepthSettings.x, gDepthSettings.y * depthScale), gDepthSettings.z * abs(localGradient));
++    if (abs(sampledPreviousDepth - motionClipDepth.w) > tolerance)
++    {
++        reasons |= kRejectDepthMismatch;
++    }
++
++    uint currentIdentity = gCurrentIdentity.Load(int3(dispatchThreadId.xy, 0));
++    uint previousIdentity = PointSampleIdentity(previousHistoryUv);
++    if (currentIdentity != previousIdentity)
++    {
++        reasons |= kRejectIdentityMismatch;
++    }
++
++    float scale = gCurrentJitterExposure.z / gPreviousJitterExposure.z;
++    float symmetricRatio = max(scale, 1.0f / scale);
++    if (!isfinite(scale) || gCurrentJitterExposure.z <= 0.0f || gPreviousJitterExposure.z <= 0.0f ||
++        !isfinite(symmetricRatio) || symmetricRatio > gPreviousJitterExposure.w)
++    {
++        reasons |= kRejectExposure;
++        if (gCurrentJitterExposure.z <= 0.0f || gPreviousJitterExposure.z <= 0.0f || !isfinite(scale))
++        {
++            scale = asfloat(0x7FC00000u);
++        }
++    }
++
+     gPreviousHistoryUvUav[dispatchThreadId.xy] = previousHistoryUv;
+-    gReprojectedHistoryColorUav[dispatchThreadId.xy] = 0.0f.xxxx;
++    gReprojectedHistoryColorUav[dispatchThreadId.xy] = gHistoryColor.SampleLevel(gLinearClamp, previousHistoryUv, 0.0f) * scale;
+     gRejectionReasonsUav[dispatchThreadId.xy] = reasons;
+-    gExposureScaleUav[dispatchThreadId.xy] = 1.0f;
++    gExposureScaleUav[dispatchThreadId.xy] = scale;
+ }
+ 
+ struct FullscreenVertexOutput
+@@ -235,7 +311,6 @@ float4 CompositePS(FullscreenVertexOutput input) : SV_Target0
+ {
+     int2 pixel = int2(input.position.xy);
+     float4 currentColor = gCurrentColor.Load(int3(pixel, 0));
+-    float2 motion = gMotionClipDepth.Load(int3(pixel, 0)).xy;
+     float4 historyColor = gReprojectedHistoryColor.Load(int3(pixel, 0));
+     uint reasons = gRejectionReasons.Load(int3(pixel, 0));
+ 
+@@ -245,8 +320,6 @@ float4 CompositePS(FullscreenVertexOutput input) : SV_Target0
+                                1.0f));
+     }
+ 
+-    float3 tint = (reasons == kRejectNoHistory)
+-        ? float3(0.5f + (4.0f * motion.x), 0.5f + (4.0f * motion.y), 0.5f)
+-        : RejectTint(reasons);
++    float3 tint = RejectTint(reasons);
+     return saturate(float4((0.25f * currentColor.rgb) + (0.75f * tint), 1.0f));
+ }

@@ -1,0 +1,302 @@
+diff --git a/chapters/transient-resource-allocation-and-aliasing/Starter/Renderer.cpp b/chapters/transient-resource-allocation-and-aliasing/Starter/Renderer.cpp
+index 6b18bee..f0d7125 100644
+--- a/chapters/transient-resource-allocation-and-aliasing/Starter/Renderer.cpp
++++ b/chapters/transient-resource-allocation-and-aliasing/Starter/Renderer.cpp
+@@ -25,6 +25,8 @@ namespace ch09::transient_aliasing::starter
+ namespace
+ {
+ 
++using namespace ch08::frame_graph;
++using namespace transient_allocation;
+ using gpu::MakeTextureBarrier;
+ using gpu::RenderTargetState;
+ using gpu::ShaderResourceState;
+@@ -290,6 +292,32 @@ lgp::framework::Status Renderer::CreateTransientTextures(lgp::framework::Extent2
+     return {};
+ }
+ 
++lgp::framework::Status Renderer::ApplyBarrierGroup(ID3D12GraphicsCommandList7 &commandList,
++                                                   TextureBarrierGroup const &group,
++                                                   std::vector<ID3D12Resource *> const &resources) const
++{
++    std::vector<D3D12_TEXTURE_BARRIER> barriers{};
++    barriers.reserve(group.records.size());
++    for (TextureBarrierRecord const &record : group.records)
++    {
++        if (record.resourceId.value >= resources.size() || resources[record.resourceId.value] == nullptr)
++        {
++            return std::unexpected(lgp::framework::MakeError("Renderer::ApplyBarrierGroup",
++                                                             "A compiled texture ID has no bound D3D12 resource."));
++        }
++        D3D12_TEXTURE_BARRIER_FLAGS const flags = record.before.layout == D3D12_BARRIER_LAYOUT_UNDEFINED &&
++                                                          record.after.layout == D3D12_BARRIER_LAYOUT_RENDER_TARGET
++                                                      ? D3D12_TEXTURE_BARRIER_FLAG_DISCARD
++                                                      : D3D12_TEXTURE_BARRIER_FLAG_NONE;
++        barriers.push_back(MakeTextureBarrier(*resources[record.resourceId.value], record.before, record.after, flags));
++    }
++    if (!barriers.empty())
++    {
++        SubmitTextureBarriers(commandList, barriers.data(), static_cast<UINT>(barriers.size()));
++    }
++    return {};
++}
++
+ lgp::framework::Status Renderer::ExecuteAliasHandoff(ID3D12GraphicsCommandList7 &commandList)
+ {
+     if (!graphPlan_ || !allocationPlan_)
+@@ -298,18 +326,33 @@ lgp::framework::Status Renderer::ExecuteAliasHandoff(ID3D12GraphicsCommandList7
+             "Renderer::ExecuteAliasHandoff", "The compiled graph and allocation plan must both be available."));
+     }
+ 
+-    auto const activation = std::ranges::find(allocationPlan_->aliasActivations, graphPlan_->textureC,
+-                                              &transient_allocation::AliasActivation::resourceId);
+-    if (activation == allocationPlan_->aliasActivations.end() || activation->passIndex != 2U ||
+-        activation->predecessorResourceIds != std::vector<ch08::frame_graph::TextureResourceId>{graphPlan_->textureA})
++    auto const accentPass =
++        std::ranges::find(graphPlan_->graph.scheduledPasses, graphPlan_->accentPass, &CompiledPass::id);
++    if (accentPass == graphPlan_->graph.scheduledPasses.end())
++    {
++        return std::unexpected(lgp::framework::MakeError(
++            "Renderer::ExecuteAliasHandoff", "The compiled schedule does not contain the accent-mask pass."));
++    }
++
++    auto const activation =
++        std::ranges::find(allocationPlan_->aliasActivations, graphPlan_->textureC, &AliasActivation::resourceId);
++    if (activation == allocationPlan_->aliasActivations.end() ||
++        std::ranges::count(allocationPlan_->aliasActivations, graphPlan_->textureC, &AliasActivation::resourceId) != 1)
+     {
+         return std::unexpected(lgp::framework::MakeError(
+             "Renderer::ExecuteAliasHandoff",
+-            "The concrete lab plan must activate C at pass 2 with A as its only predecessor."));
++            "The concrete lab plan must contain exactly one alias activation for texture C."));
++    }
++    if (activation->passIndex != accentPass->executionIndex ||
++        activation->predecessorResourceIds != std::vector<TextureResourceId>{graphPlan_->textureA})
++    {
++        return std::unexpected(lgp::framework::MakeError(
++            "Renderer::ExecuteAliasHandoff",
++            "Texture C must activate at accent-mask with texture A as its only immediate predecessor."));
+     }
+ 
+-    transient_allocation::TexturePlacement const *placementA = FindPlacement(*allocationPlan_, graphPlan_->textureA);
+-    transient_allocation::TexturePlacement const *placementC = FindPlacement(*allocationPlan_, graphPlan_->textureC);
++    TexturePlacement const *placementA = FindPlacement(*allocationPlan_, graphPlan_->textureA);
++    TexturePlacement const *placementC = FindPlacement(*allocationPlan_, graphPlan_->textureC);
+     if (placementA == nullptr || placementC == nullptr || placementA->heapIndex != placementC->heapIndex ||
+         placementA->offset >= placementC->offset + placementC->allocationSize ||
+         placementC->offset >= placementA->offset + placementA->allocationSize)
+@@ -319,16 +362,34 @@ lgp::framework::Status Renderer::ExecuteAliasHandoff(ID3D12GraphicsCommandList7
+             "The planned A-to-C activation requires overlapping byte ranges in the same physical heap."));
+     }
+ 
++    std::vector<ID3D12Resource *> resources(graphPlan_->graph.textureResources.size(), nullptr);
++    resources[graphPlan_->textureA.value] = transientTextures_[0].Get();
++    resources[graphPlan_->textureB.value] = transientTextures_[1].Get();
++    resources[graphPlan_->textureC.value] = transientTextures_[2].Get();
++    TextureResourceId const predecessorId = activation->predecessorResourceIds.front();
++    TextureResourceId const activatedId = activation->resourceId;
++    if (predecessorId.value >= resources.size() || activatedId.value >= resources.size() ||
++        resources[predecessorId.value] == nullptr || resources[activatedId.value] == nullptr)
++    {
++        return std::unexpected(lgp::framework::MakeError(
++            "Renderer::ExecuteAliasHandoff",
++            "The planned alias activation resource IDs are not bound to concrete D3D12 resources."));
++    }
++
+     lgp::framework::TextureBarrierState const deactivateAfter{
+         D3D12_BARRIER_SYNC_RENDER_TARGET, D3D12_BARRIER_ACCESS_NO_ACCESS, D3D12_BARRIER_LAYOUT_UNDEFINED};
+     lgp::framework::TextureBarrierState const activateBefore{
+         D3D12_BARRIER_SYNC_PIXEL_SHADING, D3D12_BARRIER_ACCESS_NO_ACCESS, D3D12_BARRIER_LAYOUT_UNDEFINED};
+     std::array<D3D12_TEXTURE_BARRIER, 2U> barriers{
+-        MakeTextureBarrier(*transientTextures_[0].Get(), ShaderResourceState(), deactivateAfter),
+-        MakeTextureBarrier(*transientTextures_[2].Get(), activateBefore, RenderTargetState(),
++        MakeTextureBarrier(*resources[predecessorId.value], ShaderResourceState(), deactivateAfter),
++        MakeTextureBarrier(*resources[activatedId.value], activateBefore, RenderTargetState(),
+                            D3D12_TEXTURE_BARRIER_FLAG_DISCARD),
+     };
+     SubmitTextureBarriers(commandList, barriers.data(), static_cast<UINT>(barriers.size()));
++    lastAliasHandoffTrace_ = {
++        {predecessorId, ShaderResourceState(), deactivateAfter, D3D12_TEXTURE_BARRIER_FLAG_NONE},
++        {activatedId, activateBefore, RenderTargetState(), D3D12_TEXTURE_BARRIER_FLAG_DISCARD},
++    };
+     return {};
+ }
+ 
+@@ -371,59 +432,72 @@ lgp::framework::Status Renderer::Update(lgp::framework::UpdateContext const &)
+ 
+ lgp::framework::Status Renderer::Render(lgp::framework::FrameContext const &frameContext)
+ {
+-    if (frameContext.commandList == nullptr || frameContext.renderTarget == nullptr ||
+-        transientTextures_[0] == nullptr || transientTextures_[1] == nullptr || transientTextures_[2] == nullptr)
++    if (frameContext.commandList == nullptr || frameContext.renderTarget == nullptr || !graphPlan_ ||
++        !allocationPlan_ || transientTextures_[0] == nullptr || transientTextures_[1] == nullptr ||
++        transientTextures_[2] == nullptr)
+     {
+         return {};
+     }
+ 
+     ID3D12GraphicsCommandList7 &commandList = *frameContext.commandList;
++    std::vector<ID3D12Resource *> resources(graphPlan_->graph.textureResources.size(), nullptr);
++    resources[graphPlan_->textureA.value] = transientTextures_[0].Get();
++    resources[graphPlan_->textureB.value] = transientTextures_[1].Get();
++    resources[graphPlan_->textureC.value] = transientTextures_[2].Get();
++    resources[graphPlan_->frameTarget.value] = frameContext.renderTarget;
++
+     commandList.RSSetViewports(1U, &frameContext.viewport);
+     commandList.RSSetScissorRects(1U, &frameContext.scissorRect);
+     commandList.IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+     commandList.SetGraphicsRootSignature(rootSignature_.Get());
+-
+-    std::array<D3D12_TEXTURE_BARRIER, 1U> analyticBarriers{
+-        MakeTextureBarrier(*transientTextures_[0].Get(), UndefinedState(), RenderTargetState(),
+-                           D3D12_TEXTURE_BARRIER_FLAG_DISCARD),
+-    };
+-    SubmitTextureBarriers(commandList, analyticBarriers.data(), static_cast<UINT>(analyticBarriers.size()));
+-    DrawTo(commandList, *analyticPipeline_.Get(), transientRtvs_.CpuHandle(0U));
+-
+-    std::array<D3D12_TEXTURE_BARRIER, 2U> copyBarriers{
+-        MakeTextureBarrier(*transientTextures_[0].Get(), RenderTargetState(), ShaderResourceState()),
+-        MakeTextureBarrier(*transientTextures_[1].Get(), UndefinedState(), RenderTargetState(),
+-                           D3D12_TEXTURE_BARRIER_FLAG_DISCARD),
+-    };
+-    SubmitTextureBarriers(commandList, copyBarriers.data(), static_cast<UINT>(copyBarriers.size()));
+     ID3D12DescriptorHeap *const descriptorHeaps[]{frameContext.shaderVisibleCbvSrvUavHeap};
+-    commandList.SetDescriptorHeaps(1U, descriptorHeaps);
+-    commandList.SetGraphicsRootDescriptorTable(0U, transientSrvs_.GpuHandle(0U));
+-    DrawTo(commandList, *copyPipeline_.Get(), transientRtvs_.CpuHandle(1U));
+ 
+-    if (auto status = ExecuteAliasHandoff(commandList); !status)
++    for (CompiledPass const &pass : graphPlan_->graph.scheduledPasses)
+     {
+-        return status;
+-    }
+-    DrawTo(commandList, *accentPipeline_.Get(), transientRtvs_.CpuHandle(2U));
++        if (pass.id == graphPlan_->accentPass)
++        {
++            if (auto status = ExecuteAliasHandoff(commandList); !status)
++            {
++                return status;
++            }
++        }
++        else
++        {
++            for (TextureBarrierGroup const &barrierGroup : pass.barrierGroups)
++            {
++                if (auto status = ApplyBarrierGroup(commandList, barrierGroup, resources); !status)
++                {
++                    return status;
++                }
++            }
++        }
+ 
+-    std::array<D3D12_TEXTURE_BARRIER, 3U> compositeBarriers{
+-        MakeTextureBarrier(*transientTextures_[1].Get(), RenderTargetState(), ShaderResourceState()),
+-        MakeTextureBarrier(*transientTextures_[2].Get(), RenderTargetState(), ShaderResourceState()),
+-        MakeTextureBarrier(*frameContext.renderTarget, gpu::FrameStartState(frameContext.headless),
+-                           RenderTargetState()),
+-    };
+-    SubmitTextureBarriers(commandList, compositeBarriers.data(), static_cast<UINT>(compositeBarriers.size()));
+-    commandList.SetDescriptorHeaps(1U, descriptorHeaps);
+-    commandList.SetGraphicsRootDescriptorTable(0U, transientSrvs_.GpuHandle(1U));
+-    DrawTo(commandList, *compositePipeline_.Get(), frameContext.renderTargetView);
+-
+-    std::array<D3D12_TEXTURE_BARRIER, 3U> boundaryBarriers{
+-        MakeTextureBarrier(*transientTextures_[1].Get(), ShaderResourceState(), UndefinedState()),
+-        MakeTextureBarrier(*transientTextures_[2].Get(), ShaderResourceState(), UndefinedState()),
+-        MakeTextureBarrier(*frameContext.renderTarget, RenderTargetState(), gpu::FrameEndState(frameContext.headless)),
+-    };
+-    SubmitTextureBarriers(commandList, boundaryBarriers.data(), static_cast<UINT>(boundaryBarriers.size()));
++        if (pass.id == graphPlan_->analyticPass)
++        {
++            DrawTo(commandList, *analyticPipeline_.Get(), transientRtvs_.CpuHandle(0U));
++        }
++        else if (pass.id == graphPlan_->copyPass)
++        {
++            commandList.SetDescriptorHeaps(1U, descriptorHeaps);
++            commandList.SetGraphicsRootDescriptorTable(0U, transientSrvs_.GpuHandle(0U));
++            DrawTo(commandList, *copyPipeline_.Get(), transientRtvs_.CpuHandle(1U));
++        }
++        else if (pass.id == graphPlan_->accentPass)
++        {
++            DrawTo(commandList, *accentPipeline_.Get(), transientRtvs_.CpuHandle(2U));
++        }
++        else if (pass.id == graphPlan_->compositePass)
++        {
++            commandList.SetDescriptorHeaps(1U, descriptorHeaps);
++            commandList.SetGraphicsRootDescriptorTable(0U, transientSrvs_.GpuHandle(1U));
++            DrawTo(commandList, *compositePipeline_.Get(), frameContext.renderTargetView);
++        }
++        else if (pass.id != graphPlan_->boundaryPass)
++        {
++            return std::unexpected(lgp::framework::MakeError(
++                "Renderer::Render", "The compiled Chapter 9 schedule contains an unknown pass."));
++        }
++    }
+     return {};
+ }
+ 
+@@ -437,8 +511,14 @@ transient_allocation::TransientTextureAllocationPlan const *Renderer::Allocation
+     return allocationPlan_ ? &*allocationPlan_ : nullptr;
+ }
+ 
++std::vector<ExecutedAliasBarrierRecord> const &Renderer::LastAliasHandoffTrace() const noexcept
++{
++    return lastAliasHandoffTrace_;
++}
++
+ void Renderer::Shutdown(lgp::framework::DeviceResources &) noexcept
+ {
++    lastAliasHandoffTrace_.clear();
+     allocationPlan_.reset();
+     graphPlan_.reset();
+     for (auto &texture : transientTextures_)
+diff --git a/chapters/transient-resource-allocation-and-aliasing/Starter/Renderer.hpp b/chapters/transient-resource-allocation-and-aliasing/Starter/Renderer.hpp
+index f7be4bb..0a976ba 100644
+--- a/chapters/transient-resource-allocation-and-aliasing/Starter/Renderer.hpp
++++ b/chapters/transient-resource-allocation-and-aliasing/Starter/Renderer.hpp
+@@ -11,10 +11,19 @@
+ #include <array>
+ #include <expected>
+ #include <optional>
++#include <vector>
+ 
+ namespace ch09::transient_aliasing::starter
+ {
+ 
++struct ExecutedAliasBarrierRecord final
++{
++    ch08::frame_graph::TextureResourceId resourceId{};
++    lgp::framework::TextureBarrierState before{};
++    lgp::framework::TextureBarrierState after{};
++    D3D12_TEXTURE_BARRIER_FLAGS flags{D3D12_TEXTURE_BARRIER_FLAG_NONE};
++};
++
+ class Renderer final : public lgp::framework::IChapterRenderer
+ {
+   public:
+@@ -27,6 +36,7 @@ class Renderer final : public lgp::framework::IChapterRenderer
+ 
+     [[nodiscard]] ch08::frame_graph::CompiledPassGraph const *CompiledGraph() const noexcept;
+     [[nodiscard]] transient_allocation::TransientTextureAllocationPlan const *AllocationPlan() const noexcept;
++    [[nodiscard]] std::vector<ExecutedAliasBarrierRecord> const &LastAliasHandoffTrace() const noexcept;
+ 
+   private:
+     struct GraphExecutionPlan final
+@@ -48,6 +58,9 @@ class Renderer final : public lgp::framework::IChapterRenderer
+     [[nodiscard]] lgp::framework::Status CreatePipelineStates();
+     [[nodiscard]] lgp::framework::Status CreateTransientTextures(lgp::framework::Extent2D size);
+     [[nodiscard]] std::expected<GraphExecutionPlan, lgp::framework::Error> CompileGraph() const;
++    [[nodiscard]] lgp::framework::Status ApplyBarrierGroup(ID3D12GraphicsCommandList7 &commandList,
++                                                           ch08::frame_graph::TextureBarrierGroup const &group,
++                                                           std::vector<ID3D12Resource *> const &resources) const;
+     [[nodiscard]] lgp::framework::Status ExecuteAliasHandoff(ID3D12GraphicsCommandList7 &commandList);
+     void DrawTo(ID3D12GraphicsCommandList7 &commandList, ID3D12PipelineState &pipeline,
+                 D3D12_CPU_DESCRIPTOR_HANDLE renderTarget) const;
+@@ -69,6 +82,7 @@ class Renderer final : public lgp::framework::IChapterRenderer
+     std::array<Microsoft::WRL::ComPtr<ID3D12Resource>, 3U> transientTextures_{};
+     std::optional<GraphExecutionPlan> graphPlan_{};
+     std::optional<transient_allocation::TransientTextureAllocationPlan> allocationPlan_{};
++    std::vector<ExecutedAliasBarrierRecord> lastAliasHandoffTrace_{};
+     bool headless_{};
+ };
+ 

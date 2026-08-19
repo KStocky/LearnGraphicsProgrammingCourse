@@ -1,0 +1,31 @@
+diff --git a/chapters/gpu-work-distribution-and-indirect-execution/Starter/Renderer.cpp b/chapters/gpu-work-distribution-and-indirect-execution/Starter/Renderer.cpp
+index 9e88c7e..c6dad9a 100644
+--- a/chapters/gpu-work-distribution-and-indirect-execution/Starter/Renderer.cpp
++++ b/chapters/gpu-work-distribution-and-indirect-execution/Starter/Renderer.cpp
+@@ -613,6 +613,14 @@ lgp::framework::Status Renderer::Render(lgp::framework::FrameContext const &fram
+     commandList.SetPipelineState(classifyPipeline_.Get());
+     commandList.Dispatch(1U, 1U, 1U);
+ 
++    bufferBarriers = {
++        gpu::MakeBufferBarrier(*slot.flags.Get(), gpu::ComputeUnorderedAccessState(), gpu::ComputeShaderResourceState()),
++    };
++    gpu::SubmitBufferBarriers(commandList, bufferBarriers);
++
++    commandList.SetPipelineState(stablePipeline_.Get());
++    commandList.Dispatch(1U, 1U, 1U);
++
+     std::vector<D3D12_TEXTURE_BARRIER> textureBarriers{
+         gpu::MakeTextureBarrier(*frameContext.renderTarget, gpu::FrameStartState(frameContext), gpu::RenderTargetState()),
+     };
+@@ -634,6 +642,11 @@ lgp::framework::Status Renderer::Render(lgp::framework::FrameContext const &fram
+         commandList.DrawInstanced(command.draw.vertexCountPerInstance, command.draw.instanceCount, command.draw.startVertexLocation, command.draw.startInstanceLocation);
+     }
+ 
++    bufferBarriers = {
++        gpu::MakeBufferBarrier(*slot.flags.Get(), gpu::ComputeShaderResourceState(), gpu::ComputeUnorderedAccessState()),
++    };
++    gpu::SubmitBufferBarriers(commandList, bufferBarriers);
++
+     textureBarriers = {
+         gpu::MakeTextureBarrier(*frameContext.renderTarget, gpu::RenderTargetState(), gpu::FrameEndState(frameContext)),
+     };

@@ -1,0 +1,52 @@
+From 5a84ad0c99276c9238d5e5fcf6e48d97bde12fc8 Mon Sep 17 00:00:00 2001
+From: Patch Author <patch-author@example.invalid>
+Date: Sun, 16 Aug 2026 21:36:26 +0100
+Subject: [PATCH 2/5] Apply explicit jitter correction
+
+---
+ .../motion-vectors-and-reprojection/Starter/Renderer.cpp  | 8 +++++++-
+ .../Starter/ReprojectionLab.hlsl                          | 5 ++++-
+ 2 files changed, 11 insertions(+), 2 deletions(-)
+
+diff --git a/chapters/motion-vectors-and-reprojection/Starter/Renderer.cpp b/chapters/motion-vectors-and-reprojection/Starter/Renderer.cpp
+index 1275526..9774148 100644
+--- a/chapters/motion-vectors-and-reprojection/Starter/Renderer.cpp
++++ b/chapters/motion-vectors-and-reprojection/Starter/Renderer.cpp
+@@ -457,6 +457,12 @@ lgp::framework::Status Renderer::Render(lgp::framework::FrameContext const &fram
+     commandList.Dispatch((frameContext.drawableSize.width + gpu::kThreadsX - 1U) / gpu::kThreadsX,
+                          (frameContext.drawableSize.height + gpu::kThreadsY - 1U) / gpu::kThreadsY, 1U);
+ 
++    barriers.clear();
++    barriers.push_back(gpu::MakeTextureBarrier(*slot.textures[static_cast<UINT>(TextureIndex::MotionClipDepth)].Get(),
++                                               gpu::ComputeUnorderedAccessState(), gpu::ComputeShaderResourceState()));
++    gpu::SubmitTextureBarriers(commandList, barriers);
++    commandList.SetComputeRootDescriptorTable(
++        1U, textureDescriptors_.GpuHandle(DescriptorIndex(frameContext.frameSlot, 0U, false)));
+     commandList.SetPipelineState(baselinePipeline_.Get());
+     commandList.Dispatch((frameContext.drawableSize.width + gpu::kThreadsX - 1U) / gpu::kThreadsX,
+                          (frameContext.drawableSize.height + gpu::kThreadsY - 1U) / gpu::kThreadsY, 1U);
+@@ -465,7 +471,7 @@ lgp::framework::Status Renderer::Render(lgp::framework::FrameContext const &fram
+     barriers.push_back(gpu::MakeTextureBarrier(*slot.textures[static_cast<UINT>(TextureIndex::CurrentColor)].Get(),
+                                                gpu::ComputeUnorderedAccessState(), gpu::PixelShaderResourceState()));
+     barriers.push_back(gpu::MakeTextureBarrier(*slot.textures[static_cast<UINT>(TextureIndex::MotionClipDepth)].Get(),
+-                                               gpu::ComputeUnorderedAccessState(), gpu::PixelShaderResourceState()));
++                                               gpu::ComputeShaderResourceState(), gpu::PixelShaderResourceState()));
+     barriers.push_back(
+         gpu::MakeTextureBarrier(*slot.textures[static_cast<UINT>(TextureIndex::ReprojectedHistoryColor)].Get(),
+                                 gpu::ComputeUnorderedAccessState(), gpu::PixelShaderResourceState()));
+diff --git a/chapters/motion-vectors-and-reprojection/Starter/ReprojectionLab.hlsl b/chapters/motion-vectors-and-reprojection/Starter/ReprojectionLab.hlsl
+index 47ad7ac..38f72d6 100644
+--- a/chapters/motion-vectors-and-reprojection/Starter/ReprojectionLab.hlsl
++++ b/chapters/motion-vectors-and-reprojection/Starter/ReprojectionLab.hlsl
+@@ -187,7 +187,10 @@ void BaselineNoHistoryCS(uint3 dispatchThreadId : SV_DispatchThreadID)
+         return;
+     }
+ 
+-    gPreviousHistoryUvUav[dispatchThreadId.xy] = float2(-1.0f, -1.0f);
++    float2 currentRasterUv = RasterUv(dispatchThreadId.xy);
++    float2 motion = gMotionClipDepth.Load(int3(dispatchThreadId.xy, 0)).xy;
++    gPreviousHistoryUvUav[dispatchThreadId.xy] =
++        currentRasterUv + motion + gPreviousJitterExposure.xy - gCurrentJitterExposure.xy;
+     gReprojectedHistoryColorUav[dispatchThreadId.xy] = 0.0f.xxxx;
+     gRejectionReasonsUav[dispatchThreadId.xy] = kRejectNoHistory;
+     gExposureScaleUav[dispatchThreadId.xy] = 1.0f;

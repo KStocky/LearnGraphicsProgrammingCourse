@@ -1,0 +1,148 @@
+From 6f4d482cbe901748155d06f6259da5af383c4f57 Mon Sep 17 00:00:00 2001
+From: Copilot <copilot@example.com>
+Date: Mon, 17 Aug 2026 08:02:20 +0100
+Subject: [PATCH 4/5] Stage 4 inspect optional attachments
+
+---
+ .../Starter/Renderer.cpp                      | 75 +++++++++++++++++++
+ .../Starter/Renderer.hpp                      | 12 +++
+ 2 files changed, 87 insertions(+)
+
+diff --git a/chapters/gbuffer-and-deferred-shading/Starter/Renderer.cpp b/chapters/gbuffer-and-deferred-shading/Starter/Renderer.cpp
+index 67f48db..c7ab968 100644
+--- a/chapters/gbuffer-and-deferred-shading/Starter/Renderer.cpp
++++ b/chapters/gbuffer-and-deferred-shading/Starter/Renderer.cpp
+@@ -316,6 +316,7 @@ class Renderer::Impl final
+     [[nodiscard]] lgp::framework::Status CreateSizeDependentResources(lgp::framework::Extent2D drawableSize);
+     [[nodiscard]] lgp::framework::Status Update(lgp::framework::UpdateContext const &context);
+     [[nodiscard]] lgp::framework::Status Render(lgp::framework::FrameContext const &frameContext);
++    [[nodiscard]] std::expected<ReadbackOutputs, lgp::framework::Error> ReadBackOutputs() const;
+     void ReleaseSizeDependentResources() noexcept;
+     void Shutdown() noexcept;
+ };
+@@ -989,6 +990,75 @@ lgp::framework::Status Renderer::Impl::Render(lgp::framework::FrameContext const
+     return {};
+ }
+ 
++std::expected<Renderer::ReadbackOutputs, lgp::framework::Error> Renderer::Impl::ReadBackOutputs() const
++{
++    if (frameSlots_.empty())
++    {
++        return std::unexpected(
++            lgp::framework::MakeError("ReadBackOutputs", "No Chapter 12 Solution frame has been rendered yet."));
++    }
++
++    ReadbackOutputs outputs{};
++    auto base = gpu::ReadBackTexture(
++        *deviceResources_,
++        *frameSlots_[lastRenderedFrameSlot_].textures[TextureIndex(AttachmentIndex::BaseColorMetalness)].Get(),
++        gpu::CommonState());
++    if (!base)
++    {
++        return std::unexpected(std::move(base.error()));
++    }
++    outputs.baseColorMetalness = std::move(*base);
++
++    auto normal = gpu::ReadBackTexture(
++        *deviceResources_,
++        *frameSlots_[lastRenderedFrameSlot_].textures[TextureIndex(AttachmentIndex::OctahedralNormal)].Get(),
++        gpu::CommonState());
++    if (!normal)
++    {
++        return std::unexpected(std::move(normal.error()));
++    }
++    outputs.octahedralNormal = std::move(*normal);
++
++    auto roughness = gpu::ReadBackTexture(
++        *deviceResources_,
++        *frameSlots_[lastRenderedFrameSlot_].textures[TextureIndex(AttachmentIndex::Roughness)].Get(),
++        gpu::CommonState());
++    if (!roughness)
++    {
++        return std::unexpected(std::move(roughness.error()));
++    }
++    outputs.roughness = std::move(*roughness);
++
++    auto depth = gpu::ReadBackTexture(
++        *deviceResources_,
++        *frameSlots_[lastRenderedFrameSlot_].textures[TextureIndex(AttachmentIndex::DeviceDepth)].Get(),
++        gpu::CommonState());
++    if (!depth)
++    {
++        return std::unexpected(std::move(depth.error()));
++    }
++    outputs.deviceDepth = std::move(*depth);
++
++    auto motion = gpu::ReadBackTexture(
++        *deviceResources_, *frameSlots_[lastRenderedFrameSlot_].textures[TextureIndex(AttachmentIndex::Motion)].Get(),
++        gpu::CommonState());
++    if (!motion)
++    {
++        return std::unexpected(std::move(motion.error()));
++    }
++    outputs.motion = std::move(*motion);
++
++    auto identity = gpu::ReadBackTexture(
++        *deviceResources_, *frameSlots_[lastRenderedFrameSlot_].textures[TextureIndex(AttachmentIndex::Identity)].Get(),
++        gpu::CommonState());
++    if (!identity)
++    {
++        return std::unexpected(std::move(identity.error()));
++    }
++    outputs.identity = std::move(*identity);
++    return outputs;
++}
++
+ void Renderer::Impl::Shutdown() noexcept
+ {
+     ReleaseSizeDependentResources();
+@@ -1039,4 +1109,9 @@ void Renderer::ConfigureHeadlessTest(HeadlessTestConfiguration const &configurat
+     impl_->headlessConfiguration_ = configuration;
+ }
+ 
++std::expected<Renderer::ReadbackOutputs, lgp::framework::Error> Renderer::ReadBackOutputs() const
++{
++    return impl_->ReadBackOutputs();
++}
++
+ } // namespace ch12::gbuffer::solution
+diff --git a/chapters/gbuffer-and-deferred-shading/Starter/Renderer.hpp b/chapters/gbuffer-and-deferred-shading/Starter/Renderer.hpp
+index 0918b76..565790e 100644
+--- a/chapters/gbuffer-and-deferred-shading/Starter/Renderer.hpp
++++ b/chapters/gbuffer-and-deferred-shading/Starter/Renderer.hpp
+@@ -5,6 +5,7 @@
+ 
+ #include <lgp/framework/application.hpp>
+ 
++#include <expected>
+ #include <memory>
+ 
+ namespace ch12::gbuffer::solution
+@@ -20,6 +21,16 @@ struct HeadlessTestConfiguration final
+ class Renderer final : public lgp::framework::IChapterRenderer
+ {
+   public:
++    struct ReadbackOutputs final
++    {
++        gpu::TextureReadback baseColorMetalness{};
++        gpu::TextureReadback octahedralNormal{};
++        gpu::TextureReadback roughness{};
++        gpu::TextureReadback deviceDepth{};
++        gpu::TextureReadback motion{};
++        gpu::TextureReadback identity{};
++    };
++
+     Renderer();
+     ~Renderer() override;
+ 
+@@ -36,6 +47,7 @@ class Renderer final : public lgp::framework::IChapterRenderer
+     void Shutdown(lgp::framework::DeviceResources &deviceResources) noexcept override;
+ 
+     void ConfigureHeadlessTest(HeadlessTestConfiguration const &configuration) noexcept;
++    [[nodiscard]] std::expected<ReadbackOutputs, lgp::framework::Error> ReadBackOutputs() const;
+ 
+   private:
+     class Impl;
+-- 
+2.55.0.windows.3
+

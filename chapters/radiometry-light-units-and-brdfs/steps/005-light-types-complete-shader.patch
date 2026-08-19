@@ -1,0 +1,59 @@
+diff --git a/chapters/radiometry-light-units-and-brdfs/Starter/DirectLighting.hlsl b/chapters/radiometry-light-units-and-brdfs/Starter/DirectLighting.hlsl
+index 8d5817e8409661a0949028395d6de418684e11a1..65dd6c9f2013d1c7da6b87547f85dd3b67324d43 100644
+--- a/chapters/radiometry-light-units-and-brdfs/Starter/DirectLighting.hlsl
++++ b/chapters/radiometry-light-units-and-brdfs/Starter/DirectLighting.hlsl
+@@ -108,6 +108,13 @@ float4 LightingPS(LitVertex input) : SV_Target
+     float3 viewDirection = normalize(lighting.cameraPosition - input.worldPosition);
+     float3 lightDirection = normalize(lighting.directionToLight);
+     float normalIlluminance = lighting.intensity;
++    if (lighting.lightType != 0)
++    {
++        float3 offset = lighting.lightPosition - input.worldPosition;
++        float distanceSquared = max(dot(offset, offset), 1.0e-4);
++        lightDirection = offset * rsqrt(distanceSquared);
++        normalIlluminance = lighting.intensity / distanceSquared;
++    }
+ 
+     float nDotL = saturate(dot(normal, lightDirection));
+     float nDotV = saturate(dot(normal, viewDirection));
+@@ -132,6 +139,40 @@ float4 LightingPS(LitVertex input) : SV_Target
+     float3 specular = irradiance * specularBrdf;
+     float3 color = diffuse + specular;
+ 
++    if (lighting.visualization == 1)
++    {
++        color = irradiance;
++    }
++    else if (lighting.visualization == 2)
++    {
++        color = nDotL.xxx;
++    }
++    else if (lighting.visualization == 3)
++    {
++        color = diffuse;
++    }
++    else if (lighting.visualization == 4)
++    {
++        color = specular;
++    }
++    else if (lighting.visualization == 5)
++    {
++        color = fresnel;
++    }
++    else if (lighting.visualization == 6)
++    {
++        color = distribution.xxx;
++    }
++    else if (lighting.visualization == 7)
++    {
++        color = geometry.xxx;
++    }
++    else if (lighting.visualization == 8)
++    {
++        float3 energyEstimate = (diffuseWeight * baseColor) + fresnel;
++        bool warning = any(energyEstimate > 1.0001);
++        color = warning ? float3(8.0, 0.0, 0.0) : float3(0.0, 0.35, 0.03);
++    }
+     return float4(color, 1.0);
+ }
+ 

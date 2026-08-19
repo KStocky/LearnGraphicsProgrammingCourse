@@ -1,0 +1,25 @@
+diff --git a/chapters/pass-scheduling-and-multi-queue-execution/CMakeLists.txt b/chapters/pass-scheduling-and-multi-queue-execution/CMakeLists.txt
+index 0b5e13ff4a6a3c042223ca6889286529d658a913..9316a4e0fe40987ee411acb9ff66de707864f6bb 100644
+--- a/chapters/pass-scheduling-and-multi-queue-execution/CMakeLists.txt
++++ b/chapters/pass-scheduling-and-multi-queue-execution/CMakeLists.txt
+@@ -138,6 +138,7 @@ set_target_properties(
+         FOLDER "Chapters/PassScheduling")
+ lgp_configure_framework_chapter_app(
+     TARGET Ch10_MultiQueueScheduling_Starter
++    ENABLE_IMGUI
+     EXTRA_DEPENDENCIES ch10_multi_queue_starter_logic)
+ 
+ add_executable(Ch10_MultiQueueScheduling_Solution "${CMAKE_CURRENT_SOURCE_DIR}/Solution/Main.cpp")
+diff --git a/chapters/pass-scheduling-and-multi-queue-execution/Starter/Renderer.cpp b/chapters/pass-scheduling-and-multi-queue-execution/Starter/Renderer.cpp
+index a088ebe9666a98aa8b149c3c6269a5b74be23339..ee439e8f7f85fa711f7d33d77dd182f2f0a7c8e8 100644
+--- a/chapters/pass-scheduling-and-multi-queue-execution/Starter/Renderer.cpp
++++ b/chapters/pass-scheduling-and-multi-queue-execution/Starter/Renderer.cpp
+@@ -908,7 +908,7 @@ lgp::framework::Status Renderer::Initialize(lgp::framework::ApplicationInitConte
+     {
+         return status;
+     }
+-    return {};
++    return headless_ ? lgp::framework::Status{} : InitializeImGui();
+ }
+ 
+ lgp::framework::Status Renderer::OnResize(lgp::framework::DeviceResources &, lgp::framework::Extent2D drawableSize)

@@ -1,0 +1,731 @@
+diff --git a/chapters/tiled-forward-plus-and-clustered-lighting/Starter/ClusteredLightingLab.hlsl b/chapters/tiled-forward-plus-and-clustered-lighting/Starter/ClusteredLightingLab.hlsl
+index 469d16b..6d4e8c4 100644
+--- a/chapters/tiled-forward-plus-and-clustered-lighting/Starter/ClusteredLightingLab.hlsl
++++ b/chapters/tiled-forward-plus-and-clustered-lighting/Starter/ClusteredLightingLab.hlsl
+@@ -26,9 +26,24 @@ struct PointLightData
+     float intensity;
+ };
+ 
++struct CellLightRange
++{
++    uint offset;
++    uint count;
++    uint attemptedCount;
++    uint overflowCount;
++};
++
+ ConstantBuffer<FrameConstants> gFrame : register(b0);
+ ConstantBuffer<ObjectConstants> gObject : register(b1);
+ StructuredBuffer<PointLightData> gLights : register(t0);
++StructuredBuffer<CellLightRange> gCells : register(t1);
++StructuredBuffer<uint> gLightIndices : register(t2);
++Texture2D<float> gDepth : register(t5);
++RWStructuredBuffer<uint> gCountsUav : register(u0);
++RWStructuredBuffer<CellLightRange> gCellsUav : register(u1);
++RWStructuredBuffer<uint> gLightIndicesUav : register(u2);
++RWStructuredBuffer<uint> gStatisticsUav : register(u3);
+ 
+ struct VertexInput
+ {
+@@ -44,6 +59,9 @@ struct VertexOutput
+ };
+ 
+ static const float Pi = 3.14159265358979323846;
++static const uint ThreadCount = 64u;
++static const uint BufferCanary = 0xcdcdcdcdu;
++static const uint MaximumLightIndexCapacity = 262144u;
+ 
+ float SrgbEncode(float linearValue)
+ {
+@@ -107,3 +125,24 @@ float4 ForwardPS(VertexOutput input) : SV_Target0
+     }
+     return float4(DisplayEncode(linearColor), 1.0);
+ }
++
++
++[numthreads(ThreadCount, 1, 1)]
++void ResetListsCS(uint3 dispatchThreadId : SV_DispatchThreadID)
++{
++}
++
++[numthreads(ThreadCount, 1, 1)]
++void CountLightsCS(uint3 dispatchThreadId : SV_DispatchThreadID)
++{
++}
++
++[numthreads(1, 1, 1)]
++void PrefixCellsCS(uint3 dispatchThreadId : SV_DispatchThreadID)
++{
++}
++
++[numthreads(ThreadCount, 1, 1)]
++void FillLightsCS(uint3 dispatchThreadId : SV_DispatchThreadID)
++{
++}
+diff --git a/chapters/tiled-forward-plus-and-clustered-lighting/Starter/Renderer.cpp b/chapters/tiled-forward-plus-and-clustered-lighting/Starter/Renderer.cpp
+index 3ebb4eb..b4173b3 100644
+--- a/chapters/tiled-forward-plus-and-clustered-lighting/Starter/Renderer.cpp
++++ b/chapters/tiled-forward-plus-and-clustered-lighting/Starter/Renderer.cpp
+@@ -26,11 +26,35 @@ namespace
+ 
+ using Microsoft::WRL::ComPtr;
+ 
+-enum RootParameter : UINT
++inline constexpr UINT kDescriptorsPerSlot = 10U;
++
++enum GraphicsRootParameter : UINT
++{
++    GraphicsFrameRootConstants = 0U,
++    GraphicsObjectRootConstants = 1U,
++    GraphicsSrvTable = 2U,
++};
++
++enum ComputeRootParameter : UINT
++{
++    ComputeFrameRootConstants = 0U,
++    ComputeLightSrvTable = 1U,
++    ComputeDepthSrvTable = 2U,
++    ComputeUavTable = 3U,
++};
++
++enum DescriptorIndex : UINT
+ {
+-    FrameRootConstants = 0U,
+-    ObjectRootConstants = 1U,
+-    LightSrvTable = 2U,
++    LightSrv = 0U,
++    CellSrv = 1U,
++    IndexSrv = 2U,
++    CountSrv = 3U,
++    StatisticsSrv = 4U,
++    DepthSrv = 5U,
++    CountUav = 6U,
++    CellUav = 7U,
++    IndexUav = 8U,
++    StatisticsUav = 9U,
+ };
+ 
+ struct FrameConstants final
+@@ -43,7 +67,16 @@ struct FrameConstants final
+     DirectX::XMUINT4 options{};
+ };
+ 
++struct GpuStatistics final
++{
++    std::uint32_t attemptedCount{};
++    std::uint32_t emittedCount{};
++    std::uint32_t overflowCount{};
++    std::uint32_t cellCount{};
++};
++
+ static_assert(sizeof(FrameConstants) == 144U);
++static_assert(sizeof(GpuStatistics) == 16U);
+ 
+ [[nodiscard]] std::filesystem::path ShaderPath()
+ {
+@@ -80,6 +113,24 @@ static_assert(sizeof(FrameConstants) == 144U);
+     return convention == DepthConvention::Forward ? 0U : 1U;
+ }
+ 
++[[nodiscard]] lgp::framework::Status CreateComputePipeline(ID3D12Device10 &device, ID3D12RootSignature &rootSignature,
++                                                           lgp::framework::CompiledShader const &shader,
++                                                           char const *label, ComPtr<ID3D12PipelineState> &pipeline)
++{
++    D3D12_COMPUTE_PIPELINE_STATE_DESC description{};
++    description.pRootSignature = &rootSignature;
++    description.CS = shader.Bytecode();
++    HRESULT const result =
++        device.CreateComputePipelineState(&description, IID_PPV_ARGS(pipeline.ReleaseAndGetAddressOf()));
++    if (FAILED(result))
++    {
++        return std::unexpected(
++            lgp::framework::MakeHResultError("ID3D12Device::CreateComputePipelineState", result,
++                                             std::string{"Failed to create the Chapter 14 "} + label + " pipeline."));
++    }
++    return {};
++}
++
+ } // namespace
+ 
+ lgp::framework::Status Renderer::CreateShaders()
+@@ -98,34 +149,50 @@ lgp::framework::Status Renderer::CreateShaders()
+     options.optimize = false;
+ #endif
+ 
+-    if (auto status = gpu::CompileShader(compiler, options, L"ForwardVS", L"vs_6_0", vertexShader_); !status)
++    if (auto status = gpu::CompileShader(compiler, options, L"ForwardVS", L"vs_6_0", forwardVertexShader_); !status)
++    {
++        return status;
++    }
++    if (auto status = gpu::CompileShader(compiler, options, L"ForwardPS", L"ps_6_0", forwardPixelShader_); !status)
++    {
++        return status;
++    }
++    if (auto status = gpu::CompileShader(compiler, options, L"ResetListsCS", L"cs_6_0", resetShader_); !status)
++    {
++        return status;
++    }
++    if (auto status = gpu::CompileShader(compiler, options, L"CountLightsCS", L"cs_6_0", countShader_); !status)
++    {
++        return status;
++    }
++    if (auto status = gpu::CompileShader(compiler, options, L"PrefixCellsCS", L"cs_6_0", prefixShader_); !status)
+     {
+         return status;
+     }
+-    return gpu::CompileShader(compiler, options, L"ForwardPS", L"ps_6_0", pixelShader_);
++    return gpu::CompileShader(compiler, options, L"FillLightsCS", L"cs_6_0", fillShader_);
+ }
+ 
+-lgp::framework::Status Renderer::CreateRootSignature()
++lgp::framework::Status Renderer::CreateGraphicsRootSignature()
+ {
+-    D3D12_DESCRIPTOR_RANGE lightRange{};
+-    lightRange.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
+-    lightRange.NumDescriptors = 1U;
+-    lightRange.BaseShaderRegister = 0U;
+-    lightRange.OffsetInDescriptorsFromTableStart = D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND;
++    D3D12_DESCRIPTOR_RANGE srvRange{};
++    srvRange.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
++    srvRange.NumDescriptors = 3U;
++    srvRange.BaseShaderRegister = 0U;
++    srvRange.OffsetInDescriptorsFromTableStart = D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND;
+ 
+     D3D12_ROOT_PARAMETER parameters[3]{};
+-    parameters[FrameRootConstants].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+-    parameters[FrameRootConstants].Constants.ShaderRegister = 0U;
+-    parameters[FrameRootConstants].Constants.Num32BitValues = sizeof(FrameConstants) / sizeof(std::uint32_t);
+-    parameters[FrameRootConstants].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+-    parameters[ObjectRootConstants].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+-    parameters[ObjectRootConstants].Constants.ShaderRegister = 1U;
+-    parameters[ObjectRootConstants].Constants.Num32BitValues = sizeof(gpu::ObjectData) / sizeof(std::uint32_t);
+-    parameters[ObjectRootConstants].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+-    parameters[LightSrvTable].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+-    parameters[LightSrvTable].DescriptorTable.NumDescriptorRanges = 1U;
+-    parameters[LightSrvTable].DescriptorTable.pDescriptorRanges = &lightRange;
+-    parameters[LightSrvTable].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
++    parameters[GraphicsFrameRootConstants].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
++    parameters[GraphicsFrameRootConstants].Constants.ShaderRegister = 0U;
++    parameters[GraphicsFrameRootConstants].Constants.Num32BitValues = sizeof(FrameConstants) / sizeof(std::uint32_t);
++    parameters[GraphicsFrameRootConstants].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
++    parameters[GraphicsObjectRootConstants].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
++    parameters[GraphicsObjectRootConstants].Constants.ShaderRegister = 1U;
++    parameters[GraphicsObjectRootConstants].Constants.Num32BitValues = sizeof(gpu::ObjectData) / sizeof(std::uint32_t);
++    parameters[GraphicsObjectRootConstants].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
++    parameters[GraphicsSrvTable].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
++    parameters[GraphicsSrvTable].DescriptorTable.NumDescriptorRanges = 1U;
++    parameters[GraphicsSrvTable].DescriptorTable.pDescriptorRanges = &srvRange;
++    parameters[GraphicsSrvTable].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+ 
+     D3D12_ROOT_SIGNATURE_DESC description{};
+     description.NumParameters = static_cast<UINT>(std::size(parameters));
+@@ -145,15 +212,76 @@ lgp::framework::Status Renderer::CreateRootSignature()
+         return std::unexpected(
+             lgp::framework::MakeHResultError("D3D12SerializeRootSignature", serializeResult, BlobText(errors.Get())));
+     }
++    HRESULT const createResult =
++        deviceResources_->device()->CreateRootSignature(0U, serialized->GetBufferPointer(), serialized->GetBufferSize(),
++                                                        IID_PPV_ARGS(graphicsRootSignature_.ReleaseAndGetAddressOf()));
++    if (FAILED(createResult))
++    {
++        return std::unexpected(
++            lgp::framework::MakeHResultError("ID3D12Device::CreateRootSignature", createResult,
++                                             "Failed to create the Chapter 14 graphics root signature."));
++    }
++    return {};
++}
++
++lgp::framework::Status Renderer::CreateComputeRootSignature()
++{
++    D3D12_DESCRIPTOR_RANGE lightRange{};
++    lightRange.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
++    lightRange.NumDescriptors = 1U;
++    lightRange.BaseShaderRegister = 0U;
++    lightRange.OffsetInDescriptorsFromTableStart = D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND;
++    D3D12_DESCRIPTOR_RANGE depthRange{};
++    depthRange.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
++    depthRange.NumDescriptors = 1U;
++    depthRange.BaseShaderRegister = 5U;
++    depthRange.OffsetInDescriptorsFromTableStart = D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND;
++    D3D12_DESCRIPTOR_RANGE uavRange{};
++    uavRange.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_UAV;
++    uavRange.NumDescriptors = 4U;
++    uavRange.BaseShaderRegister = 0U;
++    uavRange.OffsetInDescriptorsFromTableStart = D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND;
++
++    D3D12_ROOT_PARAMETER parameters[4]{};
++    parameters[ComputeFrameRootConstants].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
++    parameters[ComputeFrameRootConstants].Constants.ShaderRegister = 0U;
++    parameters[ComputeFrameRootConstants].Constants.Num32BitValues = sizeof(FrameConstants) / sizeof(std::uint32_t);
++    parameters[ComputeFrameRootConstants].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
++    parameters[ComputeLightSrvTable].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
++    parameters[ComputeLightSrvTable].DescriptorTable.NumDescriptorRanges = 1U;
++    parameters[ComputeLightSrvTable].DescriptorTable.pDescriptorRanges = &lightRange;
++    parameters[ComputeLightSrvTable].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
++    parameters[ComputeDepthSrvTable].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
++    parameters[ComputeDepthSrvTable].DescriptorTable.NumDescriptorRanges = 1U;
++    parameters[ComputeDepthSrvTable].DescriptorTable.pDescriptorRanges = &depthRange;
++    parameters[ComputeDepthSrvTable].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
++    parameters[ComputeUavTable].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
++    parameters[ComputeUavTable].DescriptorTable.NumDescriptorRanges = 1U;
++    parameters[ComputeUavTable].DescriptorTable.pDescriptorRanges = &uavRange;
++    parameters[ComputeUavTable].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+ 
++    D3D12_ROOT_SIGNATURE_DESC description{};
++    description.NumParameters = static_cast<UINT>(std::size(parameters));
++    description.pParameters = parameters;
++
++    ComPtr<ID3DBlob> serialized{};
++    ComPtr<ID3DBlob> errors{};
++    HRESULT const serializeResult =
++        D3D12SerializeRootSignature(&description, D3D_ROOT_SIGNATURE_VERSION_1, serialized.ReleaseAndGetAddressOf(),
++                                    errors.ReleaseAndGetAddressOf());
++    if (FAILED(serializeResult))
++    {
++        return std::unexpected(
++            lgp::framework::MakeHResultError("D3D12SerializeRootSignature", serializeResult, BlobText(errors.Get())));
++    }
+     HRESULT const createResult =
+         deviceResources_->device()->CreateRootSignature(0U, serialized->GetBufferPointer(), serialized->GetBufferSize(),
+-                                                        IID_PPV_ARGS(rootSignature_.ReleaseAndGetAddressOf()));
++                                                        IID_PPV_ARGS(computeRootSignature_.ReleaseAndGetAddressOf()));
+     if (FAILED(createResult))
+     {
+         return std::unexpected(
+             lgp::framework::MakeHResultError("ID3D12Device::CreateRootSignature", createResult,
+-                                             "Failed to create the Chapter 14 Starter root signature."));
++                                             "Failed to create the Chapter 14 compute root signature."));
+     }
+     return {};
+ }
+@@ -175,9 +303,9 @@ lgp::framework::Status Renderer::CreatePipelines()
+     depth.DepthWriteMask = D3D12_DEPTH_WRITE_MASK_ALL;
+ 
+     D3D12_GRAPHICS_PIPELINE_STATE_DESC description{};
+-    description.pRootSignature = rootSignature_.Get();
+-    description.VS = vertexShader_.Bytecode();
+-    description.PS = pixelShader_.Bytecode();
++    description.pRootSignature = graphicsRootSignature_.Get();
++    description.VS = forwardVertexShader_.Bytecode();
++    description.PS = forwardPixelShader_.Bytecode();
+     description.BlendState = blend;
+     description.SampleMask = UINT_MAX;
+     description.RasterizerState = rasterizer;
+@@ -208,7 +336,27 @@ lgp::framework::Status Renderer::CreatePipelines()
+             lgp::framework::MakeHResultError("ID3D12Device::CreateGraphicsPipelineState", reversedResult,
+                                              "Failed to create the Chapter 14 Starter reversed-depth pipeline."));
+     }
+-    return {};
++
++    if (auto status = CreateComputePipeline(*deviceResources_->device(), *computeRootSignature_.Get(), resetShader_,
++                                            "list reset and canary", resetPipeline_);
++        !status)
++    {
++        return status;
++    }
++    if (auto status = CreateComputePipeline(*deviceResources_->device(), *computeRootSignature_.Get(), countShader_,
++                                            "cell count", countPipeline_);
++        !status)
++    {
++        return status;
++    }
++    if (auto status = CreateComputePipeline(*deviceResources_->device(), *computeRootSignature_.Get(), prefixShader_,
++                                            "stable cell-major prefix", prefixPipeline_);
++        !status)
++    {
++        return status;
++    }
++    return CreateComputePipeline(*deviceResources_->device(), *computeRootSignature_.Get(), fillShader_,
++                                 "bounded cell fill", fillPipeline_);
+ }
+ 
+ lgp::framework::Status Renderer::CreateGeometry()
+@@ -226,7 +374,6 @@ lgp::framework::Status Renderer::CreateGeometry()
+     {
+         return status;
+     }
+-
+     auto indexBuffer =
+         lgp::framework::CreateUploadBuffer(*deviceResources_->device(), sizeof(indices), L"Ch14 Starter quad indices");
+     if (!indexBuffer)
+@@ -238,7 +385,6 @@ lgp::framework::Status Renderer::CreateGeometry()
+     {
+         return status;
+     }
+-
+     quad_.vertexView.BufferLocation = quad_.vertices.gpu_virtual_address();
+     quad_.vertexView.SizeInBytes = static_cast<UINT>(sizeof(vertices));
+     quad_.vertexView.StrideInBytes = sizeof(gpu::Vertex);
+@@ -254,16 +400,16 @@ void Renderer::ReleaseSizeDependentResources() noexcept
+     for (FrameSlotResources &slot : frameSlots_)
+     {
+         slot.depth.Reset();
+-        if (slot.dsv)
++        if (slot.dsvs)
+         {
+-            dsvHeap_.Free(slot.dsv);
++            dsvHeap_.Free(slot.dsvs);
+         }
+-        if (slot.lightSrv)
++        if (slot.descriptors)
+         {
+-            deviceResources_->shader_visible_cbv_srv_uav_heap().Free(slot.lightSrv);
++            deviceResources_->shader_visible_cbv_srv_uav_heap().Free(slot.descriptors);
+         }
+-        slot.dsv = {};
+-        slot.lightSrv = {};
++        slot.dsvs = {};
++        slot.descriptors = {};
+     }
+     frameSlots_.clear();
+ }
+@@ -275,30 +421,36 @@ lgp::framework::Status Renderer::CreateSizeDependentResources(lgp::framework::Ex
+     {
+         return {};
+     }
++    auto const allocatedCellCount = gpu::CellCountForMode(gpu::LightingMode::Clustered, size);
++    if (!allocatedCellCount)
++    {
++        return std::unexpected(allocatedCellCount.error());
++    }
+ 
+     frameSlots_.resize(deviceResources_->back_buffer_count());
+-    D3D12_HEAP_PROPERTIES heap{};
+-    heap.Type = D3D12_HEAP_TYPE_DEFAULT;
++    D3D12_HEAP_PROPERTIES textureHeap{};
++    textureHeap.Type = D3D12_HEAP_TYPE_DEFAULT;
+     for (FrameSlotResources &slot : frameSlots_)
+     {
+-        auto dsv = dsvHeap_.Allocate(1U);
+-        if (!dsv)
++        slot.allocatedCellCount = *allocatedCellCount;
++        auto dsvs = dsvHeap_.Allocate(2U);
++        if (!dsvs)
+         {
+-            return std::unexpected(std::move(dsv.error()));
++            return std::unexpected(std::move(dsvs.error()));
+         }
+-        slot.dsv = *dsv;
+-        auto lightSrv = deviceResources_->shader_visible_cbv_srv_uav_heap().Allocate(1U);
+-        if (!lightSrv)
++        slot.dsvs = *dsvs;
++        auto descriptors = deviceResources_->shader_visible_cbv_srv_uav_heap().Allocate(kDescriptorsPerSlot);
++        if (!descriptors)
+         {
+-            return std::unexpected(std::move(lightSrv.error()));
++            return std::unexpected(std::move(descriptors.error()));
+         }
+-        slot.lightSrv = *lightSrv;
++        slot.descriptors = *descriptors;
+ 
+-        D3D12_RESOURCE_DESC1 const description =
++        D3D12_RESOURCE_DESC1 const depthDescription =
+             gpu::MakeTextureDescription(size, gpu::kDepthResourceFormat, D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL);
+         HRESULT const depthResult = deviceResources_->device()->CreateCommittedResource3(
+-            &heap, D3D12_HEAP_FLAG_NONE, &description, D3D12_BARRIER_LAYOUT_COMMON, nullptr, nullptr, 0U, nullptr,
+-            IID_PPV_ARGS(slot.depth.ReleaseAndGetAddressOf()));
++            &textureHeap, D3D12_HEAP_FLAG_NONE, &depthDescription, D3D12_BARRIER_LAYOUT_COMMON, nullptr, nullptr, 0U,
++            nullptr, IID_PPV_ARGS(slot.depth.ReleaseAndGetAddressOf()));
+         if (FAILED(depthResult))
+         {
+             return std::unexpected(
+@@ -306,28 +458,137 @@ lgp::framework::Status Renderer::CreateSizeDependentResources(lgp::framework::Ex
+                                                  "Failed to create a Chapter 14 Starter depth resource."));
+         }
+ 
+-        D3D12_DEPTH_STENCIL_VIEW_DESC dsvDescription{};
+-        dsvDescription.Format = gpu::kDepthDsvFormat;
+-        dsvDescription.ViewDimension = D3D12_DSV_DIMENSION_TEXTURE2D;
+-        deviceResources_->device()->CreateDepthStencilView(slot.depth.Get(), &dsvDescription, slot.dsv.cpuHandle);
++        D3D12_DEPTH_STENCIL_VIEW_DESC writeDsv{};
++        writeDsv.Format = gpu::kDepthDsvFormat;
++        writeDsv.ViewDimension = D3D12_DSV_DIMENSION_TEXTURE2D;
++        deviceResources_->device()->CreateDepthStencilView(slot.depth.Get(), &writeDsv, slot.dsvs.CpuHandle(0U));
++        D3D12_DEPTH_STENCIL_VIEW_DESC readDsv = writeDsv;
++        readDsv.Flags = D3D12_DSV_FLAG_READ_ONLY_DEPTH;
++        deviceResources_->device()->CreateDepthStencilView(slot.depth.Get(), &readDsv, slot.dsvs.CpuHandle(1U));
+ 
+         auto lights =
+             gpu::CreateBuffer(*deviceResources_->device(),
+                               static_cast<std::uint64_t>(gpu::kMaximumLightCount) * sizeof(gpu::PointLightData),
+                               D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_FLAG_NONE, L"Ch14 Starter per-slot lights", true);
++        auto counts = gpu::CreateBuffer(
++            *deviceResources_->device(), static_cast<std::uint64_t>(*allocatedCellCount) * sizeof(std::uint32_t),
++            D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, L"Ch14 per-cell attempted counts");
++        auto cells = gpu::CreateBuffer(
++            *deviceResources_->device(), static_cast<std::uint64_t>(*allocatedCellCount) * sizeof(CellLightRange),
++            D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, L"Ch14 stable cell ranges");
++        auto indices = gpu::CreateBuffer(
++            *deviceResources_->device(),
++            static_cast<std::uint64_t>(gpu::kMaximumLightIndexCapacity) * sizeof(std::uint32_t),
++            D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, L"Ch14 bounded light indices");
++        auto statistics = gpu::CreateBuffer(*deviceResources_->device(), sizeof(GpuStatistics), D3D12_HEAP_TYPE_DEFAULT,
++                                            D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, L"Ch14 list statistics");
++        auto countsReadback = gpu::CreateBuffer(
++            *deviceResources_->device(), static_cast<std::uint64_t>(*allocatedCellCount) * sizeof(std::uint32_t),
++            D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_FLAG_NONE, L"Ch14 attempted-count readback", true);
++        auto cellsReadback = gpu::CreateBuffer(
++            *deviceResources_->device(), static_cast<std::uint64_t>(*allocatedCellCount) * sizeof(CellLightRange),
++            D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_FLAG_NONE, L"Ch14 cell-range readback", true);
++        auto indicesReadback =
++            gpu::CreateBuffer(*deviceResources_->device(),
++                              static_cast<std::uint64_t>(gpu::kMaximumLightIndexCapacity) * sizeof(std::uint32_t),
++                              D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_FLAG_NONE, L"Ch14 light-index readback", true);
++        auto statisticsReadback =
++            gpu::CreateBuffer(*deviceResources_->device(), sizeof(GpuStatistics), D3D12_HEAP_TYPE_READBACK,
++                              D3D12_RESOURCE_FLAG_NONE, L"Ch14 statistics readback", true);
+         if (!lights)
+         {
+             return std::unexpected(std::move(lights.error()));
+         }
++        if (!counts)
++        {
++            return std::unexpected(std::move(counts.error()));
++        }
++        if (!cells)
++        {
++            return std::unexpected(std::move(cells.error()));
++        }
++        if (!indices)
++        {
++            return std::unexpected(std::move(indices.error()));
++        }
++        if (!statistics)
++        {
++            return std::unexpected(std::move(statistics.error()));
++        }
++        if (!countsReadback)
++        {
++            return std::unexpected(std::move(countsReadback.error()));
++        }
++        if (!cellsReadback)
++        {
++            return std::unexpected(std::move(cellsReadback.error()));
++        }
++        if (!indicesReadback)
++        {
++            return std::unexpected(std::move(indicesReadback.error()));
++        }
++        if (!statisticsReadback)
++        {
++            return std::unexpected(std::move(statisticsReadback.error()));
++        }
+         slot.lights = std::move(*lights);
+-
+-        D3D12_SHADER_RESOURCE_VIEW_DESC srv{};
+-        srv.ViewDimension = D3D12_SRV_DIMENSION_BUFFER;
+-        srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+-        srv.Format = DXGI_FORMAT_UNKNOWN;
+-        srv.Buffer.NumElements = gpu::kMaximumLightCount;
+-        srv.Buffer.StructureByteStride = sizeof(gpu::PointLightData);
+-        deviceResources_->device()->CreateShaderResourceView(slot.lights.Get(), &srv, slot.lightSrv.cpuHandle);
++        slot.counts = std::move(*counts);
++        slot.cells = std::move(*cells);
++        slot.indices = std::move(*indices);
++        slot.statistics = std::move(*statistics);
++        slot.countsReadback = std::move(*countsReadback);
++        slot.cellsReadback = std::move(*cellsReadback);
++        slot.indicesReadback = std::move(*indicesReadback);
++        slot.statisticsReadback = std::move(*statisticsReadback);
++
++        D3D12_SHADER_RESOURCE_VIEW_DESC structuredSrv{};
++        structuredSrv.ViewDimension = D3D12_SRV_DIMENSION_BUFFER;
++        structuredSrv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
++        structuredSrv.Format = DXGI_FORMAT_UNKNOWN;
++        structuredSrv.Buffer.NumElements = gpu::kMaximumLightCount;
++        structuredSrv.Buffer.StructureByteStride = sizeof(gpu::PointLightData);
++        deviceResources_->device()->CreateShaderResourceView(slot.lights.Get(), &structuredSrv,
++                                                             slot.descriptors.CpuHandle(LightSrv));
++        structuredSrv.Buffer.NumElements = *allocatedCellCount;
++        structuredSrv.Buffer.StructureByteStride = sizeof(CellLightRange);
++        deviceResources_->device()->CreateShaderResourceView(slot.cells.Get(), &structuredSrv,
++                                                             slot.descriptors.CpuHandle(CellSrv));
++        structuredSrv.Buffer.NumElements = gpu::kMaximumLightIndexCapacity;
++        structuredSrv.Buffer.StructureByteStride = sizeof(std::uint32_t);
++        deviceResources_->device()->CreateShaderResourceView(slot.indices.Get(), &structuredSrv,
++                                                             slot.descriptors.CpuHandle(IndexSrv));
++        structuredSrv.Buffer.NumElements = *allocatedCellCount;
++        deviceResources_->device()->CreateShaderResourceView(slot.counts.Get(), &structuredSrv,
++                                                             slot.descriptors.CpuHandle(CountSrv));
++        structuredSrv.Buffer.NumElements = 4U;
++        deviceResources_->device()->CreateShaderResourceView(slot.statistics.Get(), &structuredSrv,
++                                                             slot.descriptors.CpuHandle(StatisticsSrv));
++
++        D3D12_SHADER_RESOURCE_VIEW_DESC depthSrv{};
++        depthSrv.Format = gpu::kDepthSrvFormat;
++        depthSrv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
++        depthSrv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
++        depthSrv.Texture2D.MipLevels = 1U;
++        deviceResources_->device()->CreateShaderResourceView(slot.depth.Get(), &depthSrv,
++                                                             slot.descriptors.CpuHandle(DepthSrv));
++
++        D3D12_UNORDERED_ACCESS_VIEW_DESC structuredUav{};
++        structuredUav.ViewDimension = D3D12_UAV_DIMENSION_BUFFER;
++        structuredUav.Format = DXGI_FORMAT_UNKNOWN;
++        structuredUav.Buffer.NumElements = *allocatedCellCount;
++        structuredUav.Buffer.StructureByteStride = sizeof(std::uint32_t);
++        deviceResources_->device()->CreateUnorderedAccessView(slot.counts.Get(), nullptr, &structuredUav,
++                                                              slot.descriptors.CpuHandle(CountUav));
++        structuredUav.Buffer.StructureByteStride = sizeof(CellLightRange);
++        deviceResources_->device()->CreateUnorderedAccessView(slot.cells.Get(), nullptr, &structuredUav,
++                                                              slot.descriptors.CpuHandle(CellUav));
++        structuredUav.Buffer.NumElements = gpu::kMaximumLightIndexCapacity;
++        structuredUav.Buffer.StructureByteStride = sizeof(std::uint32_t);
++        deviceResources_->device()->CreateUnorderedAccessView(slot.indices.Get(), nullptr, &structuredUav,
++                                                              slot.descriptors.CpuHandle(IndexUav));
++        structuredUav.Buffer.NumElements = 4U;
++        deviceResources_->device()->CreateUnorderedAccessView(slot.statistics.Get(), nullptr, &structuredUav,
++                                                              slot.descriptors.CpuHandle(StatisticsUav));
+     }
+     return {};
+ }
+@@ -350,9 +611,9 @@ lgp::framework::Status Renderer::Initialize(lgp::framework::ApplicationInitConte
+ {
+     deviceResources_ = &context.deviceResources;
+     headless_ = context.commandLine.headless;
+-    auto dsvHeap =
+-        lgp::framework::CreateDescriptorHeap(*deviceResources_->device(), D3D12_DESCRIPTOR_HEAP_TYPE_DSV,
+-                                             deviceResources_->back_buffer_count(), false, L"Ch14 Starter DSV heap");
++    auto dsvHeap = lgp::framework::CreateDescriptorHeap(*deviceResources_->device(), D3D12_DESCRIPTOR_HEAP_TYPE_DSV,
++                                                        deviceResources_->back_buffer_count() * 2U, false,
++                                                        L"Ch14 Starter DSV heap");
+     if (!dsvHeap)
+     {
+         return std::unexpected(std::move(dsvHeap.error()));
+@@ -362,7 +623,11 @@ lgp::framework::Status Renderer::Initialize(lgp::framework::ApplicationInitConte
+     {
+         return status;
+     }
+-    if (auto status = CreateRootSignature(); !status)
++    if (auto status = CreateGraphicsRootSignature(); !status)
++    {
++        return status;
++    }
++    if (auto status = CreateComputeRootSignature(); !status)
+     {
+         return status;
+     }
+@@ -439,7 +704,7 @@ lgp::framework::Status Renderer::Render(lgp::framework::FrameContext const &fram
+         static_cast<std::uint32_t>(gpu::LightingMode::BruteForce),
+         DepthModeFlag(configuration.depthConvention),
+         static_cast<std::uint32_t>(gpu::DebugView::Final),
+-        0U,
++        slot.allocatedCellCount,
+     };
+ 
+     ID3D12GraphicsCommandList7 &commandList = *frameContext.commandList;
+@@ -452,26 +717,27 @@ lgp::framework::Status Renderer::Render(lgp::framework::FrameContext const &fram
+ 
+     float const clearColor[]{0.0F, 0.0F, 0.0F, 1.0F};
+     commandList.ClearRenderTargetView(frameContext.renderTargetView, clearColor, 0U, nullptr);
+-    commandList.ClearDepthStencilView(slot.dsv.cpuHandle, D3D12_CLEAR_FLAG_DEPTH,
++    commandList.ClearDepthStencilView(slot.dsvs.CpuHandle(0U), D3D12_CLEAR_FLAG_DEPTH,
+                                       DepthClearValue(configuration.depthConvention), 0U, 0U, nullptr);
+-    commandList.OMSetRenderTargets(1U, &frameContext.renderTargetView, FALSE, &slot.dsv.cpuHandle);
++    D3D12_CPU_DESCRIPTOR_HANDLE const depthDsv = slot.dsvs.CpuHandle(0U);
++    commandList.OMSetRenderTargets(1U, &frameContext.renderTargetView, FALSE, &depthDsv);
+     commandList.RSSetViewports(1U, &frameContext.viewport);
+     commandList.RSSetScissorRects(1U, &frameContext.scissorRect);
+     commandList.IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+     commandList.IASetVertexBuffers(0U, 1U, &quad_.vertexView);
+     commandList.IASetIndexBuffer(&quad_.indexView);
+-    commandList.SetGraphicsRootSignature(rootSignature_.Get());
+-    commandList.SetGraphicsRoot32BitConstants(FrameRootConstants, sizeof(constants) / sizeof(std::uint32_t), &constants,
+-                                              0U);
++    commandList.SetGraphicsRootSignature(graphicsRootSignature_.Get());
++    commandList.SetGraphicsRoot32BitConstants(GraphicsFrameRootConstants, sizeof(constants) / sizeof(std::uint32_t),
++                                              &constants, 0U);
+     ID3D12DescriptorHeap *const heaps[]{frameContext.shaderVisibleCbvSrvUavHeap};
+     commandList.SetDescriptorHeaps(1U, heaps);
+-    commandList.SetGraphicsRootDescriptorTable(LightSrvTable, slot.lightSrv.gpuHandle);
++    commandList.SetGraphicsRootDescriptorTable(GraphicsSrvTable, slot.descriptors.GpuHandle(LightSrv));
+     commandList.SetPipelineState(configuration.depthConvention == DepthConvention::Forward ? forwardPipeline_.Get()
+                                                                                            : reversedPipeline_.Get());
+     for (gpu::SceneObject const &object : currentScene_)
+     {
+-        commandList.SetGraphicsRoot32BitConstants(ObjectRootConstants, sizeof(gpu::ObjectData) / sizeof(std::uint32_t),
+-                                                  &object.data, 0U);
++        commandList.SetGraphicsRoot32BitConstants(GraphicsObjectRootConstants,
++                                                  sizeof(gpu::ObjectData) / sizeof(std::uint32_t), &object.data, 0U);
+         commandList.DrawIndexedInstanced(quad_.indexCount, 1U, 0U, 0, 0U);
+     }
+ 
+@@ -487,11 +753,20 @@ void Renderer::Shutdown(lgp::framework::DeviceResources &deviceResources) noexce
+ {
+     ReleaseSizeDependentResources();
+     quad_ = {};
++    fillPipeline_.Reset();
++    prefixPipeline_.Reset();
++    countPipeline_.Reset();
++    resetPipeline_.Reset();
+     reversedPipeline_.Reset();
+     forwardPipeline_.Reset();
+-    rootSignature_.Reset();
+-    vertexShader_ = {};
+-    pixelShader_ = {};
++    computeRootSignature_.Reset();
++    graphicsRootSignature_.Reset();
++    forwardVertexShader_ = {};
++    forwardPixelShader_ = {};
++    resetShader_ = {};
++    countShader_ = {};
++    prefixShader_ = {};
++    fillShader_ = {};
+     dsvHeap_ = {};
+     deviceResources_ = nullptr;
+     (void)deviceResources;
+diff --git a/chapters/tiled-forward-plus-and-clustered-lighting/Starter/Renderer.hpp b/chapters/tiled-forward-plus-and-clustered-lighting/Starter/Renderer.hpp
+index 5e44d59..adebf45 100644
+--- a/chapters/tiled-forward-plus-and-clustered-lighting/Starter/Renderer.hpp
++++ b/chapters/tiled-forward-plus-and-clustered-lighting/Starter/Renderer.hpp
+@@ -56,12 +56,23 @@ class Renderer final : public lgp::framework::IChapterRenderer
+     {
+         Microsoft::WRL::ComPtr<ID3D12Resource> depth{};
+         gpu::BufferResource lights{};
+-        lgp::framework::DescriptorAllocation dsv{};
+-        lgp::framework::DescriptorAllocation lightSrv{};
++        gpu::BufferResource counts{};
++        gpu::BufferResource cells{};
++        gpu::BufferResource indices{};
++        gpu::BufferResource statistics{};
++        gpu::BufferResource countsReadback{};
++        gpu::BufferResource cellsReadback{};
++        gpu::BufferResource indicesReadback{};
++        gpu::BufferResource statisticsReadback{};
++        lgp::framework::DescriptorAllocation dsvs{};
++        lgp::framework::DescriptorAllocation descriptors{};
++        std::uint32_t allocatedCellCount{};
++        bool writableStateInitialized{false};
+     };
+ 
+     [[nodiscard]] lgp::framework::Status CreateShaders();
+-    [[nodiscard]] lgp::framework::Status CreateRootSignature();
++    [[nodiscard]] lgp::framework::Status CreateGraphicsRootSignature();
++    [[nodiscard]] lgp::framework::Status CreateComputeRootSignature();
+     [[nodiscard]] lgp::framework::Status CreatePipelines();
+     [[nodiscard]] lgp::framework::Status CreateGeometry();
+     [[nodiscard]] lgp::framework::Status CreateSizeDependentResources(lgp::framework::Extent2D size);
+@@ -69,11 +80,20 @@ class Renderer final : public lgp::framework::IChapterRenderer
+     [[nodiscard]] gpu::LabConfiguration ActiveConfiguration() const noexcept;
+ 
+     lgp::framework::DeviceResources *deviceResources_{};
+-    lgp::framework::CompiledShader vertexShader_{};
+-    lgp::framework::CompiledShader pixelShader_{};
+-    Microsoft::WRL::ComPtr<ID3D12RootSignature> rootSignature_{};
++    lgp::framework::CompiledShader forwardVertexShader_{};
++    lgp::framework::CompiledShader forwardPixelShader_{};
++    lgp::framework::CompiledShader resetShader_{};
++    lgp::framework::CompiledShader countShader_{};
++    lgp::framework::CompiledShader prefixShader_{};
++    lgp::framework::CompiledShader fillShader_{};
++    Microsoft::WRL::ComPtr<ID3D12RootSignature> graphicsRootSignature_{};
++    Microsoft::WRL::ComPtr<ID3D12RootSignature> computeRootSignature_{};
+     Microsoft::WRL::ComPtr<ID3D12PipelineState> forwardPipeline_{};
+     Microsoft::WRL::ComPtr<ID3D12PipelineState> reversedPipeline_{};
++    Microsoft::WRL::ComPtr<ID3D12PipelineState> resetPipeline_{};
++    Microsoft::WRL::ComPtr<ID3D12PipelineState> countPipeline_{};
++    Microsoft::WRL::ComPtr<ID3D12PipelineState> prefixPipeline_{};
++    Microsoft::WRL::ComPtr<ID3D12PipelineState> fillPipeline_{};
+     MeshBuffers quad_{};
+     lgp::framework::DescriptorHeap dsvHeap_{};
+     std::vector<FrameSlotResources> frameSlots_{};

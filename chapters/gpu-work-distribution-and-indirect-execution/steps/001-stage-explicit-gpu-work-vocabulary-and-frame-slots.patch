@@ -1,0 +1,641 @@
+diff --git a/chapters/gpu-work-distribution-and-indirect-execution/Starter/Renderer.cpp b/chapters/gpu-work-distribution-and-indirect-execution/Starter/Renderer.cpp
+index 38acb27..5c0c319 100644
+--- a/chapters/gpu-work-distribution-and-indirect-execution/Starter/Renderer.cpp
++++ b/chapters/gpu-work-distribution-and-indirect-execution/Starter/Renderer.cpp
+@@ -12,7 +12,7 @@
+ #include <wrl/client.h>
+ 
+ #include <array>
+-#include <cstdio>
++#include <cstring>
+ #include <filesystem>
+ #include <string>
+ 
+@@ -23,12 +23,42 @@ namespace
+ 
+ using Microsoft::WRL::ComPtr;
+ 
+-enum RootParameter : UINT
++inline constexpr UINT kDescriptorsPerSlot = 7U;
++
++enum GraphicsRootParameter : UINT
+ {
+     CandidateRootConstant = 0U,
+     CandidateSrvTable = 1U,
+ };
+ 
++enum ComputeRootParameter : UINT
++{
++    DispatchRootConstants = 0U,
++    ComputeSrvTable = 1U,
++    ComputeUavTable = 2U,
++};
++
++enum DescriptorIndex : UINT
++{
++    CandidateSrv = 0U,
++    FlagsSrv = 1U,
++    FlagsUav = 2U,
++    EmittedIndicesUav = 3U,
++    IndirectCommandsUav = 4U,
++    IndirectCountUav = 5U,
++    StatisticsUav = 6U,
++};
++
++struct DispatchConstants final
++{
++    std::uint32_t capacity{};
++    std::uint32_t candidateCount{gpu::kCandidateCount};
++    std::uint32_t vertexCountPerQuad{gpu::kVertexCountPerQuad};
++    std::uint32_t reserved{};
++};
++
++static_assert(sizeof(DispatchConstants) == 16U);
++
+ [[nodiscard]] std::filesystem::path ShaderPath()
+ {
+     return std::filesystem::path{__FILE__}.parent_path() / "WorkDistributionLab.hlsl";
+@@ -43,6 +73,25 @@ enum RootParameter : UINT
+     return {static_cast<char const *>(blob->GetBufferPointer()), static_cast<std::size_t>(blob->GetBufferSize())};
+ }
+ 
++[[nodiscard]] lgp::framework::Status CreateComputePipeline(ID3D12Device10 &device, ID3D12RootSignature &rootSignature,
++                                                           lgp::framework::CompiledShader const &shader,
++                                                           char const *label, ComPtr<ID3D12PipelineState> &pipeline)
++{
++    D3D12_COMPUTE_PIPELINE_STATE_DESC description{};
++    description.pRootSignature = &rootSignature;
++    description.CS = shader.Bytecode();
++
++    HRESULT const result =
++        device.CreateComputePipelineState(&description, IID_PPV_ARGS(pipeline.ReleaseAndGetAddressOf()));
++    if (FAILED(result))
++    {
++        return std::unexpected(
++            lgp::framework::MakeHResultError("ID3D12Device::CreateComputePipelineState", result,
++                                             std::string{"Failed to create the Chapter 13 "} + label + " pipeline."));
++    }
++    return {};
++}
++
+ } // namespace
+ 
+ lgp::framework::Status Renderer::CreateShaders()
+@@ -62,6 +111,22 @@ lgp::framework::Status Renderer::CreateShaders()
+     options.optimize = false;
+ #endif
+ 
++    if (auto status = gpu::CompileShader(compiler, options, L"ResetCS", L"cs_6_0", resetShader_); !status)
++    {
++        return status;
++    }
++    if (auto status = gpu::CompileShader(compiler, options, L"ClassifyCS", L"cs_6_0", classifyShader_); !status)
++    {
++        return status;
++    }
++    if (auto status = gpu::CompileShader(compiler, options, L"StableCompactCS", L"cs_6_0", stableShader_); !status)
++    {
++        return status;
++    }
++    if (auto status = gpu::CompileShader(compiler, options, L"AtomicAppendCS", L"cs_6_0", atomicShader_); !status)
++    {
++        return status;
++    }
+     if (auto status = gpu::CompileShader(compiler, options, L"IndirectVS", L"vs_6_0", vertexShader_); !status)
+     {
+         return status;
+@@ -113,21 +178,99 @@ lgp::framework::Status Renderer::CreateGraphicsRootSignature()
+     {
+         return std::unexpected(
+             lgp::framework::MakeHResultError("ID3D12Device::CreateRootSignature", createResult,
+-                                             "Failed to create the Chapter 13 Starter root signature."));
++                                             "Failed to create the Chapter 13 graphics root signature."));
++    }
++    return {};
++}
++
++lgp::framework::Status Renderer::CreateComputeRootSignature()
++{
++    D3D12_DESCRIPTOR_RANGE srvRange{};
++    srvRange.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
++    srvRange.NumDescriptors = 2U;
++    srvRange.BaseShaderRegister = 0U;
++    srvRange.OffsetInDescriptorsFromTableStart = D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND;
++
++    D3D12_DESCRIPTOR_RANGE uavRange{};
++    uavRange.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_UAV;
++    uavRange.NumDescriptors = 5U;
++    uavRange.BaseShaderRegister = 0U;
++    uavRange.OffsetInDescriptorsFromTableStart = D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND;
++
++    D3D12_ROOT_PARAMETER parameters[3]{};
++    parameters[DispatchRootConstants].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
++    parameters[DispatchRootConstants].Constants.ShaderRegister = 0U;
++    parameters[DispatchRootConstants].Constants.Num32BitValues = sizeof(DispatchConstants) / sizeof(std::uint32_t);
++    parameters[DispatchRootConstants].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
++    parameters[ComputeSrvTable].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
++    parameters[ComputeSrvTable].DescriptorTable.NumDescriptorRanges = 1U;
++    parameters[ComputeSrvTable].DescriptorTable.pDescriptorRanges = &srvRange;
++    parameters[ComputeSrvTable].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
++    parameters[ComputeUavTable].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
++    parameters[ComputeUavTable].DescriptorTable.NumDescriptorRanges = 1U;
++    parameters[ComputeUavTable].DescriptorTable.pDescriptorRanges = &uavRange;
++    parameters[ComputeUavTable].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
++
++    D3D12_ROOT_SIGNATURE_DESC description{};
++    description.NumParameters = static_cast<UINT>(std::size(parameters));
++    description.pParameters = parameters;
++
++    ComPtr<ID3DBlob> serialized{};
++    ComPtr<ID3DBlob> errors{};
++    HRESULT const serializeResult =
++        D3D12SerializeRootSignature(&description, D3D_ROOT_SIGNATURE_VERSION_1, serialized.ReleaseAndGetAddressOf(),
++                                    errors.ReleaseAndGetAddressOf());
++    if (FAILED(serializeResult))
++    {
++        return std::unexpected(
++            lgp::framework::MakeHResultError("D3D12SerializeRootSignature", serializeResult, BlobText(errors.Get())));
++    }
++
++    HRESULT const createResult =
++        deviceResources_->device()->CreateRootSignature(0U, serialized->GetBufferPointer(), serialized->GetBufferSize(),
++                                                        IID_PPV_ARGS(computeRootSignature_.ReleaseAndGetAddressOf()));
++    if (FAILED(createResult))
++    {
++        return std::unexpected(
++            lgp::framework::MakeHResultError("ID3D12Device::CreateRootSignature", createResult,
++                                             "Failed to create the Chapter 13 compute root signature."));
+     }
+     return {};
+ }
+ 
+-lgp::framework::Status Renderer::CreateGraphicsPipeline()
++lgp::framework::Status Renderer::CreatePipelines()
+ {
++    if (auto status = CreateComputePipeline(*deviceResources_->device(), *computeRootSignature_.Get(), resetShader_,
++                                            "reset", resetPipeline_);
++        !status)
++    {
++        return status;
++    }
++    if (auto status = CreateComputePipeline(*deviceResources_->device(), *computeRootSignature_.Get(), classifyShader_,
++                                            "classification", classifyPipeline_);
++        !status)
++    {
++        return status;
++    }
++    if (auto status = CreateComputePipeline(*deviceResources_->device(), *computeRootSignature_.Get(), stableShader_,
++                                            "stable compaction", stablePipeline_);
++        !status)
++    {
++        return status;
++    }
++    if (auto status = CreateComputePipeline(*deviceResources_->device(), *computeRootSignature_.Get(), atomicShader_,
++                                            "atomic append", atomicPipeline_);
++        !status)
++    {
++        return status;
++    }
++
+     D3D12_BLEND_DESC blend{};
+     blend.RenderTarget[0].RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
+-
+     D3D12_RASTERIZER_DESC rasterizer{};
+     rasterizer.FillMode = D3D12_FILL_MODE_SOLID;
+     rasterizer.CullMode = D3D12_CULL_MODE_NONE;
+     rasterizer.DepthClipEnable = TRUE;
+-
+     D3D12_DEPTH_STENCIL_DESC depth{};
+     depth.DepthEnable = FALSE;
+     depth.DepthWriteMask = D3D12_DEPTH_WRITE_MASK_ZERO;
+@@ -152,42 +295,206 @@ lgp::framework::Status Renderer::CreateGraphicsPipeline()
+     {
+         return std::unexpected(lgp::framework::MakeHResultError("ID3D12Device::CreateGraphicsPipelineState",
+                                                                 createResult,
+-                                                                "Failed to create the Chapter 13 Starter pipeline."));
++                                                                "Failed to create the Chapter 13 graphics pipeline."));
++    }
++    return {};
++}
++
++lgp::framework::Status Renderer::CreateCommandSignature()
++{
++    D3D12_INDIRECT_ARGUMENT_DESC arguments[2]{};
++    arguments[0].Type = D3D12_INDIRECT_ARGUMENT_TYPE_CONSTANT;
++    arguments[0].Constant.RootParameterIndex = CandidateRootConstant;
++    arguments[0].Constant.DestOffsetIn32BitValues = 0U;
++    arguments[0].Constant.Num32BitValuesToSet = 1U;
++    arguments[1].Type = D3D12_INDIRECT_ARGUMENT_TYPE_DRAW;
++
++    D3D12_COMMAND_SIGNATURE_DESC description{};
++    description.ByteStride = kIndirectDrawCommandStride;
++    description.NumArgumentDescs = static_cast<UINT>(std::size(arguments));
++    description.pArgumentDescs = arguments;
++
++    IndirectExecutionLayout const layout{
++        .byteStride = kIndirectDrawCommandStride,
++        .argumentBufferOffset = 0U,
++        .argumentBufferBytes = static_cast<std::uint64_t>(gpu::kCandidateCount) * kIndirectDrawCommandStride,
++        .maximumCommandCount = gpu::kCandidateCount,
++        .countBufferOffset = 0U,
++        .countBufferBytes = sizeof(std::uint32_t),
++    };
++    if (auto validation = ValidateIndirectExecutionLayout(layout); !validation)
++    {
++        return std::unexpected(
++            lgp::framework::MakeError("CreateCommandSignature", "The Chapter 13 indirect layout validation failed."));
++    }
++
++    HRESULT const createResult = deviceResources_->device()->CreateCommandSignature(
++        &description, graphicsRootSignature_.Get(), IID_PPV_ARGS(commandSignature_.ReleaseAndGetAddressOf()));
++    if (FAILED(createResult))
++    {
++        return std::unexpected(lgp::framework::MakeHResultError("ID3D12Device::CreateCommandSignature", createResult,
++                                                                "Failed to create the Chapter 13 command signature."));
+     }
+     return {};
+ }
+ 
+ lgp::framework::Status Renderer::CreateCandidateResources()
++{
++    return {};
++}
++
++lgp::framework::Status Renderer::CreateFrameSlotResources()
+ {
+     frameSlots_.resize(deviceResources_->back_buffer_count());
+     for (FrameSlotResources &slot : frameSlots_)
+     {
++        auto descriptors = deviceResources_->shader_visible_cbv_srv_uav_heap().Allocate(kDescriptorsPerSlot);
++        if (!descriptors)
++        {
++            return std::unexpected(std::move(descriptors.error()));
++        }
++        slot.descriptors = *descriptors;
++
++        auto flags = gpu::CreateBuffer(*deviceResources_->device(), gpu::kCandidateCount * sizeof(std::uint32_t),
++                                       D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
++                                       L"Ch13 Flags Buffer");
+         auto candidateBuffer = gpu::CreateBuffer(
+             *deviceResources_->device(), static_cast<std::uint64_t>(gpu::kCandidateCount) * sizeof(gpu::CandidateData),
+-            D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_FLAG_NONE, L"Ch13 Starter Candidate Buffer", true);
++            D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_FLAG_NONE, L"Ch13 Solution Candidate Buffer", true);
++        auto indices = gpu::CreateBuffer(*deviceResources_->device(), gpu::kCandidateCount * sizeof(std::uint32_t),
++                                         D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
++                                         L"Ch13 Emitted Indices Buffer");
++        auto commands = gpu::CreateBuffer(
++            *deviceResources_->device(), static_cast<std::uint64_t>(gpu::kCandidateCount) * kIndirectDrawCommandStride,
++            D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, L"Ch13 Indirect Commands Buffer");
++        auto count = gpu::CreateBuffer(*deviceResources_->device(), sizeof(std::uint32_t), D3D12_HEAP_TYPE_DEFAULT,
++                                       D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, L"Ch13 Indirect Count Buffer");
++        auto statistics =
++            gpu::CreateBuffer(*deviceResources_->device(), 4U * sizeof(std::uint32_t), D3D12_HEAP_TYPE_DEFAULT,
++                              D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, L"Ch13 Statistics Buffer");
++        auto indicesReadback =
++            gpu::CreateBuffer(*deviceResources_->device(), gpu::kCandidateCount * sizeof(std::uint32_t),
++                              D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_FLAG_NONE, L"Ch13 Indices Readback", true);
++        auto commandsReadback = gpu::CreateBuffer(
++            *deviceResources_->device(), static_cast<std::uint64_t>(gpu::kCandidateCount) * kIndirectDrawCommandStride,
++            D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_FLAG_NONE, L"Ch13 Commands Readback", true);
++        auto countReadback =
++            gpu::CreateBuffer(*deviceResources_->device(), sizeof(std::uint32_t), D3D12_HEAP_TYPE_READBACK,
++                              D3D12_RESOURCE_FLAG_NONE, L"Ch13 Count Readback", true);
++        auto statisticsReadback =
++            gpu::CreateBuffer(*deviceResources_->device(), 4U * sizeof(std::uint32_t), D3D12_HEAP_TYPE_READBACK,
++                              D3D12_RESOURCE_FLAG_NONE, L"Ch13 Statistics Readback", true);
++
++        if (!flags)
++        {
++            return std::unexpected(std::move(flags.error()));
++        }
+         if (!candidateBuffer)
+         {
+             return std::unexpected(std::move(candidateBuffer.error()));
+         }
+-        slot.candidateBuffer = std::move(*candidateBuffer);
+-
+-        auto candidateSrv = deviceResources_->shader_visible_cbv_srv_uav_heap().Allocate(1U);
+-        if (!candidateSrv)
++        if (!indices)
+         {
+-            return std::unexpected(std::move(candidateSrv.error()));
++            return std::unexpected(std::move(indices.error()));
+         }
+-        slot.candidateSrv = *candidateSrv;
+-
+-        D3D12_SHADER_RESOURCE_VIEW_DESC srv{};
+-        srv.ViewDimension = D3D12_SRV_DIMENSION_BUFFER;
+-        srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+-        srv.Format = DXGI_FORMAT_UNKNOWN;
+-        srv.Buffer.FirstElement = 0U;
+-        srv.Buffer.NumElements = gpu::kCandidateCount;
+-        srv.Buffer.StructureByteStride = sizeof(gpu::CandidateData);
+-        srv.Buffer.Flags = D3D12_BUFFER_SRV_FLAG_NONE;
+-        deviceResources_->device()->CreateShaderResourceView(slot.candidateBuffer.Get(), &srv,
+-                                                             slot.candidateSrv.cpuHandle);
++        if (!commands)
++        {
++            return std::unexpected(std::move(commands.error()));
++        }
++        if (!count)
++        {
++            return std::unexpected(std::move(count.error()));
++        }
++        if (!statistics)
++        {
++            return std::unexpected(std::move(statistics.error()));
++        }
++        if (!indicesReadback)
++        {
++            return std::unexpected(std::move(indicesReadback.error()));
++        }
++        if (!commandsReadback)
++        {
++            return std::unexpected(std::move(commandsReadback.error()));
++        }
++        if (!countReadback)
++        {
++            return std::unexpected(std::move(countReadback.error()));
++        }
++        if (!statisticsReadback)
++        {
++            return std::unexpected(std::move(statisticsReadback.error()));
++        }
++
++        slot.candidateBuffer = std::move(*candidateBuffer);
++        slot.flags = std::move(*flags);
++        slot.emittedIndices = std::move(*indices);
++        slot.indirectCommands = std::move(*commands);
++        slot.indirectCount = std::move(*count);
++        slot.statistics = std::move(*statistics);
++        slot.emittedIndicesReadback = std::move(*indicesReadback);
++        slot.indirectCommandsReadback = std::move(*commandsReadback);
++        slot.indirectCountReadback = std::move(*countReadback);
++        slot.statisticsReadback = std::move(*statisticsReadback);
++
++        D3D12_SHADER_RESOURCE_VIEW_DESC candidateSrv{};
++        candidateSrv.ViewDimension = D3D12_SRV_DIMENSION_BUFFER;
++        candidateSrv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
++        candidateSrv.Format = DXGI_FORMAT_UNKNOWN;
++        candidateSrv.Buffer.FirstElement = 0U;
++        candidateSrv.Buffer.NumElements = gpu::kCandidateCount;
++        candidateSrv.Buffer.StructureByteStride = sizeof(gpu::CandidateData);
++        deviceResources_->device()->CreateShaderResourceView(slot.candidateBuffer.Get(), &candidateSrv,
++                                                             slot.descriptors.CpuHandle(CandidateSrv));
++
++        D3D12_SHADER_RESOURCE_VIEW_DESC flagsSrv{};
++        flagsSrv.ViewDimension = D3D12_SRV_DIMENSION_BUFFER;
++        flagsSrv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
++        flagsSrv.Format = DXGI_FORMAT_UNKNOWN;
++        flagsSrv.Buffer.FirstElement = 0U;
++        flagsSrv.Buffer.NumElements = gpu::kCandidateCount;
++        flagsSrv.Buffer.StructureByteStride = sizeof(std::uint32_t);
++        deviceResources_->device()->CreateShaderResourceView(slot.flags.Get(), &flagsSrv,
++                                                             slot.descriptors.CpuHandle(FlagsSrv));
++
++        D3D12_UNORDERED_ACCESS_VIEW_DESC structuredUav{};
++        structuredUav.ViewDimension = D3D12_UAV_DIMENSION_BUFFER;
++        structuredUav.Format = DXGI_FORMAT_UNKNOWN;
++        structuredUav.Buffer.FirstElement = 0U;
++        structuredUav.Buffer.NumElements = gpu::kCandidateCount;
++        structuredUav.Buffer.StructureByteStride = sizeof(std::uint32_t);
++        deviceResources_->device()->CreateUnorderedAccessView(slot.flags.Get(), nullptr, &structuredUav,
++                                                              slot.descriptors.CpuHandle(FlagsUav));
++        deviceResources_->device()->CreateUnorderedAccessView(slot.emittedIndices.Get(), nullptr, &structuredUav,
++                                                              slot.descriptors.CpuHandle(EmittedIndicesUav));
++
++        D3D12_UNORDERED_ACCESS_VIEW_DESC commandsUav{};
++        commandsUav.ViewDimension = D3D12_UAV_DIMENSION_BUFFER;
++        commandsUav.Format = DXGI_FORMAT_R32_TYPELESS;
++        commandsUav.Buffer.FirstElement = 0U;
++        commandsUav.Buffer.NumElements =
++            static_cast<UINT>(slot.indirectCommands.size_in_bytes() / sizeof(std::uint32_t));
++        commandsUav.Buffer.Flags = D3D12_BUFFER_UAV_FLAG_RAW;
++        deviceResources_->device()->CreateUnorderedAccessView(slot.indirectCommands.Get(), nullptr, &commandsUav,
++                                                              slot.descriptors.CpuHandle(IndirectCommandsUav));
++
++        D3D12_UNORDERED_ACCESS_VIEW_DESC countUav{};
++        countUav.ViewDimension = D3D12_UAV_DIMENSION_BUFFER;
++        countUav.Format = DXGI_FORMAT_UNKNOWN;
++        countUav.Buffer.FirstElement = 0U;
++        countUav.Buffer.NumElements = 1U;
++        countUav.Buffer.StructureByteStride = sizeof(std::uint32_t);
++        deviceResources_->device()->CreateUnorderedAccessView(slot.indirectCount.Get(), nullptr, &countUav,
++                                                              slot.descriptors.CpuHandle(IndirectCountUav));
++
++        D3D12_UNORDERED_ACCESS_VIEW_DESC statisticsUav{};
++        statisticsUav.ViewDimension = D3D12_UAV_DIMENSION_BUFFER;
++        statisticsUav.Format = DXGI_FORMAT_UNKNOWN;
++        statisticsUav.Buffer.FirstElement = 0U;
++        statisticsUav.Buffer.NumElements = 4U;
++        statisticsUav.Buffer.StructureByteStride = sizeof(std::uint32_t);
++        deviceResources_->device()->CreateUnorderedAccessView(slot.statistics.Get(), nullptr, &statisticsUav,
++                                                              slot.descriptors.CpuHandle(StatisticsUav));
+     }
+     return {};
+ }
+@@ -199,7 +506,7 @@ gpu::LabConfiguration Renderer::ActiveConfiguration() const noexcept
+         return {
+             headlessConfiguration_->scene,
+             gpu::NormalizeCapacity(headlessConfiguration_->capacity),
+-            gpu::ExecutionMode::Stable,
++            headlessConfiguration_->mode,
+         };
+     }
+     return {};
+@@ -217,11 +524,23 @@ lgp::framework::Status Renderer::Initialize(lgp::framework::ApplicationInitConte
+     {
+         return status;
+     }
+-    if (auto status = CreateGraphicsPipeline(); !status)
++    if (auto status = CreateComputeRootSignature(); !status)
++    {
++        return status;
++    }
++    if (auto status = CreatePipelines(); !status)
++    {
++        return status;
++    }
++    if (auto status = CreateCommandSignature(); !status)
++    {
++        return status;
++    }
++    if (auto status = CreateCandidateResources(); !status)
+     {
+         return status;
+     }
+-    return CreateCandidateResources();
++    return CreateFrameSlotResources();
+ }
+ 
+ lgp::framework::Status Renderer::OnResize(lgp::framework::DeviceResources &deviceResources,
+@@ -260,11 +579,11 @@ lgp::framework::Status Renderer::Render(lgp::framework::FrameContext const &fram
+     }
+ 
+     ID3D12GraphicsCommandList7 &commandList = *frameContext.commandList;
+-    std::vector<D3D12_TEXTURE_BARRIER> barriers{
++    std::vector<D3D12_TEXTURE_BARRIER> textureBarriers{
+         gpu::MakeTextureBarrier(*frameContext.renderTarget, gpu::FrameStartState(frameContext),
+                                 gpu::RenderTargetState()),
+     };
+-    gpu::SubmitTextureBarriers(commandList, barriers);
++    gpu::SubmitTextureBarriers(commandList, textureBarriers);
+ 
+     float const clearColor[]{0.0F, 0.0F, 0.0F, 1.0F};
+     commandList.ClearRenderTargetView(frameContext.renderTargetView, clearColor, 0U, nullptr);
+@@ -277,7 +596,7 @@ lgp::framework::Status Renderer::Render(lgp::framework::FrameContext const &fram
+ 
+     ID3D12DescriptorHeap *const heaps[]{frameContext.shaderVisibleCbvSrvUavHeap};
+     commandList.SetDescriptorHeaps(1U, heaps);
+-    commandList.SetGraphicsRootDescriptorTable(CandidateSrvTable, slot.candidateSrv.gpuHandle);
++    commandList.SetGraphicsRootDescriptorTable(CandidateSrvTable, slot.descriptors.GpuHandle(CandidateSrv));
+ 
+     for (IndirectDrawCommand const &command : currentReference_.indirectCommands)
+     {
+@@ -286,26 +605,43 @@ lgp::framework::Status Renderer::Render(lgp::framework::FrameContext const &fram
+                                   command.draw.startVertexLocation, command.draw.startInstanceLocation);
+     }
+ 
+-    barriers = {
++    textureBarriers = {
+         gpu::MakeTextureBarrier(*frameContext.renderTarget, gpu::RenderTargetState(), gpu::FrameEndState(frameContext)),
+     };
+-    gpu::SubmitTextureBarriers(commandList, barriers);
++    gpu::SubmitTextureBarriers(commandList, textureBarriers);
++
++    lastRenderedFrameSlot_ = frameContext.frameSlot;
+     return {};
+ }
+ 
+-void Renderer::Shutdown(lgp::framework::DeviceResources &deviceResources) noexcept
++void Renderer::DestroyFrameSlotResources(lgp::framework::DeviceResources &deviceResources) noexcept
+ {
+     for (FrameSlotResources &slot : frameSlots_)
+     {
+-        if (slot.candidateSrv)
++        if (slot.descriptors)
+         {
+-            deviceResources.shader_visible_cbv_srv_uav_heap().Free(slot.candidateSrv);
+-            slot.candidateSrv = {};
++            deviceResources.shader_visible_cbv_srv_uav_heap().Free(slot.descriptors);
++            slot.descriptors = {};
+         }
+     }
+     frameSlots_.clear();
++}
++
++void Renderer::Shutdown(lgp::framework::DeviceResources &deviceResources) noexcept
++{
++    DestroyFrameSlotResources(deviceResources);
++    commandSignature_.Reset();
+     graphicsPipeline_.Reset();
++    atomicPipeline_.Reset();
++    stablePipeline_.Reset();
++    classifyPipeline_.Reset();
++    resetPipeline_.Reset();
++    computeRootSignature_.Reset();
+     graphicsRootSignature_.Reset();
++    resetShader_ = {};
++    classifyShader_ = {};
++    stableShader_ = {};
++    atomicShader_ = {};
+     vertexShader_ = {};
+     pixelShader_ = {};
+     deviceResources_ = nullptr;
+@@ -316,9 +652,10 @@ void Renderer::ConfigureHeadlessTest(HeadlessTestConfiguration const &configurat
+     headlessConfiguration_ = configuration;
+ }
+ 
+-gpu::CpuReference const &Renderer::LastReference() const noexcept
++std::expected<Renderer::ReadbackOutputs, lgp::framework::Error> Renderer::ReadBackOutputs()
+ {
+-    return currentReference_;
++    return std::unexpected(lgp::framework::MakeError(
++        "ReadBackOutputs", "Chapter 13 Starter enables indirect diagnostics and readback in a later patch."));
+ }
+ 
+ } // namespace ch13::work_distribution::starter
+diff --git a/chapters/gpu-work-distribution-and-indirect-execution/Starter/Renderer.hpp b/chapters/gpu-work-distribution-and-indirect-execution/Starter/Renderer.hpp
+index f0fbee0..2940183 100644
+--- a/chapters/gpu-work-distribution-and-indirect-execution/Starter/Renderer.hpp
++++ b/chapters/gpu-work-distribution-and-indirect-execution/Starter/Renderer.hpp
+@@ -19,11 +19,22 @@ struct HeadlessTestConfiguration final
+ {
+     gpu::ScenePreset scene{gpu::ScenePreset::Default};
+     std::uint32_t capacity{gpu::kCandidateCount};
++    gpu::ExecutionMode mode{gpu::ExecutionMode::Stable};
+ };
+ 
+ class Renderer final : public lgp::framework::IChapterRenderer
+ {
+   public:
++    struct ReadbackOutputs final
++    {
++        DistributionStatistics statistics{};
++        std::vector<std::uint32_t> emittedCandidateIndices{};
++        std::vector<IndirectDrawCommand> indirectCommands{};
++        std::uint32_t gpuCount{};
++        std::uint32_t executionCount{};
++        gpu::ExecutionMode mode{gpu::ExecutionMode::Stable};
++    };
++
+     Renderer() = default;
+     Renderer(Renderer &&) noexcept = default;
+     Renderer &operator=(Renderer &&) noexcept = default;
+@@ -39,28 +50,53 @@ class Renderer final : public lgp::framework::IChapterRenderer
+     void Shutdown(lgp::framework::DeviceResources &deviceResources) noexcept override;
+ 
+     void ConfigureHeadlessTest(HeadlessTestConfiguration const &configuration) noexcept;
+-    [[nodiscard]] gpu::CpuReference const &LastReference() const noexcept;
++    [[nodiscard]] std::expected<ReadbackOutputs, lgp::framework::Error> ReadBackOutputs();
+ 
+   private:
+     struct FrameSlotResources final
+     {
+         gpu::BufferResource candidateBuffer{};
+-        lgp::framework::DescriptorAllocation candidateSrv{};
++        gpu::BufferResource flags{};
++        gpu::BufferResource emittedIndices{};
++        gpu::BufferResource indirectCommands{};
++        gpu::BufferResource indirectCount{};
++        gpu::BufferResource statistics{};
++        gpu::BufferResource emittedIndicesReadback{};
++        gpu::BufferResource indirectCommandsReadback{};
++        gpu::BufferResource indirectCountReadback{};
++        gpu::BufferResource statisticsReadback{};
++        lgp::framework::DescriptorAllocation descriptors{};
++        bool writableStateInitialized{false};
+     };
+ 
+     [[nodiscard]] lgp::framework::Status CreateShaders();
+     [[nodiscard]] lgp::framework::Status CreateGraphicsRootSignature();
+-    [[nodiscard]] lgp::framework::Status CreateGraphicsPipeline();
++    [[nodiscard]] lgp::framework::Status CreateComputeRootSignature();
++    [[nodiscard]] lgp::framework::Status CreatePipelines();
++    [[nodiscard]] lgp::framework::Status CreateCommandSignature();
+     [[nodiscard]] lgp::framework::Status CreateCandidateResources();
++    [[nodiscard]] lgp::framework::Status CreateFrameSlotResources();
+     [[nodiscard]] gpu::LabConfiguration ActiveConfiguration() const noexcept;
++    void DestroyFrameSlotResources(lgp::framework::DeviceResources &deviceResources) noexcept;
+ 
+     lgp::framework::DeviceResources *deviceResources_{};
++    lgp::framework::CompiledShader resetShader_{};
++    lgp::framework::CompiledShader classifyShader_{};
++    lgp::framework::CompiledShader stableShader_{};
++    lgp::framework::CompiledShader atomicShader_{};
+     lgp::framework::CompiledShader vertexShader_{};
+     lgp::framework::CompiledShader pixelShader_{};
+     Microsoft::WRL::ComPtr<ID3D12RootSignature> graphicsRootSignature_{};
++    Microsoft::WRL::ComPtr<ID3D12RootSignature> computeRootSignature_{};
++    Microsoft::WRL::ComPtr<ID3D12PipelineState> resetPipeline_{};
++    Microsoft::WRL::ComPtr<ID3D12PipelineState> classifyPipeline_{};
++    Microsoft::WRL::ComPtr<ID3D12PipelineState> stablePipeline_{};
++    Microsoft::WRL::ComPtr<ID3D12PipelineState> atomicPipeline_{};
+     Microsoft::WRL::ComPtr<ID3D12PipelineState> graphicsPipeline_{};
++    Microsoft::WRL::ComPtr<ID3D12CommandSignature> commandSignature_{};
+     std::vector<FrameSlotResources> frameSlots_{};
+     gpu::CpuReference currentReference_{};
++    UINT lastRenderedFrameSlot_{0U};
+     std::optional<HeadlessTestConfiguration> headlessConfiguration_{};
+     bool headless_{false};
+ };

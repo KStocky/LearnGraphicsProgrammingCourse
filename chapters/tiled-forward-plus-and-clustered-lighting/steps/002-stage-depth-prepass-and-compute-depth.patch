@@ -1,0 +1,307 @@
+diff --git a/chapters/tiled-forward-plus-and-clustered-lighting/Starter/ClusteredLightingLab.hlsl b/chapters/tiled-forward-plus-and-clustered-lighting/Starter/ClusteredLightingLab.hlsl
+index 6d4e8c4..fcbfe8d 100644
+--- a/chapters/tiled-forward-plus-and-clustered-lighting/Starter/ClusteredLightingLab.hlsl
++++ b/chapters/tiled-forward-plus-and-clustered-lighting/Starter/ClusteredLightingLab.hlsl
+@@ -51,7 +51,12 @@ struct VertexInput
+     float3 normal : NORMAL;
+ };
+ 
+-struct VertexOutput
++struct DepthVertexOutput
++{
++    float4 position : SV_Position;
++};
++
++struct ForwardVertexOutput
+ {
+     float4 position : SV_Position;
+     float3 viewPosition : POSITION0;
+@@ -104,16 +109,24 @@ float3 ShadePointLight(PointLightData light, float3 position, float3 normal, flo
+     return light.color * light.intensity * attenuation * nDotL * (diffuse + specular);
+ }
+ 
+-VertexOutput ForwardVS(VertexInput input)
++DepthVertexOutput DepthVS(VertexInput input)
++{
++    DepthVertexOutput output;
++    float3 viewPosition = (input.position * gObject.scale) + gObject.translation;
++    output.position = mul(float4(viewPosition, 1.0), gFrame.projection);
++    return output;
++}
++
++ForwardVertexOutput ForwardVS(VertexInput input)
+ {
+-    VertexOutput output;
++    ForwardVertexOutput output;
+     output.viewPosition = (input.position * gObject.scale) + gObject.translation;
+     output.viewNormal = normalize(input.normal);
+     output.position = mul(float4(output.viewPosition, 1.0), gFrame.projection);
+     return output;
+ }
+ 
+-float4 ForwardPS(VertexOutput input) : SV_Target0
++float4 ForwardPS(ForwardVertexOutput input) : SV_Target0
+ {
+     float3 normal = normalize(input.viewNormal);
+     float3 linearColor = gObject.baseColor * 0.018;
+diff --git a/chapters/tiled-forward-plus-and-clustered-lighting/Starter/Renderer.cpp b/chapters/tiled-forward-plus-and-clustered-lighting/Starter/Renderer.cpp
+index b4173b3..cd6f3bb 100644
+--- a/chapters/tiled-forward-plus-and-clustered-lighting/Starter/Renderer.cpp
++++ b/chapters/tiled-forward-plus-and-clustered-lighting/Starter/Renderer.cpp
+@@ -149,6 +149,10 @@ lgp::framework::Status Renderer::CreateShaders()
+     options.optimize = false;
+ #endif
+ 
++    if (auto status = gpu::CompileShader(compiler, options, L"DepthVS", L"vs_6_0", depthVertexShader_); !status)
++    {
++        return status;
++    }
+     if (auto status = gpu::CompileShader(compiler, options, L"ForwardVS", L"vs_6_0", forwardVertexShader_); !status)
+     {
+         return status;
+@@ -292,49 +296,83 @@ lgp::framework::Status Renderer::CreatePipelines()
+         {"POSITION", 0U, DXGI_FORMAT_R32G32B32_FLOAT, 0U, 0U, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0U},
+         {"NORMAL", 0U, DXGI_FORMAT_R32G32B32_FLOAT, 0U, 12U, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0U},
+     };
+-    D3D12_BLEND_DESC blend{};
+-    blend.RenderTarget[0].RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
+     D3D12_RASTERIZER_DESC rasterizer{};
+     rasterizer.FillMode = D3D12_FILL_MODE_SOLID;
+     rasterizer.CullMode = D3D12_CULL_MODE_NONE;
+     rasterizer.DepthClipEnable = TRUE;
+-    D3D12_DEPTH_STENCIL_DESC depth{};
+-    depth.DepthEnable = TRUE;
+-    depth.DepthWriteMask = D3D12_DEPTH_WRITE_MASK_ALL;
+-
+-    D3D12_GRAPHICS_PIPELINE_STATE_DESC description{};
+-    description.pRootSignature = graphicsRootSignature_.Get();
+-    description.VS = forwardVertexShader_.Bytecode();
+-    description.PS = forwardPixelShader_.Bytecode();
+-    description.BlendState = blend;
+-    description.SampleMask = UINT_MAX;
+-    description.RasterizerState = rasterizer;
+-    description.DepthStencilState = depth;
+-    description.InputLayout = {inputLayout, static_cast<UINT>(std::size(inputLayout))};
+-    description.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+-    description.NumRenderTargets = 1U;
+-    description.RTVFormats[0] = deviceResources_->back_buffer_format();
+-    description.DSVFormat = gpu::kDepthDsvFormat;
+-    description.SampleDesc.Count = 1U;
+-
+-    description.DepthStencilState.DepthFunc = DepthFunction(DepthConvention::Forward);
+-    HRESULT const forwardResult = deviceResources_->device()->CreateGraphicsPipelineState(
+-        &description, IID_PPV_ARGS(forwardPipeline_.ReleaseAndGetAddressOf()));
+-    if (FAILED(forwardResult))
++    D3D12_BLEND_DESC depthBlend{};
++    D3D12_DEPTH_STENCIL_DESC depthState{};
++    depthState.DepthEnable = TRUE;
++    depthState.DepthWriteMask = D3D12_DEPTH_WRITE_MASK_ALL;
++
++    D3D12_GRAPHICS_PIPELINE_STATE_DESC depthDescription{};
++    depthDescription.pRootSignature = graphicsRootSignature_.Get();
++    depthDescription.VS = depthVertexShader_.Bytecode();
++    depthDescription.BlendState = depthBlend;
++    depthDescription.SampleMask = UINT_MAX;
++    depthDescription.RasterizerState = rasterizer;
++    depthDescription.DepthStencilState = depthState;
++    depthDescription.InputLayout = {inputLayout, static_cast<UINT>(std::size(inputLayout))};
++    depthDescription.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
++    depthDescription.DSVFormat = gpu::kDepthDsvFormat;
++    depthDescription.SampleDesc.Count = 1U;
++
++    depthDescription.DepthStencilState.DepthFunc = DepthFunction(DepthConvention::Forward);
++    HRESULT const depthForwardResult = deviceResources_->device()->CreateGraphicsPipelineState(
++        &depthDescription, IID_PPV_ARGS(depthForwardPipeline_.ReleaseAndGetAddressOf()));
++    if (FAILED(depthForwardResult))
+     {
+         return std::unexpected(
+-            lgp::framework::MakeHResultError("ID3D12Device::CreateGraphicsPipelineState", forwardResult,
+-                                             "Failed to create the Chapter 14 Starter forward-depth pipeline."));
++            lgp::framework::MakeHResultError("ID3D12Device::CreateGraphicsPipelineState", depthForwardResult,
++                                             "Failed to create the Chapter 14 forward depth-prepass pipeline."));
+     }
+-
+-    description.DepthStencilState.DepthFunc = DepthFunction(DepthConvention::Reversed);
+-    HRESULT const reversedResult = deviceResources_->device()->CreateGraphicsPipelineState(
+-        &description, IID_PPV_ARGS(reversedPipeline_.ReleaseAndGetAddressOf()));
+-    if (FAILED(reversedResult))
++    depthDescription.DepthStencilState.DepthFunc = DepthFunction(DepthConvention::Reversed);
++    HRESULT const depthReversedResult = deviceResources_->device()->CreateGraphicsPipelineState(
++        &depthDescription, IID_PPV_ARGS(depthReversedPipeline_.ReleaseAndGetAddressOf()));
++    if (FAILED(depthReversedResult))
++    {
++        return std::unexpected(
++            lgp::framework::MakeHResultError("ID3D12Device::CreateGraphicsPipelineState", depthReversedResult,
++                                             "Failed to create the Chapter 14 reversed depth-prepass pipeline."));
++    }
++
++    D3D12_BLEND_DESC shadeBlend{};
++    shadeBlend.RenderTarget[0].RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
++    D3D12_DEPTH_STENCIL_DESC shadeDepth{};
++    shadeDepth.DepthEnable = TRUE;
++    shadeDepth.DepthWriteMask = D3D12_DEPTH_WRITE_MASK_ZERO;
++    D3D12_GRAPHICS_PIPELINE_STATE_DESC shadeDescription{};
++    shadeDescription.pRootSignature = graphicsRootSignature_.Get();
++    shadeDescription.VS = forwardVertexShader_.Bytecode();
++    shadeDescription.PS = forwardPixelShader_.Bytecode();
++    shadeDescription.BlendState = shadeBlend;
++    shadeDescription.SampleMask = UINT_MAX;
++    shadeDescription.RasterizerState = rasterizer;
++    shadeDescription.DepthStencilState = shadeDepth;
++    shadeDescription.InputLayout = {inputLayout, static_cast<UINT>(std::size(inputLayout))};
++    shadeDescription.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
++    shadeDescription.NumRenderTargets = 1U;
++    shadeDescription.RTVFormats[0] = deviceResources_->back_buffer_format();
++    shadeDescription.DSVFormat = gpu::kDepthDsvFormat;
++    shadeDescription.SampleDesc.Count = 1U;
++
++    shadeDescription.DepthStencilState.DepthFunc = DepthFunction(DepthConvention::Forward);
++    HRESULT const shadeForwardResult = deviceResources_->device()->CreateGraphicsPipelineState(
++        &shadeDescription, IID_PPV_ARGS(shadeForwardPipeline_.ReleaseAndGetAddressOf()));
++    if (FAILED(shadeForwardResult))
+     {
+         return std::unexpected(
+-            lgp::framework::MakeHResultError("ID3D12Device::CreateGraphicsPipelineState", reversedResult,
+-                                             "Failed to create the Chapter 14 Starter reversed-depth pipeline."));
++            lgp::framework::MakeHResultError("ID3D12Device::CreateGraphicsPipelineState", shadeForwardResult,
++                                             "Failed to create the Chapter 14 forward shading pipeline."));
++    }
++    shadeDescription.DepthStencilState.DepthFunc = DepthFunction(DepthConvention::Reversed);
++    HRESULT const shadeReversedResult = deviceResources_->device()->CreateGraphicsPipelineState(
++        &shadeDescription, IID_PPV_ARGS(shadeReversedPipeline_.ReleaseAndGetAddressOf()));
++    if (FAILED(shadeReversedResult))
++    {
++        return std::unexpected(
++            lgp::framework::MakeHResultError("ID3D12Device::CreateGraphicsPipelineState", shadeReversedResult,
++                                             "Failed to create the Chapter 14 reversed shading pipeline."));
+     }
+ 
+     if (auto status = CreateComputePipeline(*deviceResources_->device(), *computeRootSignature_.Get(), resetShader_,
+@@ -708,32 +746,58 @@ lgp::framework::Status Renderer::Render(lgp::framework::FrameContext const &fram
+     };
+ 
+     ID3D12GraphicsCommandList7 &commandList = *frameContext.commandList;
+-    std::vector<D3D12_TEXTURE_BARRIER> barriers{
++    ID3D12DescriptorHeap *const heaps[]{frameContext.shaderVisibleCbvSrvUavHeap};
++    commandList.SetDescriptorHeaps(1U, heaps);
++    commandList.RSSetViewports(1U, &frameContext.viewport);
++    commandList.RSSetScissorRects(1U, &frameContext.scissorRect);
++    commandList.IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
++    commandList.IASetVertexBuffers(0U, 1U, &quad_.vertexView);
++    commandList.IASetIndexBuffer(&quad_.indexView);
++
++    std::vector<D3D12_TEXTURE_BARRIER> textureBarriers{
+         gpu::MakeTextureBarrier(*frameContext.renderTarget, gpu::FrameStartState(frameContext),
+                                 gpu::RenderTargetState()),
+         gpu::MakeTextureBarrier(*slot.depth.Get(), gpu::CommonState(), gpu::DepthWriteState()),
+     };
+-    gpu::SubmitTextureBarriers(commandList, barriers);
++    gpu::SubmitTextureBarriers(commandList, textureBarriers);
+ 
+     float const clearColor[]{0.0F, 0.0F, 0.0F, 1.0F};
+     commandList.ClearRenderTargetView(frameContext.renderTargetView, clearColor, 0U, nullptr);
+     commandList.ClearDepthStencilView(slot.dsvs.CpuHandle(0U), D3D12_CLEAR_FLAG_DEPTH,
+                                       DepthClearValue(configuration.depthConvention), 0U, 0U, nullptr);
+-    D3D12_CPU_DESCRIPTOR_HANDLE const depthDsv = slot.dsvs.CpuHandle(0U);
+-    commandList.OMSetRenderTargets(1U, &frameContext.renderTargetView, FALSE, &depthDsv);
+-    commandList.RSSetViewports(1U, &frameContext.viewport);
+-    commandList.RSSetScissorRects(1U, &frameContext.scissorRect);
+-    commandList.IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+-    commandList.IASetVertexBuffers(0U, 1U, &quad_.vertexView);
+-    commandList.IASetIndexBuffer(&quad_.indexView);
++    D3D12_CPU_DESCRIPTOR_HANDLE const depthWriteDsv = slot.dsvs.CpuHandle(0U);
++    commandList.OMSetRenderTargets(0U, nullptr, FALSE, &depthWriteDsv);
++    commandList.SetGraphicsRootSignature(graphicsRootSignature_.Get());
++    commandList.SetGraphicsRoot32BitConstants(GraphicsFrameRootConstants, sizeof(constants) / sizeof(std::uint32_t),
++                                              &constants, 0U);
++    commandList.SetPipelineState(configuration.depthConvention == DepthConvention::Forward
++                                     ? depthForwardPipeline_.Get()
++                                     : depthReversedPipeline_.Get());
++    for (gpu::SceneObject const &object : currentScene_)
++    {
++        commandList.SetGraphicsRoot32BitConstants(GraphicsObjectRootConstants,
++                                                  sizeof(gpu::ObjectData) / sizeof(std::uint32_t), &object.data, 0U);
++        commandList.DrawIndexedInstanced(quad_.indexCount, 1U, 0U, 0, 0U);
++    }
++
++    textureBarriers = {
++        gpu::MakeTextureBarrier(*slot.depth.Get(), gpu::DepthWriteState(), gpu::ComputeShaderResourceState()),
++    };
++    gpu::SubmitTextureBarriers(commandList, textureBarriers);
++    textureBarriers = {
++        gpu::MakeTextureBarrier(*slot.depth.Get(), gpu::ComputeShaderResourceState(), gpu::DepthReadState()),
++    };
++    gpu::SubmitTextureBarriers(commandList, textureBarriers);
++
++    D3D12_CPU_DESCRIPTOR_HANDLE const depthReadDsv = slot.dsvs.CpuHandle(1U);
++    commandList.OMSetRenderTargets(1U, &frameContext.renderTargetView, FALSE, &depthReadDsv);
+     commandList.SetGraphicsRootSignature(graphicsRootSignature_.Get());
+     commandList.SetGraphicsRoot32BitConstants(GraphicsFrameRootConstants, sizeof(constants) / sizeof(std::uint32_t),
+                                               &constants, 0U);
+-    ID3D12DescriptorHeap *const heaps[]{frameContext.shaderVisibleCbvSrvUavHeap};
+-    commandList.SetDescriptorHeaps(1U, heaps);
+     commandList.SetGraphicsRootDescriptorTable(GraphicsSrvTable, slot.descriptors.GpuHandle(LightSrv));
+-    commandList.SetPipelineState(configuration.depthConvention == DepthConvention::Forward ? forwardPipeline_.Get()
+-                                                                                           : reversedPipeline_.Get());
++    commandList.SetPipelineState(configuration.depthConvention == DepthConvention::Forward
++                                     ? shadeForwardPipeline_.Get()
++                                     : shadeReversedPipeline_.Get());
+     for (gpu::SceneObject const &object : currentScene_)
+     {
+         commandList.SetGraphicsRoot32BitConstants(GraphicsObjectRootConstants,
+@@ -741,11 +805,11 @@ lgp::framework::Status Renderer::Render(lgp::framework::FrameContext const &fram
+         commandList.DrawIndexedInstanced(quad_.indexCount, 1U, 0U, 0, 0U);
+     }
+ 
+-    barriers = {
+-        gpu::MakeTextureBarrier(*slot.depth.Get(), gpu::DepthWriteState(), gpu::CommonState()),
++    textureBarriers = {
++        gpu::MakeTextureBarrier(*slot.depth.Get(), gpu::DepthReadState(), gpu::CommonState()),
+         gpu::MakeTextureBarrier(*frameContext.renderTarget, gpu::RenderTargetState(), gpu::FrameEndState(frameContext)),
+     };
+-    gpu::SubmitTextureBarriers(commandList, barriers);
++    gpu::SubmitTextureBarriers(commandList, textureBarriers);
+     return {};
+ }
+ 
+@@ -757,10 +821,13 @@ void Renderer::Shutdown(lgp::framework::DeviceResources &deviceResources) noexce
+     prefixPipeline_.Reset();
+     countPipeline_.Reset();
+     resetPipeline_.Reset();
+-    reversedPipeline_.Reset();
+-    forwardPipeline_.Reset();
++    shadeReversedPipeline_.Reset();
++    shadeForwardPipeline_.Reset();
++    depthReversedPipeline_.Reset();
++    depthForwardPipeline_.Reset();
+     computeRootSignature_.Reset();
+     graphicsRootSignature_.Reset();
++    depthVertexShader_ = {};
+     forwardVertexShader_ = {};
+     forwardPixelShader_ = {};
+     resetShader_ = {};
+diff --git a/chapters/tiled-forward-plus-and-clustered-lighting/Starter/Renderer.hpp b/chapters/tiled-forward-plus-and-clustered-lighting/Starter/Renderer.hpp
+index adebf45..3ff8f70 100644
+--- a/chapters/tiled-forward-plus-and-clustered-lighting/Starter/Renderer.hpp
++++ b/chapters/tiled-forward-plus-and-clustered-lighting/Starter/Renderer.hpp
+@@ -80,6 +80,7 @@ class Renderer final : public lgp::framework::IChapterRenderer
+     [[nodiscard]] gpu::LabConfiguration ActiveConfiguration() const noexcept;
+ 
+     lgp::framework::DeviceResources *deviceResources_{};
++    lgp::framework::CompiledShader depthVertexShader_{};
+     lgp::framework::CompiledShader forwardVertexShader_{};
+     lgp::framework::CompiledShader forwardPixelShader_{};
+     lgp::framework::CompiledShader resetShader_{};
+@@ -88,8 +89,10 @@ class Renderer final : public lgp::framework::IChapterRenderer
+     lgp::framework::CompiledShader fillShader_{};
+     Microsoft::WRL::ComPtr<ID3D12RootSignature> graphicsRootSignature_{};
+     Microsoft::WRL::ComPtr<ID3D12RootSignature> computeRootSignature_{};
+-    Microsoft::WRL::ComPtr<ID3D12PipelineState> forwardPipeline_{};
+-    Microsoft::WRL::ComPtr<ID3D12PipelineState> reversedPipeline_{};
++    Microsoft::WRL::ComPtr<ID3D12PipelineState> depthForwardPipeline_{};
++    Microsoft::WRL::ComPtr<ID3D12PipelineState> depthReversedPipeline_{};
++    Microsoft::WRL::ComPtr<ID3D12PipelineState> shadeForwardPipeline_{};
++    Microsoft::WRL::ComPtr<ID3D12PipelineState> shadeReversedPipeline_{};
+     Microsoft::WRL::ComPtr<ID3D12PipelineState> resetPipeline_{};
+     Microsoft::WRL::ComPtr<ID3D12PipelineState> countPipeline_{};
+     Microsoft::WRL::ComPtr<ID3D12PipelineState> prefixPipeline_{};

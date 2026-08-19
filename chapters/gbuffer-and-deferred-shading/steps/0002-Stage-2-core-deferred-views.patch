@@ -1,0 +1,1031 @@
+From 5ddc2655a270edf48a789fdd4a9725a50b78a612 Mon Sep 17 00:00:00 2001
+From: Copilot <copilot@example.com>
+Date: Mon, 17 Aug 2026 08:02:04 +0100
+Subject: [PATCH 2/5] Stage 2 core deferred views
+
+---
+ .../Starter/GBufferDeferredLab.hlsl           | 197 ++++---
+ .../Starter/Main.cpp                          |   4 +-
+ .../Starter/Renderer.cpp                      | 483 ++++++++++++++----
+ .../Starter/Renderer.hpp                      |   4 +-
+ 4 files changed, 496 insertions(+), 192 deletions(-)
+
+diff --git a/chapters/gbuffer-and-deferred-shading/Starter/GBufferDeferredLab.hlsl b/chapters/gbuffer-and-deferred-shading/Starter/GBufferDeferredLab.hlsl
+index fd36f7b..789b3d2 100644
+--- a/chapters/gbuffer-and-deferred-shading/Starter/GBufferDeferredLab.hlsl
++++ b/chapters/gbuffer-and-deferred-shading/Starter/GBufferDeferredLab.hlsl
+@@ -33,22 +33,25 @@ struct MeshVertex
+     float4 tangent : TANGENT;
+ };
+ 
+-struct ForwardVertex
++struct GeometryVertex
+ {
+     float4 position : SV_Position;
+     float3 viewPosition : POSITION0;
+     float3 viewNormal : NORMAL0;
+ };
+ 
+-struct SurfaceRecord
++struct GBufferOutputs
+ {
+-    float3 baseColor;
+-    float metalness;
+-    float3 viewNormal;
+-    float roughness;
+-    float deviceDepth;
+-    float2 motion;
+-    uint identity;
++    float4 baseColorMetalness : SV_Target0;
++    float4 octahedralNormal : SV_Target1;
++    float4 roughness : SV_Target2;
++    float4 motion : SV_Target3;
++    uint4 identity : SV_Target4;
++};
++
++struct FullscreenVertex
++{
++    float4 position : SV_Position;
+ };
+ 
+ static const float Pi = 3.14159265358979323846;
+@@ -81,35 +84,15 @@ float3 DecodeOctahedral(float2 encoded)
+     return normalize(normal);
+ }
+ 
+-float QuantizeUnorm(float value, float maximumCode)
+-{
+-    return round(saturate(value) * maximumCode) / maximumCode;
+-}
+-
+ float SrgbEncode(float linearValue)
+ {
+     float value = saturate(linearValue);
+     return value <= 0.0031308 ? value * 12.92 : (1.055 * pow(value, 1.0 / 2.4)) - 0.055;
+ }
+ 
+-float SrgbDecode(float encoded)
+-{
+-    float value = saturate(encoded);
+-    return value <= 0.04045 ? value / 12.92 : pow((value + 0.055) / 1.055, 2.4);
+-}
+-
+-float3 QuantizedBaseColor(float3 linearBaseColor)
+-{
+-    float3 encoded = float3(SrgbEncode(linearBaseColor.r), SrgbEncode(linearBaseColor.g), SrgbEncode(linearBaseColor.b));
+-    encoded = float3(QuantizeUnorm(encoded.r, 255.0), QuantizeUnorm(encoded.g, 255.0), QuantizeUnorm(encoded.b, 255.0));
+-    return float3(SrgbDecode(encoded.r), SrgbDecode(encoded.g), SrgbDecode(encoded.b));
+-}
+-
+-float3 QuantizedNormal(float3 unitNormal)
++float3 DisplayEncode(float3 linearColor)
+ {
+-    float2 encoded = EncodeOctahedral(unitNormal);
+-    encoded = float2(QuantizeUnorm(encoded.x, 65535.0), QuantizeUnorm(encoded.y, 65535.0));
+-    return DecodeOctahedral(encoded);
++    return float3(SrgbEncode(linearColor.r), SrgbEncode(linearColor.g), SrgbEncode(linearColor.b));
+ }
+ 
+ float3 SchlickFresnel(float3 f0, float cosine)
+@@ -141,6 +124,31 @@ float SmithG1(float nDotDirection, float roughness)
+     return (2.0 * cosine) / max(cosine + root, 1.0e-7);
+ }
+ 
++float BackgroundDepth()
++{
++    return frameData.options.y == 0U ? 1.0 : 0.0;
++}
++
++float ViewDepthFromDeviceDepth(float deviceDepth)
++{
++    float denominator = deviceDepth - frameData.projectionData.z;
++    if (abs(denominator) < 1.0e-8)
++    {
++        return 0.0;
++    }
++    return frameData.projectionData.w / denominator;
++}
++
++float3 ReconstructViewPosition(int2 pixel, float deviceDepth)
++{
++    float2 renderSize = float2(frameData.options.z, frameData.options.w);
++    float2 uv = (float2(pixel) + 0.5) / renderSize;
++    float2 ndc = float2((uv.x * 2.0) - 1.0, 1.0 - (uv.y * 2.0));
++    float viewDepth = ViewDepthFromDeviceDepth(deviceDepth);
++    return float3(ndc.x * viewDepth * frameData.projectionData.x, ndc.y * viewDepth * frameData.projectionData.y,
++                  viewDepth);
++}
++
+ float3 IdentityColor(uint identity)
+ {
+     if (identity == 0U) return 0.0;
+@@ -151,101 +159,88 @@ float3 IdentityColor(uint identity)
+     return float3(0.18, 0.64, 0.90);
+ }
+ 
+-float3 DisplayEncode(float3 linearColor)
++GeometryVertex GeometryVS(MeshVertex input)
+ {
+-    return float3(SrgbEncode(linearColor.r), SrgbEncode(linearColor.g), SrgbEncode(linearColor.b));
++    GeometryVertex output;
++    float4 worldPosition = float4(input.position + objectData.translation, 1.0);
++    float4 viewPosition = mul(worldPosition, frameData.viewMatrix);
++    output.position = mul(worldPosition, frameData.viewProjection);
++    output.viewPosition = viewPosition.xyz;
++    output.viewNormal = mul(float4(input.normal, 0.0), frameData.viewMatrix).xyz;
++    return output;
+ }
+ 
+-SurfaceRecord BuildSurfaceRecord(ForwardVertex input, bool frontFace)
++GBufferOutputs GeometryPS(GeometryVertex input, bool frontFace : SV_IsFrontFace)
+ {
+-    SurfaceRecord surface;
+-    surface.viewNormal = QuantizedNormal(normalize(input.viewNormal) * (frontFace ? 1.0 : -1.0));
+-    surface.baseColor = QuantizedBaseColor(objectData.baseColor);
+-    surface.roughness = QuantizeUnorm(objectData.roughness, 255.0);
+-    surface.metalness = QuantizeUnorm(objectData.metalness, 255.0);
+-    surface.deviceDepth = saturate(input.position.z);
+-    surface.motion = 0.0.xx;
+-    surface.identity = objectData.metadata.x;
+-    return surface;
++    GBufferOutputs output;
++    float3 viewNormal = normalize(input.viewNormal) * (frontFace ? 1.0 : -1.0);
++    output.baseColorMetalness = float4(objectData.baseColor, objectData.metalness);
++    output.octahedralNormal = float4(EncodeOctahedral(viewNormal), 0.0, 0.0);
++    output.roughness = float4(objectData.roughness, 0.0, 0.0, 0.0);
++    output.motion = float4(0.0, 0.0, 0.0, 0.0);
++    output.identity = uint4(objectData.metadata.x, 0U, 0U, 0U);
++    return output;
+ }
+ 
+-float3 ShadeSurfaceRecord(SurfaceRecord surface, float3 viewPosition)
++FullscreenVertex FullscreenVS(uint vertexId : SV_VertexID)
+ {
+-    float3 viewDirection = normalize(-viewPosition);
+-    float3 lightDirection = normalize(frameData.lightDirectionIntensity.xyz);
+-    float nDotL = saturate(dot(surface.viewNormal, lightDirection));
+-    float nDotV = saturate(dot(surface.viewNormal, viewDirection));
+-    float3 halfVector = normalize(viewDirection + lightDirection);
+-    float nDotH = saturate(dot(surface.viewNormal, halfVector));
+-    float vDotH = saturate(dot(viewDirection, halfVector));
+-    float3 f0 = lerp(float3(0.04, 0.04, 0.04), surface.baseColor, surface.metalness);
+-    float3 fresnel = SchlickFresnel(f0, vDotH);
+-    float distribution = GgxDistribution(nDotH, surface.roughness);
+-    float geometry = SmithG1(nDotV, surface.roughness) * SmithG1(nDotL, surface.roughness);
+-    float denominator = max(4.0 * nDotV * nDotL, 1.0e-6);
+-    float3 specularBrdf = nDotL > 0.0 && nDotV > 0.0 ? fresnel * distribution * geometry / denominator : 0.0;
+-    float3 diffuseWeight =
+-        (1.0 - SchlickFresnel(f0, nDotV)) * (1.0 - SchlickFresnel(f0, nDotL)) * (1.0 - surface.metalness);
+-    float3 diffuseBrdf = diffuseWeight * surface.baseColor / Pi;
+-    return frameData.lightDirectionIntensity.w * nDotL * (diffuseBrdf + specularBrdf);
++    float2 uv = float2((vertexId << 1) & 2, vertexId & 2);
++    FullscreenVertex output;
++    output.position = float4((uv * float2(2.0, -2.0)) + float2(-1.0, 1.0), 0.0, 1.0);
++    return output;
+ }
+ 
+-float4 VisualizeSurfaceRecord(SurfaceRecord surface, uint debugView)
++float4 DeferredPS(FullscreenVertex input) : SV_Target
+ {
+-    float3 linearColor = 0.0.xxx;
+-    if (debugView == 1U)
++    int2 pixel = int2(input.position.xy);
++    float deviceDepth = deviceDepthTexture.Load(int3(pixel, 0));
++    uint debugView = frameData.options.x;
++    if (deviceDepth == BackgroundDepth())
+     {
+-        linearColor = surface.baseColor;
++        float3 background = debugView == 5U ? deviceDepth.xxx : 0.0;
++        return float4(debugView == 5U ? saturate(background) : DisplayEncode(background), 1.0);
+     }
+-    else if (debugView == 2U)
++
++    float4 baseColorMetalness = baseColorMetalnessTexture.Load(int3(pixel, 0));
++    float3 baseColor = baseColorMetalness.rgb;
++    float metalness = baseColorMetalness.a;
++    float3 viewNormal = DecodeOctahedral(octahedralNormalTexture.Load(int3(pixel, 0)));
++    float roughness = roughnessTexture.Load(int3(pixel, 0));
++    float2 motion = motionTexture.Load(int3(pixel, 0));
++    uint identity = identityTexture.Load(int3(pixel, 0));
++    float3 viewPosition = ReconstructViewPosition(pixel, deviceDepth);
++
++    float3 linearColor = 0.0;
++    if (debugView == 1U)
+     {
+-        linearColor = surface.metalness.xxx;
++        linearColor = baseColor;
++        return float4(DisplayEncode(linearColor), 1.0);
+     }
+-    else if (debugView == 3U)
++    if (debugView == 2U)
+     {
+-        linearColor = surface.viewNormal * 0.5 + 0.5;
+-        return float4(saturate(linearColor), 1.0);
++        return float4(metalness.xxx, 1.0);
+     }
+-    else if (debugView == 4U)
++    if (debugView == 3U)
+     {
+-        linearColor = surface.roughness.xxx;
++        return float4(saturate((viewNormal * 0.5) + 0.5), 1.0);
+     }
+-    else if (debugView == 5U)
++    if (debugView == 4U)
+     {
+-        linearColor = surface.deviceDepth.xxx;
++        return float4(roughness.xxx, 1.0);
+     }
+-    else if (debugView == 6U)
++    if (debugView == 5U)
+     {
+-        linearColor = 0.5.xxx;
+-        return float4(linearColor, 1.0);
++        return float4(deviceDepth.xxx, 1.0);
+     }
+-    else if (debugView == 7U)
++    if (debugView == 6U)
+     {
+-        linearColor = IdentityColor(surface.identity);
++        return float4((motion * 0.5) + 0.5, 0.0, 1.0);
+     }
+-    return float4(saturate(DisplayEncode(linearColor)), 1.0);
+-}
+-
+-ForwardVertex ForwardVS(MeshVertex input)
+-{
+-    ForwardVertex output;
+-    float4 worldPosition = float4(input.position + objectData.translation, 1.0);
+-    float4 viewPosition = mul(worldPosition, frameData.viewMatrix);
+-    output.position = mul(worldPosition, frameData.viewProjection);
+-    output.viewPosition = viewPosition.xyz;
+-    output.viewNormal = mul(float4(input.normal, 0.0), frameData.viewMatrix).xyz;
+-    return output;
+-}
+-
+-float4 ForwardPS(ForwardVertex input, bool frontFace : SV_IsFrontFace) : SV_Target
+-{
+-    SurfaceRecord surface = BuildSurfaceRecord(input, frontFace);
+-    uint debugView = frameData.options.x;
+-    if (debugView != 0U)
++    if (debugView == 7U)
+     {
+-        return VisualizeSurfaceRecord(surface, debugView);
++        return float4(DisplayEncode(IdentityColor(identity)), 1.0);
+     }
+ 
+-    float3 linearColor = ShadeSurfaceRecord(surface, input.viewPosition);
+-    return float4(saturate(DisplayEncode(linearColor)), 1.0);
++    linearColor = baseColor;
++    return float4(DisplayEncode(linearColor), 1.0);
+ }
+diff --git a/chapters/gbuffer-and-deferred-shading/Starter/Main.cpp b/chapters/gbuffer-and-deferred-shading/Starter/Main.cpp
+index babdfd3..2a87368 100644
+--- a/chapters/gbuffer-and-deferred-shading/Starter/Main.cpp
++++ b/chapters/gbuffer-and-deferred-shading/Starter/Main.cpp
+@@ -4,14 +4,14 @@
+ 
+ int wmain(int argc, wchar_t **argv)
+ {
+-    ch12::gbuffer::starter::Renderer renderer{};
++    ch12::gbuffer::solution::Renderer renderer{};
+ 
+     lgp::framework::ApplicationConfiguration configuration{};
+     configuration.title = L"Ch12 G-buffer and Deferred Shading Starter";
+     configuration.width = 1600U;
+     configuration.height = 900U;
+     configuration.enableDebugLayer = false;
+-    configuration.rtvDescriptorCount = 32U;
++    configuration.rtvDescriptorCount = 64U;
+ 
+     auto result = lgp::framework::RunApplication(configuration, argc, argv, renderer);
+     if (!result)
+diff --git a/chapters/gbuffer-and-deferred-shading/Starter/Renderer.cpp b/chapters/gbuffer-and-deferred-shading/Starter/Renderer.cpp
+index ff46dc4..e0dadc6 100644
+--- a/chapters/gbuffer-and-deferred-shading/Starter/Renderer.cpp
++++ b/chapters/gbuffer-and-deferred-shading/Starter/Renderer.cpp
+@@ -34,7 +34,7 @@
+ #include <lgp/framework/descriptors.hpp>
+ #include <lgp/framework/shader_compiler.hpp>
+ 
+-namespace ch12::gbuffer::starter
++namespace ch12::gbuffer::solution
+ {
+ namespace
+ {
+@@ -48,11 +48,25 @@ using Microsoft::WRL::ComPtr;
+ inline constexpr float kVerticalFov = 0.78F;
+ inline constexpr float kNearPlane = 0.1F;
+ inline constexpr float kFarPlane = 100.0F;
++inline constexpr UINT kSrvCount = 6U;
++inline constexpr UINT kPerSlotShaderVisibleDescriptors = 7U;
+ 
+ enum RootParameter : UINT
+ {
+     FrameRootConstants = 0U,
+     ObjectRootConstants = 1U,
++    GBufferSrvTable = 2U,
++};
++
++enum class AttachmentIndex : UINT
++{
++    BaseColorMetalness = 0U,
++    OctahedralNormal,
++    Roughness,
++    DeviceDepth,
++    Motion,
++    Identity,
++    Count,
+ };
+ 
+ struct FrameConstants final
+@@ -107,8 +121,10 @@ struct SceneState final
+ 
+ struct FrameSlotResources final
+ {
+-    ComPtr<ID3D12Resource> depth{};
++    std::array<ComPtr<ID3D12Resource>, static_cast<std::size_t>(AttachmentIndex::Count)> textures{};
++    lgp::framework::DescriptorAllocation rtvs{};
+     lgp::framework::DescriptorAllocation dsv{};
++    lgp::framework::DescriptorAllocation srvs{};
+ };
+ 
+ static_assert((sizeof(FrameConstants) % sizeof(std::uint32_t)) == 0U);
+@@ -156,9 +172,12 @@ static_assert((sizeof(ObjectConstants) % sizeof(std::uint32_t)) == 0U);
+     return mesh;
+ }
+ 
+-[[nodiscard]] SceneState MakeSceneState(bool headless, std::optional<HeadlessTestConfiguration> const &configuration)
++[[nodiscard]] SceneState MakeSceneState(bool headless, std::optional<HeadlessTestConfiguration> const &configuration,
++                                        DepthConvention uiDepthConvention, gpu::DebugView uiDebugView)
+ {
+     SceneState state{};
++    state.depthConvention = uiDepthConvention;
++    state.debugView = uiDebugView;
+     if (!headless || !configuration.has_value())
+     {
+         state.eye = {6.0F, 4.4F, -8.2F};
+@@ -220,17 +239,62 @@ static_assert((sizeof(ObjectConstants) % sizeof(std::uint32_t)) == 0U);
+                                                   : D3D12_COMPARISON_FUNC_GREATER_EQUAL;
+ }
+ 
++[[nodiscard]] DXGI_FORMAT AttachmentResourceFormat(AttachmentIndex index) noexcept
++{
++    switch (index)
++    {
++    case AttachmentIndex::BaseColorMetalness:
++        return gpu::kBaseColorMetalnessResourceFormat;
++    case AttachmentIndex::OctahedralNormal:
++        return gpu::kOctahedralNormalFormat;
++    case AttachmentIndex::Roughness:
++        return gpu::kRoughnessFormat;
++    case AttachmentIndex::DeviceDepth:
++        return gpu::kDepthResourceFormat;
++    case AttachmentIndex::Motion:
++        return gpu::kMotionFormat;
++    case AttachmentIndex::Identity:
++        return gpu::kIdentityFormat;
++    case AttachmentIndex::Count:
++        break;
++    }
++    return DXGI_FORMAT_UNKNOWN;
++}
++
++[[nodiscard]] UINT ColorAttachmentCount() noexcept
++{
++    return 5U;
++}
++
++[[nodiscard]] UINT TextureIndex(AttachmentIndex attachment) noexcept
++{
++    return static_cast<UINT>(attachment);
++}
++
++[[nodiscard]] char const *DebugViewComboItems() noexcept
++{
++    return "Final shading\0Base color\0Metalness\0Decoded normal\0Roughness\0Device depth\0Motion\0Identity\0";
++}
++
++[[nodiscard]] char const *DepthModeItems() noexcept
++{
++    return "Forward Z\0Reversed Z\0";
++}
++
+ } // namespace
+ 
+ class Renderer::Impl final
+ {
+   public:
+     lgp::framework::DeviceResources *deviceResources_{};
+-    lgp::framework::CompiledShader vertexShader_{};
+-    lgp::framework::CompiledShader pixelShader_{};
++    lgp::framework::CompiledShader geometryVertexShader_{};
++    lgp::framework::CompiledShader geometryPixelShader_{};
++    lgp::framework::CompiledShader fullscreenVertexShader_{};
++    lgp::framework::CompiledShader deferredPixelShader_{};
+     ComPtr<ID3D12RootSignature> rootSignature_{};
+-    ComPtr<ID3D12PipelineState> forwardPipeline_{};
+-    ComPtr<ID3D12PipelineState> reversedPipeline_{};
++    ComPtr<ID3D12PipelineState> geometryForwardPipeline_{};
++    ComPtr<ID3D12PipelineState> geometryReversedPipeline_{};
++    ComPtr<ID3D12PipelineState> deferredPipeline_{};
+     MeshBuffers sphere_{};
+     MeshBuffers ground_{};
+     MeshBuffers quad_{};
+@@ -238,6 +302,7 @@ class Renderer::Impl final
+     std::vector<FrameSlotResources> frameSlots_{};
+     SceneState sceneState_{};
+     std::optional<HeadlessTestConfiguration> headlessConfiguration_{};
++    UINT lastRenderedFrameSlot_{0U};
+     bool headless_{false};
+ 
+     [[nodiscard]] lgp::framework::Status Initialize(lgp::framework::ApplicationInitContext const &context);
+@@ -271,25 +336,45 @@ lgp::framework::Status Renderer::Impl::CreateShaders()
+     options.optimize = false;
+ #endif
+ 
+-    auto vertex = CompileShader(compiler, options, L"ForwardVS", L"vs_6_0");
+-    if (!vertex)
++    auto geometryVs = CompileShader(compiler, options, L"GeometryVS", L"vs_6_0");
++    if (!geometryVs)
++    {
++        return std::unexpected(std::move(geometryVs.error()));
++    }
++    geometryVertexShader_ = std::move(*geometryVs);
++
++    auto geometryPs = CompileShader(compiler, options, L"GeometryPS", L"ps_6_0");
++    if (!geometryPs)
+     {
+-        return std::unexpected(std::move(vertex.error()));
++        return std::unexpected(std::move(geometryPs.error()));
+     }
+-    vertexShader_ = std::move(*vertex);
++    geometryPixelShader_ = std::move(*geometryPs);
+ 
+-    auto pixel = CompileShader(compiler, options, L"ForwardPS", L"ps_6_0");
+-    if (!pixel)
++    auto fullscreenVs = CompileShader(compiler, options, L"FullscreenVS", L"vs_6_0");
++    if (!fullscreenVs)
+     {
+-        return std::unexpected(std::move(pixel.error()));
++        return std::unexpected(std::move(fullscreenVs.error()));
+     }
+-    pixelShader_ = std::move(*pixel);
++    fullscreenVertexShader_ = std::move(*fullscreenVs);
++
++    auto deferredPs = CompileShader(compiler, options, L"DeferredPS", L"ps_6_0");
++    if (!deferredPs)
++    {
++        return std::unexpected(std::move(deferredPs.error()));
++    }
++    deferredPixelShader_ = std::move(*deferredPs);
+     return {};
+ }
+ 
+ lgp::framework::Status Renderer::Impl::CreateRootSignature()
+ {
+-    D3D12_ROOT_PARAMETER parameters[2]{};
++    D3D12_DESCRIPTOR_RANGE range{};
++    range.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
++    range.NumDescriptors = kSrvCount;
++    range.BaseShaderRegister = 0U;
++    range.OffsetInDescriptorsFromTableStart = D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND;
++
++    D3D12_ROOT_PARAMETER parameters[3]{};
+     parameters[FrameRootConstants].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+     parameters[FrameRootConstants].Constants.ShaderRegister = 0U;
+     parameters[FrameRootConstants].Constants.Num32BitValues = sizeof(FrameConstants) / sizeof(std::uint32_t);
+@@ -298,6 +383,10 @@ lgp::framework::Status Renderer::Impl::CreateRootSignature()
+     parameters[ObjectRootConstants].Constants.ShaderRegister = 1U;
+     parameters[ObjectRootConstants].Constants.Num32BitValues = sizeof(ObjectConstants) / sizeof(std::uint32_t);
+     parameters[ObjectRootConstants].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
++    parameters[GBufferSrvTable].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
++    parameters[GBufferSrvTable].DescriptorTable.NumDescriptorRanges = 1U;
++    parameters[GBufferSrvTable].DescriptorTable.pDescriptorRanges = &range;
++    parameters[GBufferSrvTable].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+ 
+     D3D12_ROOT_SIGNATURE_DESC description{};
+     description.NumParameters = static_cast<UINT>(std::size(parameters));
+@@ -325,7 +414,7 @@ lgp::framework::Status Renderer::Impl::CreateRootSignature()
+     {
+         return std::unexpected(
+             lgp::framework::MakeHResultError("ID3D12Device::CreateRootSignature", createResult,
+-                                             "Failed to create the Chapter 12 Starter root signature."));
++                                             "Failed to create the Chapter 12 Solution root signature."));
+     }
+     return {};
+ }
+@@ -340,7 +429,10 @@ lgp::framework::Status Renderer::Impl::CreatePipelines()
+     };
+ 
+     D3D12_BLEND_DESC blend{};
+-    blend.RenderTarget[0].RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
++    for (UINT index = 0U; index < ColorAttachmentCount(); ++index)
++    {
++        blend.RenderTarget[index].RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
++    }
+ 
+     D3D12_RASTERIZER_DESC rasterizer{};
+     rasterizer.FillMode = D3D12_FILL_MODE_SOLID;
+@@ -351,41 +443,73 @@ lgp::framework::Status Renderer::Impl::CreatePipelines()
+     depth.DepthEnable = TRUE;
+     depth.DepthWriteMask = D3D12_DEPTH_WRITE_MASK_ALL;
+ 
+-    D3D12_GRAPHICS_PIPELINE_STATE_DESC description{};
+-    description.pRootSignature = rootSignature_.Get();
+-    description.VS = vertexShader_.Bytecode();
+-    description.PS = pixelShader_.Bytecode();
+-    description.BlendState = blend;
+-    description.SampleMask = UINT_MAX;
+-    description.RasterizerState = rasterizer;
+-    description.DepthStencilState = depth;
+-    description.InputLayout = {inputLayout, static_cast<UINT>(std::size(inputLayout))};
+-    description.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+-    description.NumRenderTargets = 1U;
+-    description.RTVFormats[0] = deviceResources_->back_buffer_format();
+-    description.DSVFormat = gpu::kDepthDsvFormat;
+-    description.SampleDesc.Count = 1U;
+-
+-    description.DepthStencilState.DepthFunc = DepthFunc(DepthConvention::Forward);
++    D3D12_GRAPHICS_PIPELINE_STATE_DESC geometryDescription{};
++    geometryDescription.pRootSignature = rootSignature_.Get();
++    geometryDescription.VS = geometryVertexShader_.Bytecode();
++    geometryDescription.PS = geometryPixelShader_.Bytecode();
++    geometryDescription.BlendState = blend;
++    geometryDescription.SampleMask = UINT_MAX;
++    geometryDescription.RasterizerState = rasterizer;
++    geometryDescription.DepthStencilState = depth;
++    geometryDescription.InputLayout = {inputLayout, static_cast<UINT>(std::size(inputLayout))};
++    geometryDescription.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
++    geometryDescription.NumRenderTargets = ColorAttachmentCount();
++    geometryDescription.RTVFormats[0] = gpu::kBaseColorMetalnessViewFormat;
++    geometryDescription.RTVFormats[1] = gpu::kOctahedralNormalFormat;
++    geometryDescription.RTVFormats[2] = gpu::kRoughnessFormat;
++    geometryDescription.RTVFormats[3] = gpu::kMotionFormat;
++    geometryDescription.RTVFormats[4] = gpu::kIdentityFormat;
++    geometryDescription.DSVFormat = gpu::kDepthDsvFormat;
++    geometryDescription.SampleDesc.Count = 1U;
++
++    geometryDescription.DepthStencilState.DepthFunc = DepthFunc(DepthConvention::Forward);
+     HRESULT const forwardResult = deviceResources_->device()->CreateGraphicsPipelineState(
+-        &description, IID_PPV_ARGS(forwardPipeline_.ReleaseAndGetAddressOf()));
++        &geometryDescription, IID_PPV_ARGS(geometryForwardPipeline_.ReleaseAndGetAddressOf()));
+     if (FAILED(forwardResult))
+     {
+         return std::unexpected(
+             lgp::framework::MakeHResultError("ID3D12Device::CreateGraphicsPipelineState", forwardResult,
+-                                             "Failed to create the Chapter 12 Starter forward-depth pipeline."));
++                                             "Failed to create the Chapter 12 Solution forward geometry pipeline."));
+     }
+ 
+-    description.DepthStencilState.DepthFunc = DepthFunc(DepthConvention::Reversed);
++    geometryDescription.DepthStencilState.DepthFunc = DepthFunc(DepthConvention::Reversed);
+     HRESULT const reversedResult = deviceResources_->device()->CreateGraphicsPipelineState(
+-        &description, IID_PPV_ARGS(reversedPipeline_.ReleaseAndGetAddressOf()));
++        &geometryDescription, IID_PPV_ARGS(geometryReversedPipeline_.ReleaseAndGetAddressOf()));
+     if (FAILED(reversedResult))
+     {
+         return std::unexpected(
+             lgp::framework::MakeHResultError("ID3D12Device::CreateGraphicsPipelineState", reversedResult,
+-                                             "Failed to create the Chapter 12 Starter reversed-depth pipeline."));
++                                             "Failed to create the Chapter 12 Solution reversed geometry pipeline."));
+     }
+ 
++    D3D12_BLEND_DESC fullscreenBlend{};
++    fullscreenBlend.RenderTarget[0].RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
++
++    D3D12_DEPTH_STENCIL_DESC fullscreenDepth{};
++    fullscreenDepth.DepthEnable = FALSE;
++    fullscreenDepth.DepthWriteMask = D3D12_DEPTH_WRITE_MASK_ZERO;
++    fullscreenDepth.DepthFunc = D3D12_COMPARISON_FUNC_ALWAYS;
++
++    D3D12_GRAPHICS_PIPELINE_STATE_DESC deferredDescription{};
++    deferredDescription.pRootSignature = rootSignature_.Get();
++    deferredDescription.VS = fullscreenVertexShader_.Bytecode();
++    deferredDescription.PS = deferredPixelShader_.Bytecode();
++    deferredDescription.BlendState = fullscreenBlend;
++    deferredDescription.SampleMask = UINT_MAX;
++    deferredDescription.RasterizerState = rasterizer;
++    deferredDescription.DepthStencilState = fullscreenDepth;
++    deferredDescription.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
++    deferredDescription.NumRenderTargets = 1U;
++    deferredDescription.RTVFormats[0] = deviceResources_->back_buffer_format();
++    deferredDescription.SampleDesc.Count = 1U;
++    HRESULT const deferredResult = deviceResources_->device()->CreateGraphicsPipelineState(
++        &deferredDescription, IID_PPV_ARGS(deferredPipeline_.ReleaseAndGetAddressOf()));
++    if (FAILED(deferredResult))
++    {
++        return std::unexpected(
++            lgp::framework::MakeHResultError("ID3D12Device::CreateGraphicsPipelineState", deferredResult,
++                                             "Failed to create the Chapter 12 Solution deferred pipeline."));
++    }
+     return {};
+ }
+ 
+@@ -443,11 +567,24 @@ void Renderer::Impl::ReleaseSizeDependentResources() noexcept
+ {
+     for (FrameSlotResources &slot : frameSlots_)
+     {
+-        slot.depth.Reset();
++        for (auto &texture : slot.textures)
++        {
++            texture.Reset();
++        }
++        if (slot.rtvs)
++        {
++            deviceResources_->rtv_heap().Free(slot.rtvs);
++        }
++        if (slot.srvs)
++        {
++            deviceResources_->shader_visible_cbv_srv_uav_heap().Free(slot.srvs);
++        }
+         if (slot.dsv)
+         {
+             dsvHeap_.Free(slot.dsv);
+         }
++        slot.rtvs = {};
++        slot.srvs = {};
+         slot.dsv = {};
+     }
+     frameSlots_.clear();
+@@ -467,6 +604,13 @@ lgp::framework::Status Renderer::Impl::CreateSizeDependentResources(lgp::framewo
+ 
+     for (UINT frameSlot = 0U; frameSlot < deviceResources_->back_buffer_count(); ++frameSlot)
+     {
++        auto rtvResult = deviceResources_->rtv_heap().Allocate(ColorAttachmentCount());
++        if (!rtvResult)
++        {
++            return std::unexpected(std::move(rtvResult.error()));
++        }
++        frameSlots_[frameSlot].rtvs = *rtvResult;
++
+         auto dsvResult = dsvHeap_.Allocate(1U);
+         if (!dsvResult)
+         {
+@@ -474,25 +618,127 @@ lgp::framework::Status Renderer::Impl::CreateSizeDependentResources(lgp::framewo
+         }
+         frameSlots_[frameSlot].dsv = *dsvResult;
+ 
+-        D3D12_RESOURCE_DESC1 const description =
+-            gpu::MakeTextureDescription(drawableSize, gpu::kDepthDsvFormat, D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL);
+-        HRESULT const createResult = deviceResources_->device()->CreateCommittedResource3(
+-            &heap, D3D12_HEAP_FLAG_NONE, &description, D3D12_BARRIER_LAYOUT_COMMON, nullptr, nullptr, 0U, nullptr,
+-            IID_PPV_ARGS(frameSlots_[frameSlot].depth.ReleaseAndGetAddressOf()));
+-        if (FAILED(createResult))
++        auto srvResult = deviceResources_->shader_visible_cbv_srv_uav_heap().Allocate(kPerSlotShaderVisibleDescriptors);
++        if (!srvResult)
+         {
+-            return std::unexpected(
+-                lgp::framework::MakeHResultError("ID3D12Device10::CreateCommittedResource3", createResult,
+-                                                 "Failed to create a Chapter 12 Starter depth resource."));
++            return std::unexpected(std::move(srvResult.error()));
+         }
++        frameSlots_[frameSlot].srvs = *srvResult;
++
++        for (UINT index = 0U; index < TextureIndex(AttachmentIndex::Count); ++index)
++        {
++            AttachmentIndex const attachment = static_cast<AttachmentIndex>(index);
++            DXGI_FORMAT const resourceFormat = AttachmentResourceFormat(attachment);
++            D3D12_RESOURCE_FLAGS flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
++            if (attachment == AttachmentIndex::DeviceDepth)
++            {
++                flags = D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL;
++            }
++            else if (attachment == AttachmentIndex::Identity)
++            {
++                flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET | D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
++            }
++            D3D12_RESOURCE_DESC1 const description = gpu::MakeTextureDescription(drawableSize, resourceFormat, flags);
++
++            HRESULT const createResult = deviceResources_->device()->CreateCommittedResource3(
++                &heap, D3D12_HEAP_FLAG_NONE, &description, D3D12_BARRIER_LAYOUT_COMMON, nullptr, nullptr, 0U, nullptr,
++                IID_PPV_ARGS(frameSlots_[frameSlot].textures[index].ReleaseAndGetAddressOf()));
++            if (FAILED(createResult))
++            {
++                return std::unexpected(
++                    lgp::framework::MakeHResultError("ID3D12Device10::CreateCommittedResource3", createResult,
++                                                     "Failed to create a Chapter 12 Solution per-frame attachment."));
++            }
++        }
++
++        D3D12_RENDER_TARGET_VIEW_DESC baseRtv{};
++        baseRtv.Format = gpu::kBaseColorMetalnessViewFormat;
++        baseRtv.ViewDimension = D3D12_RTV_DIMENSION_TEXTURE2D;
++        deviceResources_->device()->CreateRenderTargetView(
++            frameSlots_[frameSlot].textures[TextureIndex(AttachmentIndex::BaseColorMetalness)].Get(), &baseRtv,
++            frameSlots_[frameSlot].rtvs.CpuHandle(0U));
++
++        D3D12_RENDER_TARGET_VIEW_DESC normalRtv{};
++        normalRtv.Format = gpu::kOctahedralNormalFormat;
++        normalRtv.ViewDimension = D3D12_RTV_DIMENSION_TEXTURE2D;
++        deviceResources_->device()->CreateRenderTargetView(
++            frameSlots_[frameSlot].textures[TextureIndex(AttachmentIndex::OctahedralNormal)].Get(), &normalRtv,
++            frameSlots_[frameSlot].rtvs.CpuHandle(1U));
++
++        D3D12_RENDER_TARGET_VIEW_DESC roughnessRtv{};
++        roughnessRtv.Format = gpu::kRoughnessFormat;
++        roughnessRtv.ViewDimension = D3D12_RTV_DIMENSION_TEXTURE2D;
++        deviceResources_->device()->CreateRenderTargetView(
++            frameSlots_[frameSlot].textures[TextureIndex(AttachmentIndex::Roughness)].Get(), &roughnessRtv,
++            frameSlots_[frameSlot].rtvs.CpuHandle(2U));
++
++        D3D12_RENDER_TARGET_VIEW_DESC motionRtv{};
++        motionRtv.Format = gpu::kMotionFormat;
++        motionRtv.ViewDimension = D3D12_RTV_DIMENSION_TEXTURE2D;
++        deviceResources_->device()->CreateRenderTargetView(
++            frameSlots_[frameSlot].textures[TextureIndex(AttachmentIndex::Motion)].Get(), &motionRtv,
++            frameSlots_[frameSlot].rtvs.CpuHandle(3U));
++
++        D3D12_RENDER_TARGET_VIEW_DESC identityRtv{};
++        identityRtv.Format = gpu::kIdentityFormat;
++        identityRtv.ViewDimension = D3D12_RTV_DIMENSION_TEXTURE2D;
++        deviceResources_->device()->CreateRenderTargetView(
++            frameSlots_[frameSlot].textures[TextureIndex(AttachmentIndex::Identity)].Get(), &identityRtv,
++            frameSlots_[frameSlot].rtvs.CpuHandle(4U));
+ 
+         D3D12_DEPTH_STENCIL_VIEW_DESC dsv{};
+         dsv.Format = gpu::kDepthDsvFormat;
+         dsv.ViewDimension = D3D12_DSV_DIMENSION_TEXTURE2D;
+-        deviceResources_->device()->CreateDepthStencilView(frameSlots_[frameSlot].depth.Get(), &dsv,
+-                                                           frameSlots_[frameSlot].dsv.cpuHandle);
++        deviceResources_->device()->CreateDepthStencilView(
++            frameSlots_[frameSlot].textures[TextureIndex(AttachmentIndex::DeviceDepth)].Get(), &dsv,
++            frameSlots_[frameSlot].dsv.cpuHandle);
++
++        D3D12_SHADER_RESOURCE_VIEW_DESC baseSrv{};
++        baseSrv.Format = gpu::kBaseColorMetalnessViewFormat;
++        baseSrv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
++        baseSrv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
++        baseSrv.Texture2D.MipLevels = 1U;
++        deviceResources_->device()->CreateShaderResourceView(
++            frameSlots_[frameSlot].textures[TextureIndex(AttachmentIndex::BaseColorMetalness)].Get(), &baseSrv,
++            frameSlots_[frameSlot].srvs.CpuHandle(0U));
++
++        D3D12_SHADER_RESOURCE_VIEW_DESC normalSrv = baseSrv;
++        normalSrv.Format = gpu::kOctahedralNormalFormat;
++        deviceResources_->device()->CreateShaderResourceView(
++            frameSlots_[frameSlot].textures[TextureIndex(AttachmentIndex::OctahedralNormal)].Get(), &normalSrv,
++            frameSlots_[frameSlot].srvs.CpuHandle(1U));
++
++        D3D12_SHADER_RESOURCE_VIEW_DESC roughnessSrv = baseSrv;
++        roughnessSrv.Format = gpu::kRoughnessFormat;
++        deviceResources_->device()->CreateShaderResourceView(
++            frameSlots_[frameSlot].textures[TextureIndex(AttachmentIndex::Roughness)].Get(), &roughnessSrv,
++            frameSlots_[frameSlot].srvs.CpuHandle(2U));
++
++        D3D12_SHADER_RESOURCE_VIEW_DESC depthSrv = baseSrv;
++        depthSrv.Format = gpu::kDepthSrvFormat;
++        deviceResources_->device()->CreateShaderResourceView(
++            frameSlots_[frameSlot].textures[TextureIndex(AttachmentIndex::DeviceDepth)].Get(), &depthSrv,
++            frameSlots_[frameSlot].srvs.CpuHandle(3U));
++
++        D3D12_SHADER_RESOURCE_VIEW_DESC motionSrv = baseSrv;
++        motionSrv.Format = gpu::kMotionFormat;
++        deviceResources_->device()->CreateShaderResourceView(
++            frameSlots_[frameSlot].textures[TextureIndex(AttachmentIndex::Motion)].Get(), &motionSrv,
++            frameSlots_[frameSlot].srvs.CpuHandle(4U));
++
++        D3D12_SHADER_RESOURCE_VIEW_DESC identitySrv = baseSrv;
++        identitySrv.Format = gpu::kIdentityFormat;
++        deviceResources_->device()->CreateShaderResourceView(
++            frameSlots_[frameSlot].textures[TextureIndex(AttachmentIndex::Identity)].Get(), &identitySrv,
++            frameSlots_[frameSlot].srvs.CpuHandle(5U));
++
++        D3D12_UNORDERED_ACCESS_VIEW_DESC identityUav{};
++        identityUav.Format = gpu::kIdentityFormat;
++        identityUav.ViewDimension = D3D12_UAV_DIMENSION_TEXTURE2D;
++        deviceResources_->device()->CreateUnorderedAccessView(
++            frameSlots_[frameSlot].textures[TextureIndex(AttachmentIndex::Identity)].Get(), nullptr, &identityUav,
++            frameSlots_[frameSlot].srvs.CpuHandle(6U));
+     }
+-
+     return {};
+ }
+ 
+@@ -506,12 +752,12 @@ lgp::framework::Status Renderer::Impl::Initialize(lgp::framework::ApplicationIni
+     if (!sphereResult || !groundResult)
+     {
+         return std::unexpected(
+-            lgp::framework::MakeError("GenerateGeometry", "Failed to build the Chapter 12 Starter geometry."));
++            lgp::framework::MakeError("GenerateGeometry", "Failed to build the Chapter 12 Solution geometry."));
+     }
+ 
+     auto dsvHeapResult =
+         lgp::framework::CreateDescriptorHeap(*deviceResources_->device(), D3D12_DESCRIPTOR_HEAP_TYPE_DSV,
+-                                             deviceResources_->back_buffer_count(), false, L"Ch12 Starter DSV heap");
++                                             deviceResources_->back_buffer_count(), false, L"Ch12 Solution DSV heap");
+     if (!dsvHeapResult)
+     {
+         return std::unexpected(std::move(dsvHeapResult.error()));
+@@ -530,34 +776,25 @@ lgp::framework::Status Renderer::Impl::Initialize(lgp::framework::ApplicationIni
+     {
+         return status;
+     }
+-    if (auto status = CreateMeshBuffers(*sphereResult, L"Ch12 Starter Sphere", sphere_); !status)
++    if (auto status = CreateMeshBuffers(*sphereResult, L"Ch12 Solution Sphere", sphere_); !status)
+     {
+         return status;
+     }
+-    if (auto status = CreateMeshBuffers(*groundResult, L"Ch12 Starter Ground", ground_); !status)
++    if (auto status = CreateMeshBuffers(*groundResult, L"Ch12 Solution Ground", ground_); !status)
+     {
+         return status;
+     }
+-    if (auto status = CreateMeshBuffers(MakeFrontQuad(12.0F, 12.0F, 6.0F), L"Ch12 Starter Front Quad", quad_); !status)
++    if (auto status = CreateMeshBuffers(MakeFrontQuad(12.0F, 12.0F, 6.0F), L"Ch12 Solution Front Quad", quad_); !status)
+     {
+         return status;
+     }
+     return CreateSizeDependentResources(context.drawableSize);
+ }
+ 
+-lgp::framework::Status Renderer::Impl::Update(lgp::framework::UpdateContext const &context)
++lgp::framework::Status Renderer::Impl::Update(lgp::framework::UpdateContext const &)
+ {
+-    sceneState_ = MakeSceneState(headless_, headlessConfiguration_);
++    sceneState_ = MakeSceneState(headless_, headlessConfiguration_, DepthConvention::Forward, gpu::DebugView::BaseColor);
+     sceneState_.directionToLightWorld = Normalize(sceneState_.directionToLightWorld);
+-    if (!headless_ && !headlessConfiguration_.has_value())
+-    {
+-        sceneState_.depthConvention = DepthConvention::Forward;
+-        sceneState_.debugView = gpu::DebugView::Final;
+-    }
+-    if (context.drawableSize.empty())
+-    {
+-        return {};
+-    }
+     return {};
+ }
+ 
+@@ -590,7 +827,7 @@ lgp::framework::Status Renderer::Impl::Render(lgp::framework::FrameContext const
+     if (!coefficients)
+     {
+         return std::unexpected(lgp::framework::MakeError("MakeDeviceDepthCoefficients",
+-                                                         "Invalid Chapter 12 Starter projection constants."));
++                                                         "Invalid Chapter 12 Solution projection constants."));
+     }
+ 
+     DirectX::XMVECTOR const eye = DirectX::XMLoadFloat3(&sceneState_.eye);
+@@ -645,25 +882,64 @@ lgp::framework::Status Renderer::Impl::Render(lgp::framework::FrameContext const
+     }
+ 
+     FrameSlotResources &slot = frameSlots_[frameContext.frameSlot];
+-    std::vector<D3D12_TEXTURE_BARRIER> barriers{
+-        gpu::MakeTextureBarrier(*frameContext.renderTarget, gpu::FrameStartState(frameContext),
+-                                gpu::RenderTargetState()),
+-        gpu::MakeTextureBarrier(*slot.depth.Get(), gpu::CommonState(), gpu::DepthWriteState(),
+-                                D3D12_TEXTURE_BARRIER_FLAG_DISCARD),
+-    };
++    ID3D12DescriptorHeap *const heaps[]{frameContext.shaderVisibleCbvSrvUavHeap};
++    commandList.SetDescriptorHeaps(1U, heaps);
++
++    std::vector<D3D12_TEXTURE_BARRIER> barriers{};
++    barriers.push_back(gpu::MakeTextureBarrier(*frameContext.renderTarget, gpu::FrameStartState(frameContext),
++                                               gpu::RenderTargetState()));
++    barriers.push_back(gpu::MakeTextureBarrier(*slot.textures[TextureIndex(AttachmentIndex::BaseColorMetalness)].Get(),
++                                               gpu::CommonState(), gpu::RenderTargetState(),
++                                               D3D12_TEXTURE_BARRIER_FLAG_DISCARD));
++    barriers.push_back(gpu::MakeTextureBarrier(*slot.textures[TextureIndex(AttachmentIndex::OctahedralNormal)].Get(),
++                                               gpu::CommonState(), gpu::RenderTargetState(),
++                                               D3D12_TEXTURE_BARRIER_FLAG_DISCARD));
++    barriers.push_back(gpu::MakeTextureBarrier(*slot.textures[TextureIndex(AttachmentIndex::Roughness)].Get(),
++                                               gpu::CommonState(), gpu::RenderTargetState(),
++                                               D3D12_TEXTURE_BARRIER_FLAG_DISCARD));
++    barriers.push_back(gpu::MakeTextureBarrier(*slot.textures[TextureIndex(AttachmentIndex::Motion)].Get(),
++                                               gpu::CommonState(), gpu::RenderTargetState(),
++                                               D3D12_TEXTURE_BARRIER_FLAG_DISCARD));
++    barriers.push_back(gpu::MakeTextureBarrier(*slot.textures[TextureIndex(AttachmentIndex::Identity)].Get(),
++                                               gpu::CommonState(), gpu::UnorderedAccessState(),
++                                               D3D12_TEXTURE_BARRIER_FLAG_DISCARD));
++    barriers.push_back(gpu::MakeTextureBarrier(*slot.textures[TextureIndex(AttachmentIndex::DeviceDepth)].Get(),
++                                               gpu::CommonState(), gpu::DepthWriteState(),
++                                               D3D12_TEXTURE_BARRIER_FLAG_DISCARD));
+     gpu::SubmitTextureBarriers(commandList, barriers);
+ 
+-    float const clearColor[]{0.0F, 0.0F, 0.0F, 1.0F};
+-    commandList.OMSetRenderTargets(1U, &frameContext.renderTargetView, FALSE, &slot.dsv.cpuHandle);
+-    commandList.ClearRenderTargetView(frameContext.renderTargetView, clearColor, 0U, nullptr);
++    float const displayClear[]{0.0F, 0.0F, 0.0F, 1.0F};
++    float const baseClear[]{0.0F, 0.0F, 0.0F, 0.0F};
++    float const normalClear[]{0.5F, 0.5F, 0.0F, 0.0F};
++    float const roughnessClear[]{1.0F, 0.0F, 0.0F, 0.0F};
++    float const motionClear[]{0.0F, 0.0F, 0.0F, 0.0F};
++    commandList.ClearRenderTargetView(frameContext.renderTargetView, displayClear, 0U, nullptr);
++    commandList.ClearRenderTargetView(slot.rtvs.CpuHandle(0U), baseClear, 0U, nullptr);
++    commandList.ClearRenderTargetView(slot.rtvs.CpuHandle(1U), normalClear, 0U, nullptr);
++    commandList.ClearRenderTargetView(slot.rtvs.CpuHandle(2U), roughnessClear, 0U, nullptr);
++    commandList.ClearRenderTargetView(slot.rtvs.CpuHandle(3U), motionClear, 0U, nullptr);
++    UINT const identityClear[]{0U, 0U, 0U, 0U};
++    commandList.ClearUnorderedAccessViewUint(slot.srvs.GpuHandle(6U), slot.srvs.CpuHandle(6U),
++                                             slot.textures[TextureIndex(AttachmentIndex::Identity)].Get(),
++                                             identityClear, 0U, nullptr);
+     commandList.ClearDepthStencilView(slot.dsv.cpuHandle, D3D12_CLEAR_FLAG_DEPTH,
+                                       DepthClearValue(sceneState_.depthConvention), 0U, 0U, nullptr);
+ 
+-    commandList.SetPipelineState(sceneState_.depthConvention == DepthConvention::Forward ? forwardPipeline_.Get()
+-                                                                                         : reversedPipeline_.Get());
+     commandList.SetGraphicsRoot32BitConstants(FrameRootConstants, sizeof(FrameConstants) / sizeof(std::uint32_t),
+                                               &frameConstants, 0U);
++    barriers.clear();
++    barriers.push_back(gpu::MakeTextureBarrier(*slot.textures[TextureIndex(AttachmentIndex::Identity)].Get(),
++                                               gpu::UnorderedAccessState(), gpu::RenderTargetState()));
++    gpu::SubmitTextureBarriers(commandList, barriers);
+ 
++    D3D12_CPU_DESCRIPTOR_HANDLE rtvs[5U]{
++        slot.rtvs.CpuHandle(0U), slot.rtvs.CpuHandle(1U), slot.rtvs.CpuHandle(2U),
++        slot.rtvs.CpuHandle(3U), slot.rtvs.CpuHandle(4U),
++    };
++    commandList.OMSetRenderTargets(ColorAttachmentCount(), rtvs, FALSE, &slot.dsv.cpuHandle);
++    commandList.SetPipelineState(sceneState_.depthConvention == DepthConvention::Forward
++                                     ? geometryForwardPipeline_.Get()
++                                     : geometryReversedPipeline_.Get());
+     for (SceneObject const &object : objects)
+     {
+         commandList.SetGraphicsRoot32BitConstants(ObjectRootConstants, sizeof(ObjectConstants) / sizeof(std::uint32_t),
+@@ -673,11 +949,43 @@ lgp::framework::Status Renderer::Impl::Render(lgp::framework::FrameContext const
+         commandList.DrawIndexedInstanced(object.mesh->indexCount, 1U, 0U, 0, 0U);
+     }
+ 
+-    barriers = {
+-        gpu::MakeTextureBarrier(*slot.depth.Get(), gpu::DepthWriteState(), gpu::CommonState()),
+-        gpu::MakeTextureBarrier(*frameContext.renderTarget, gpu::RenderTargetState(), gpu::FrameEndState(frameContext)),
+-    };
++    barriers.clear();
++    barriers.push_back(gpu::MakeTextureBarrier(*slot.textures[TextureIndex(AttachmentIndex::BaseColorMetalness)].Get(),
++                                               gpu::RenderTargetState(), gpu::DirectQueueShaderResourceState()));
++    barriers.push_back(gpu::MakeTextureBarrier(*slot.textures[TextureIndex(AttachmentIndex::OctahedralNormal)].Get(),
++                                               gpu::RenderTargetState(), gpu::DirectQueueShaderResourceState()));
++    barriers.push_back(gpu::MakeTextureBarrier(*slot.textures[TextureIndex(AttachmentIndex::Roughness)].Get(),
++                                               gpu::RenderTargetState(), gpu::DirectQueueShaderResourceState()));
++    barriers.push_back(gpu::MakeTextureBarrier(*slot.textures[TextureIndex(AttachmentIndex::Motion)].Get(),
++                                               gpu::RenderTargetState(), gpu::DirectQueueShaderResourceState()));
++    barriers.push_back(gpu::MakeTextureBarrier(*slot.textures[TextureIndex(AttachmentIndex::Identity)].Get(),
++                                               gpu::RenderTargetState(), gpu::DirectQueueShaderResourceState()));
++    barriers.push_back(gpu::MakeTextureBarrier(*slot.textures[TextureIndex(AttachmentIndex::DeviceDepth)].Get(),
++                                               gpu::DepthWriteState(), gpu::DirectQueueShaderResourceState()));
++    gpu::SubmitTextureBarriers(commandList, barriers);
++
++    commandList.OMSetRenderTargets(1U, &frameContext.renderTargetView, FALSE, nullptr);
++    commandList.SetPipelineState(deferredPipeline_.Get());
++    commandList.SetGraphicsRootDescriptorTable(GBufferSrvTable, slot.srvs.gpuHandle);
++    commandList.DrawInstanced(3U, 1U, 0U, 0U);
++
++    barriers.clear();
++    barriers.push_back(gpu::MakeTextureBarrier(*slot.textures[TextureIndex(AttachmentIndex::BaseColorMetalness)].Get(),
++                                               gpu::DirectQueueShaderResourceState(), gpu::CommonState()));
++    barriers.push_back(gpu::MakeTextureBarrier(*slot.textures[TextureIndex(AttachmentIndex::OctahedralNormal)].Get(),
++                                               gpu::DirectQueueShaderResourceState(), gpu::CommonState()));
++    barriers.push_back(gpu::MakeTextureBarrier(*slot.textures[TextureIndex(AttachmentIndex::Roughness)].Get(),
++                                               gpu::DirectQueueShaderResourceState(), gpu::CommonState()));
++    barriers.push_back(gpu::MakeTextureBarrier(*slot.textures[TextureIndex(AttachmentIndex::Motion)].Get(),
++                                               gpu::DirectQueueShaderResourceState(), gpu::CommonState()));
++    barriers.push_back(gpu::MakeTextureBarrier(*slot.textures[TextureIndex(AttachmentIndex::Identity)].Get(),
++                                               gpu::DirectQueueShaderResourceState(), gpu::CommonState()));
++    barriers.push_back(gpu::MakeTextureBarrier(*slot.textures[TextureIndex(AttachmentIndex::DeviceDepth)].Get(),
++                                               gpu::DirectQueueShaderResourceState(), gpu::CommonState()));
++    barriers.push_back(gpu::MakeTextureBarrier(*frameContext.renderTarget, gpu::RenderTargetState(),
++                                               gpu::FrameEndState(frameContext)));
+     gpu::SubmitTextureBarriers(commandList, barriers);
++    lastRenderedFrameSlot_ = frameContext.frameSlot;
+     return {};
+ }
+ 
+@@ -688,8 +996,9 @@ void Renderer::Impl::Shutdown() noexcept
+     quad_ = {};
+     ground_ = {};
+     sphere_ = {};
+-    reversedPipeline_.Reset();
+-    forwardPipeline_.Reset();
++    deferredPipeline_.Reset();
++    geometryReversedPipeline_.Reset();
++    geometryForwardPipeline_.Reset();
+     rootSignature_.Reset();
+     deviceResources_ = nullptr;
+ }
+@@ -730,4 +1039,4 @@ void Renderer::ConfigureHeadlessTest(HeadlessTestConfiguration const &configurat
+     impl_->headlessConfiguration_ = configuration;
+ }
+ 
+-} // namespace ch12::gbuffer::starter
++} // namespace ch12::gbuffer::solution
+diff --git a/chapters/gbuffer-and-deferred-shading/Starter/Renderer.hpp b/chapters/gbuffer-and-deferred-shading/Starter/Renderer.hpp
+index cca6b7b..0918b76 100644
+--- a/chapters/gbuffer-and-deferred-shading/Starter/Renderer.hpp
++++ b/chapters/gbuffer-and-deferred-shading/Starter/Renderer.hpp
+@@ -7,7 +7,7 @@
+ 
+ #include <memory>
+ 
+-namespace ch12::gbuffer::starter
++namespace ch12::gbuffer::solution
+ {
+ 
+ struct HeadlessTestConfiguration final
+@@ -42,4 +42,4 @@ class Renderer final : public lgp::framework::IChapterRenderer
+     std::unique_ptr<Impl> impl_;
+ };
+ 
+-} // namespace ch12::gbuffer::starter
++} // namespace ch12::gbuffer::solution
+-- 
+2.55.0.windows.3
+

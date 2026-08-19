@@ -1,0 +1,103 @@
+diff --git a/chapters/gpu-work-distribution-and-indirect-execution/Starter/Main.cpp b/chapters/gpu-work-distribution-and-indirect-execution/Starter/Main.cpp
+index 31a3ee5..bb5ac82 100644
+--- a/chapters/gpu-work-distribution-and-indirect-execution/Starter/Main.cpp
++++ b/chapters/gpu-work-distribution-and-indirect-execution/Starter/Main.cpp
+@@ -4,10 +4,10 @@
+ 
+ int wmain(int argc, wchar_t **argv)
+ {
+-    ch13::work_distribution::starter::Renderer renderer{};
++    ch13::work_distribution::solution::Renderer renderer{};
+ 
+     lgp::framework::ApplicationConfiguration configuration{};
+-    configuration.title = L"Ch13 GPU Work Distribution Starter";
++    configuration.title = L"Ch13 GPU Work Distribution Solution";
+     configuration.width = 1600U;
+     configuration.height = 900U;
+     configuration.enableDebugLayer = false;
+diff --git a/chapters/gpu-work-distribution-and-indirect-execution/Starter/Renderer.cpp b/chapters/gpu-work-distribution-and-indirect-execution/Starter/Renderer.cpp
+index 8570c64..6d702b6 100644
+--- a/chapters/gpu-work-distribution-and-indirect-execution/Starter/Renderer.cpp
++++ b/chapters/gpu-work-distribution-and-indirect-execution/Starter/Renderer.cpp
+@@ -16,7 +16,7 @@
+ #include <filesystem>
+ #include <string>
+ 
+-namespace ch13::work_distribution::starter
++namespace ch13::work_distribution::solution
+ {
+ namespace
+ {
+@@ -780,4 +780,4 @@ std::expected<Renderer::ReadbackOutputs, lgp::framework::Error> Renderer::ReadBa
+     return outputs;
+ }
+ 
+-} // namespace ch13::work_distribution::starter
++} // namespace ch13::work_distribution::solution
+diff --git a/chapters/gpu-work-distribution-and-indirect-execution/Starter/Renderer.hpp b/chapters/gpu-work-distribution-and-indirect-execution/Starter/Renderer.hpp
+index 2940183..8af5129 100644
+--- a/chapters/gpu-work-distribution-and-indirect-execution/Starter/Renderer.hpp
++++ b/chapters/gpu-work-distribution-and-indirect-execution/Starter/Renderer.hpp
+@@ -12,7 +12,7 @@
+ #include <optional>
+ #include <vector>
+ 
+-namespace ch13::work_distribution::starter
++namespace ch13::work_distribution::solution
+ {
+ 
+ struct HeadlessTestConfiguration final
+@@ -101,4 +101,4 @@ class Renderer final : public lgp::framework::IChapterRenderer
+     bool headless_{false};
+ };
+ 
+-} // namespace ch13::work_distribution::starter
++} // namespace ch13::work_distribution::solution
+diff --git a/chapters/gpu-work-distribution-and-indirect-execution/Starter/WorkDistributionLab.hlsl b/chapters/gpu-work-distribution-and-indirect-execution/Starter/WorkDistributionLab.hlsl
+index ed5239c..1742451 100644
+--- a/chapters/gpu-work-distribution-and-indirect-execution/Starter/WorkDistributionLab.hlsl
++++ b/chapters/gpu-work-distribution-and-indirect-execution/Starter/WorkDistributionLab.hlsl
+@@ -161,32 +161,20 @@ void StableCompactCS(uint3 dispatchThreadId : SV_DispatchThreadID, uint groupInd
+ void AtomicAppendCS(uint3 dispatchThreadId : SV_DispatchThreadID)
+ {
+     uint reverseIndex = (gCandidateCount - 1u) - dispatchThreadId.x;
+-    if (reverseIndex >= gCandidateCount || gFlags[reverseIndex] == 0u)
++    if (reverseIndex < gCandidateCount && gFlags[reverseIndex] != 0u)
+     {
+-        GroupMemoryBarrierWithGroupSync();
+-        if (dispatchThreadId.x == 0u)
++        uint appendIndex;
++        InterlockedAdd(gCount[0], 1u, appendIndex);
++        if (appendIndex < gCapacity)
+         {
+-            uint visibleCount = gCount[0];
+-            uint emittedCount = min(visibleCount, gCapacity);
+-            gStats[0] = gCandidateCount;
+-            gStats[1] = visibleCount;
+-            gStats[2] = emittedCount;
+-            gStats[3] = visibleCount - emittedCount;
++            gIndices[appendIndex] = reverseIndex;
++            uint commandOffset = appendIndex * 20u;
++            gCommands.Store(commandOffset + 0u, reverseIndex);
++            gCommands.Store(commandOffset + 4u, gVertexCountPerQuad);
++            gCommands.Store(commandOffset + 8u, 1u);
++            gCommands.Store(commandOffset + 12u, 0u);
++            gCommands.Store(commandOffset + 16u, 0u);
+         }
+-        return;
+-    }
+-
+-    uint appendIndex;
+-    InterlockedAdd(gCount[0], 1u, appendIndex);
+-    if (appendIndex < gCapacity)
+-    {
+-        gIndices[appendIndex] = reverseIndex;
+-        uint commandOffset = appendIndex * 20u;
+-        gCommands.Store(commandOffset + 0u, reverseIndex);
+-        gCommands.Store(commandOffset + 4u, gVertexCountPerQuad);
+-        gCommands.Store(commandOffset + 8u, 1u);
+-        gCommands.Store(commandOffset + 12u, 0u);
+-        gCommands.Store(commandOffset + 16u, 0u);
+     }
+ 
+     GroupMemoryBarrierWithGroupSync();

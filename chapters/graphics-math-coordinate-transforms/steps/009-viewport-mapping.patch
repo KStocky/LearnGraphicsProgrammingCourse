@@ -1,0 +1,40 @@
+diff --git a/chapters/graphics-math-coordinate-transforms/Starter/Scene.cpp b/chapters/graphics-math-coordinate-transforms/Starter/Scene.cpp
+--- a/chapters/graphics-math-coordinate-transforms/Starter/Scene.cpp
++++ b/chapters/graphics-math-coordinate-transforms/Starter/Scene.cpp
+@@ -98,10 +98,10 @@ lgp::framework::Result<ChapterDerivedScene> BuildScene(ChapterControls const &co
+
+     ChapterDerivedScene scene{};
+     scene.capabilities = {
+-        true, true, true, true, false, false, false, false, false, true,
++        true, true, true, true, true, false, false, false, false, true,
+     };
+     scene.implementationNote =
+-        "Step 8: clip-space positions are carried through the homogeneous divide before later viewport mapping.";
++        "Step 9: normalized-device coordinates now map into viewport pixels for the screen-space preview.";
+     scene.model = StoreMatrix(modelMatrix);
+     scene.comparisonModel = StoreMatrix(comparisonModelMatrix);
+     scene.wrongOrderModel = StoreMatrix(wrongOrderModelMatrix);
+@@ -132,7 +132,7 @@ lgp::framework::Result<ChapterDerivedScene> BuildScene(ChapterControls const &co
+                            viewMatrix);
+         scene.clipVertices[vertexIndex] = TransformPoint(objectVertex, modelViewProjectionMatrix);
+         scene.ndcVertices[vertexIndex] = HomogeneousDivide(scene.clipVertices[vertexIndex]);
+-        scene.screenVertices[vertexIndex] = {scene.ndcVertices[vertexIndex].x, scene.ndcVertices[vertexIndex].y};
++        scene.screenVertices[vertexIndex] = ViewportMap(scene.ndcVertices[vertexIndex], viewport);
+     }
+
+     int const selectedVertex = sanitizedControls.selectedVertex;
+@@ -144,7 +144,13 @@ lgp::framework::Result<ChapterDerivedScene> BuildScene(ChapterControls const &co
+     scene.inspection.clip = scene.clipVertices[static_cast<std::size_t>(selectedVertex)];
+     scene.inspection.ndc = scene.ndcVertices[static_cast<std::size_t>(selectedVertex)];
+     scene.inspection.screen = scene.screenVertices[static_cast<std::size_t>(selectedVertex)];
+-    scene.inspection.screenWithoutDivide = {scene.inspection.clip.x, scene.inspection.clip.y};
++    scene.inspection.screenWithoutDivide = ViewportMap(
++        {
++            scene.inspection.clip.x,
++            scene.inspection.clip.y,
++            scene.inspection.clip.z,
++        },
++        viewport);
+
+     scene.normalOriginWorld = {
+         scene.inspection.world.x,

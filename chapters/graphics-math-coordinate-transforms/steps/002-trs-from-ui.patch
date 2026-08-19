@@ -1,0 +1,29 @@
+diff --git a/chapters/graphics-math-coordinate-transforms/Starter/Scene.cpp b/chapters/graphics-math-coordinate-transforms/Starter/Scene.cpp
+--- a/chapters/graphics-math-coordinate-transforms/Starter/Scene.cpp
++++ b/chapters/graphics-math-coordinate-transforms/Starter/Scene.cpp
+@@ -88,9 +88,9 @@ lgp::framework::Result<ChapterDerivedScene> BuildScene(ChapterControls const &co
+         BuildPerspectiveProjection(sanitizedControls.verticalFieldOfViewDegrees, aspectRatio,
+                                    sanitizedControls.nearPlane, sanitizedControls.farPlane);
+
+-    DirectX::XMMATRIX const activeRotationMatrix = XMMatrixIdentity();
++    DirectX::XMMATRIX const activeRotationMatrix = BuildEulerRotationMatrixFromDegrees(sanitizedControls.eulerDegrees);
+     DirectX::XMMATRIX const modelMatrix =
+-        ComposeModelMatrix({0.0F, 0.0F, 0.0F}, {1.0F, 1.0F, 1.0F}, activeRotationMatrix);
++        ComposeModelMatrix(sanitizedControls.translation, sanitizedControls.scale, activeRotationMatrix);
+     DirectX::XMMATRIX const comparisonModelMatrix = modelMatrix;
+     DirectX::XMMATRIX const wrongOrderModelMatrix = modelMatrix;
+     DirectX::XMMATRIX const viewProjectionMatrix = viewMatrix * projectionMatrix;
+@@ -99,10 +99,10 @@ lgp::framework::Result<ChapterDerivedScene> BuildScene(ChapterControls const &co
+
+     ChapterDerivedScene scene{};
+     scene.capabilities = {
+-        false, false, false, false, false, false, false, false, false, false,
++        true, false, false, false, false, false, false, false, false, false,
+     };
+-    scene.implementationNote = "Step 1: shared conventions are live, and the model matrix starts at identity while "
+-                               "later controls stay disabled.";
++    scene.implementationNote =
++        "Step 2: translation, Euler rotation, and scale now compose the model transform from the UI state.";
+     scene.model = StoreMatrix(modelMatrix);
+     scene.comparisonModel = StoreMatrix(comparisonModelMatrix);
+     scene.wrongOrderModel = StoreMatrix(wrongOrderModelMatrix);

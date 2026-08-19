@@ -1,0 +1,28 @@
+diff --git a/chapters/graphics-math-coordinate-transforms/Starter/Scene.cpp b/chapters/graphics-math-coordinate-transforms/Starter/Scene.cpp
+--- a/chapters/graphics-math-coordinate-transforms/Starter/Scene.cpp
++++ b/chapters/graphics-math-coordinate-transforms/Starter/Scene.cpp
+@@ -84,9 +84,7 @@ lgp::framework::Result<ChapterDerivedScene> BuildScene(ChapterControls const &co
+     float const aspectRatio = (viewport.width != 0U && viewport.height != 0U)
+                                   ? (static_cast<float>(viewport.width) / static_cast<float>(viewport.height))
+                                   : 1.0F;
+-    DirectX::XMMATRIX const projectionMatrix =
+-        BuildPerspectiveProjection(sanitizedControls.verticalFieldOfViewDegrees, aspectRatio,
+-                                   sanitizedControls.nearPlane, sanitizedControls.farPlane);
++    DirectX::XMMATRIX const projectionMatrix = ChooseProjection(sanitizedControls, aspectRatio);
+
+     DirectX::XMMATRIX const activeRotationMatrix = BuildEulerRotationMatrixFromDegrees(sanitizedControls.eulerDegrees);
+     DirectX::XMMATRIX const modelMatrix =
+@@ -100,10 +98,10 @@ lgp::framework::Result<ChapterDerivedScene> BuildScene(ChapterControls const &co
+
+     ChapterDerivedScene scene{};
+     scene.capabilities = {
+-        true, false, true, false, false, false, false, false, false, true,
++        true, true, true, false, false, false, false, false, false, true,
+     };
+-    scene.implementationNote =
+-        "Step 5: the camera basis and hand-built view matrix now drive the world-to-view transform.";
++    scene.implementationNote = "Step 6: orthographic projection joins the explorer so preserved parallel lines can be "
++                               "compared against perspective.";
+     scene.model = StoreMatrix(modelMatrix);
+     scene.comparisonModel = StoreMatrix(comparisonModelMatrix);
+     scene.wrongOrderModel = StoreMatrix(wrongOrderModelMatrix);

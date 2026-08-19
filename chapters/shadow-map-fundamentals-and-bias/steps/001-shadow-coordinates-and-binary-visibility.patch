@@ -1,0 +1,44 @@
+diff --git a/chapters/shadow-map-fundamentals-and-bias/Starter/DirectionalBaseline.hlsl b/chapters/shadow-map-fundamentals-and-bias/Starter/DirectionalBaseline.hlsl
+index 8b1bdf0..1659be0 100644
+--- a/chapters/shadow-map-fundamentals-and-bias/Starter/DirectionalBaseline.hlsl
++++ b/chapters/shadow-map-fundamentals-and-bias/Starter/DirectionalBaseline.hlsl
+@@ -46,6 +46,29 @@ struct FullscreenVertex
+ static const float Pi = 3.14159265358979323846;
+ static const float MinimumRoughness = 0.045;
+ 
++struct ShadowCoordinate
++{
++    float4 clip;
++    float3 ndc;
++    float2 uv;
++    float depth;
++};
++
++ShadowCoordinate BuildShadowCoordinate(float3 worldPosition, row_major float4x4 worldToShadow)
++{
++    ShadowCoordinate result;
++    result.clip = mul(float4(worldPosition, 1.0), worldToShadow);
++    result.ndc = result.clip.xyz / result.clip.w;
++    result.uv = float2((result.ndc.x * 0.5) + 0.5, 0.5 - (result.ndc.y * 0.5));
++    result.depth = result.ndc.z;
++    return result;
++}
++
++float BinaryVisibility(bool occluded)
++{
++    return occluded ? 0.0 : 1.0;
++}
++
+ LitVertex LightingVS(MeshVertex input)
+ {
+     LitVertex output;
+@@ -109,7 +132,8 @@ float4 LightingPS(LitVertex input) : SV_Target
+         (1.0 - SchlickFresnel(f0, nDotV)) * (1.0 - SchlickFresnel(f0, nDotL)) * (1.0 - objectData.metalness);
+     float3 diffuseBrdf = diffuseWeight * objectData.baseColor / Pi;
+     float3 irradiance = lighting.intensity * nDotL;
+-    return float4(irradiance * (diffuseBrdf + specularBrdf), 1.0);
++    float visibility = BinaryVisibility(false);
++    return float4(visibility * irradiance * (diffuseBrdf + specularBrdf), 1.0);
+ }
+ 
+ FullscreenVertex FullscreenVS(uint vertexId : SV_VertexID)

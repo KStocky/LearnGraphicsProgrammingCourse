@@ -1,0 +1,192 @@
+diff --git a/chapters/transient-resource-allocation-and-aliasing/CMakeLists.txt b/chapters/transient-resource-allocation-and-aliasing/CMakeLists.txt
+index c4430c2..7018cd7 100644
+--- a/chapters/transient-resource-allocation-and-aliasing/CMakeLists.txt
++++ b/chapters/transient-resource-allocation-and-aliasing/CMakeLists.txt
+@@ -77,6 +77,7 @@ target_link_libraries(
+     ch09_transient_aliasing_starter_logic
+     PUBLIC
+         ch09_transient_aliasing_gpu_common
++        LGP::Ch08FrameGraphContracts
+         LGP::Framework)
+ target_include_directories(ch09_transient_aliasing_starter_logic PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}")
+ set_target_properties(
+diff --git a/chapters/transient-resource-allocation-and-aliasing/Starter/Renderer.cpp b/chapters/transient-resource-allocation-and-aliasing/Starter/Renderer.cpp
+index e0f4828..5606f2a 100644
+--- a/chapters/transient-resource-allocation-and-aliasing/Starter/Renderer.cpp
++++ b/chapters/transient-resource-allocation-and-aliasing/Starter/Renderer.cpp
+@@ -14,7 +14,9 @@
+ 
+ #include <array>
+ #include <filesystem>
++#include <string>
+ #include <utility>
++#include <vector>
+ 
+ namespace ch09::transient_aliasing::starter
+ {
+@@ -26,6 +28,21 @@ using gpu::RenderTargetState;
+ using gpu::ShaderResourceState;
+ using gpu::UndefinedState;
+ 
++[[nodiscard]] std::string DescribeGraphDiagnostics(
++    std::vector<ch08::frame_graph::PassGraphDiagnostic> const &diagnostics)
++{
++    std::string message{};
++    for (ch08::frame_graph::PassGraphDiagnostic const &diagnostic : diagnostics)
++    {
++        if (!message.empty())
++        {
++            message += '\n';
++        }
++        message += diagnostic.message;
++    }
++    return message;
++}
++
+ [[nodiscard]] std::filesystem::path ShaderPath()
+ {
+     return std::filesystem::path{__FILE__}.parent_path() / "TransientAliasingLab.hlsl";
+@@ -61,6 +78,43 @@ lgp::framework::Status Renderer::CreatePipelineStates()
+                                         copyPipeline_, accentPipeline_, compositePipeline_);
+ }
+ 
++std::expected<Renderer::GraphExecutionPlan, lgp::framework::Error> Renderer::CompileGraph() const
++{
++    using namespace ch08::frame_graph;
++
++    PassGraph graph{};
++    TextureResourceId const textureA = graph.AddTransientTexture("A");
++    TextureResourceId const textureB = graph.AddTransientTexture("B");
++    TextureResourceId const textureC = graph.AddTransientTexture("C");
++    TextureResourceId const frameTarget = graph.AddImportedTexture("frameTarget", gpu::FrameStartState(headless_));
++
++    PassId const analyticPass = graph.AddPass("analytic-hdr");
++    PassId const copyPass = graph.AddPass("copy-hdr");
++    PassId const accentPass = graph.AddPass("accent-mask");
++    PassId const compositePass = graph.AddPass("composite");
++    PassId const boundaryPass = graph.AddPass("frame-boundary");
++
++    graph.DeclareTextureWrite(analyticPass, textureA, RenderTargetState());
++    graph.DeclareTextureRead(copyPass, textureA, ShaderResourceState());
++    graph.DeclareTextureWrite(copyPass, textureB, RenderTargetState());
++    graph.DeclareTextureWrite(accentPass, textureC, RenderTargetState());
++    graph.DeclareTextureRead(compositePass, textureB, ShaderResourceState());
++    graph.DeclareTextureRead(compositePass, textureC, ShaderResourceState());
++    graph.DeclareTextureWrite(compositePass, frameTarget, RenderTargetState());
++    graph.DeclareTextureRead(boundaryPass, textureB, UndefinedState());
++    graph.DeclareTextureRead(boundaryPass, textureC, UndefinedState());
++    graph.DeclareTextureRead(boundaryPass, frameTarget, gpu::FrameEndState(headless_));
++
++    PassGraphCompileResult result = graph.Compile();
++    if (!result)
++    {
++        return std::unexpected(
++            lgp::framework::MakeError("PassGraph::Compile", DescribeGraphDiagnostics(result.error())));
++    }
++    return GraphExecutionPlan{std::move(*result), textureA, textureB,   textureC,      frameTarget,
++                              analyticPass,       copyPass, accentPass, compositePass, boundaryPass};
++}
++
+ lgp::framework::Status Renderer::CreateTransientTextures(lgp::framework::Extent2D size)
+ {
+     for (auto &texture : transientTextures_)
+@@ -69,9 +123,17 @@ lgp::framework::Status Renderer::CreateTransientTextures(lgp::framework::Extent2
+     }
+     if (size.empty())
+     {
++        graphPlan_.reset();
+         return {};
+     }
+ 
++    auto graphResult = CompileGraph();
++    if (!graphResult)
++    {
++        return std::unexpected(std::move(graphResult.error()));
++    }
++    graphPlan_ = std::move(*graphResult);
++
+     if (!transientRtvs_)
+     {
+         auto result = deviceResources_->rtv_heap().Allocate(3U);
+@@ -138,6 +200,7 @@ void Renderer::DrawTo(ID3D12GraphicsCommandList7 &commandList, ID3D12PipelineSta
+ lgp::framework::Status Renderer::Initialize(lgp::framework::ApplicationInitContext const &context)
+ {
+     deviceResources_ = &context.deviceResources;
++    headless_ = context.commandLine.headless;
+     if (auto status = CreateShaders(); !status)
+     {
+         return status;
+@@ -227,8 +290,14 @@ lgp::framework::Status Renderer::Render(lgp::framework::FrameContext const &fram
+     return {};
+ }
+ 
++ch08::frame_graph::CompiledPassGraph const *Renderer::CompiledGraph() const noexcept
++{
++    return graphPlan_ ? &graphPlan_->graph : nullptr;
++}
++
+ void Renderer::Shutdown(lgp::framework::DeviceResources &) noexcept
+ {
++    graphPlan_.reset();
+     for (auto &texture : transientTextures_)
+     {
+         texture.Reset();
+diff --git a/chapters/transient-resource-allocation-and-aliasing/Starter/Renderer.hpp b/chapters/transient-resource-allocation-and-aliasing/Starter/Renderer.hpp
+index 6445bcc..9bb9358 100644
+--- a/chapters/transient-resource-allocation-and-aliasing/Starter/Renderer.hpp
++++ b/chapters/transient-resource-allocation-and-aliasing/Starter/Renderer.hpp
+@@ -1,5 +1,7 @@
+ #pragma once
+ 
++#include "PassGraph.hpp"
++
+ #include <lgp/framework/application.hpp>
+ #include <lgp/framework/descriptors.hpp>
+ #include <lgp/framework/shader_compiler.hpp>
+@@ -7,6 +9,8 @@
+ #include <wrl/client.h>
+ 
+ #include <array>
++#include <expected>
++#include <optional>
+ 
+ namespace ch09::transient_aliasing::starter
+ {
+@@ -21,11 +25,28 @@ class Renderer final : public lgp::framework::IChapterRenderer
+     [[nodiscard]] lgp::framework::Status Render(lgp::framework::FrameContext const &frameContext) override;
+     void Shutdown(lgp::framework::DeviceResources &deviceResources) noexcept override;
+ 
++    [[nodiscard]] ch08::frame_graph::CompiledPassGraph const *CompiledGraph() const noexcept;
++
+   private:
++    struct GraphExecutionPlan final
++    {
++        ch08::frame_graph::CompiledPassGraph graph{};
++        ch08::frame_graph::TextureResourceId textureA{};
++        ch08::frame_graph::TextureResourceId textureB{};
++        ch08::frame_graph::TextureResourceId textureC{};
++        ch08::frame_graph::TextureResourceId frameTarget{};
++        ch08::frame_graph::PassId analyticPass{};
++        ch08::frame_graph::PassId copyPass{};
++        ch08::frame_graph::PassId accentPass{};
++        ch08::frame_graph::PassId compositePass{};
++        ch08::frame_graph::PassId boundaryPass{};
++    };
++
+     [[nodiscard]] lgp::framework::Status CreateShaders();
+     [[nodiscard]] lgp::framework::Status CreateRootSignature();
+     [[nodiscard]] lgp::framework::Status CreatePipelineStates();
+     [[nodiscard]] lgp::framework::Status CreateTransientTextures(lgp::framework::Extent2D size);
++    [[nodiscard]] std::expected<GraphExecutionPlan, lgp::framework::Error> CompileGraph() const;
+     void DrawTo(ID3D12GraphicsCommandList7 &commandList, ID3D12PipelineState &pipeline,
+                 D3D12_CPU_DESCRIPTOR_HANDLE renderTarget) const;
+ 
+@@ -43,6 +64,8 @@ class Renderer final : public lgp::framework::IChapterRenderer
+     lgp::framework::DescriptorAllocation transientRtvs_{};
+     lgp::framework::DescriptorAllocation transientSrvs_{};
+     std::array<Microsoft::WRL::ComPtr<ID3D12Resource>, 3U> transientTextures_{};
++    std::optional<GraphExecutionPlan> graphPlan_{};
++    bool headless_{};
+ };
+ 
+ } // namespace ch09::transient_aliasing::starter
