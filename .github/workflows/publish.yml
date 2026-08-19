@@ -154,7 +154,8 @@ jobs:
       - name: Build tagged release site
         shell: bash
         env:
-          SOURCE_TAG: ${{ inputs.source_tag }}
+          HUGO_PARAMS_SITEVERSION: ${{ inputs.source_tag }}
+          HUGO_PARAMS_PUBLICSOURCEARCHIVEURL: https://github.com/KStocky/LearnGraphicsProgrammingCourse/archive/refs/tags/${{ inputs.source_tag }}.zip
         run: |
           set -euo pipefail
           npm --prefix source/site ci
@@ -164,9 +165,7 @@ jobs:
             --environment production \
             --gc --minify --cleanDestinationDir \
             --baseURL "https://kstocky.github.io/LearnGraphicsProgrammingCourse/" \
-            --destination "$GITHUB_WORKSPACE/public-site" \
-            --params "siteVersion=$SOURCE_TAG" \
-            --params "publicSourceArchiveURL=https://github.com/KStocky/LearnGraphicsProgrammingCourse/archive/refs/tags/$SOURCE_TAG.zip"
+            --destination "$GITHUB_WORKSPACE/public-site"
 
       - name: Configure Pages
         uses: actions/configure-pages@v5
