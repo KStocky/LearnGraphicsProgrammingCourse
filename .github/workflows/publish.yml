@@ -86,7 +86,6 @@ jobs:
           SOURCE_SHA: ${{ inputs.source_sha }}
         run: |
           set -euo pipefail
-          git fetch --force origin "refs/tags/$SOURCE_TAG:refs/tags/$SOURCE_TAG"
           test "$(git rev-parse "$SOURCE_TAG^{commit}")" = "$SOURCE_SHA"
           test "$(git rev-parse HEAD)" = "$SOURCE_SHA"
 
