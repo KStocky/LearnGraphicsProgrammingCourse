@@ -1,0 +1,224 @@
+diff --git "a/chapters/visibility-buffers-and-material-evaluation/Starter/Main.cpp" "b/chapters/visibility-buffers-and-material-evaluation/Starter/Main.cpp"
+index 8663f07..cba3a9f 100644
+--- "a/chapters/visibility-buffers-and-material-evaluation/Starter/Main.cpp"
++++ "b/chapters/visibility-buffers-and-material-evaluation/Starter/Main.cpp"
+@@ -4,10 +4,10 @@
+ 
+ int wmain(int argc, wchar_t **argv)
+ {
+-    ch15::visibility_buffer::starter::Renderer renderer{};
++    ch15::visibility_buffer::solution::Renderer renderer{};
+ 
+     lgp::framework::ApplicationConfiguration configuration{};
+-    configuration.title = L"Ch15 Visibility Buffer Starter (wide G-buffer baseline)";
++    configuration.title = L"Ch15 Visibility Buffer Solution (1 final, 2 UV, 3 gradients, 4 IDs)";
+     configuration.width = 320U;
+     configuration.height = 180U;
+     configuration.enableDebugLayer = false;
+diff --git "a/chapters/visibility-buffers-and-material-evaluation/Starter/Renderer.cpp" "b/chapters/visibility-buffers-and-material-evaluation/Starter/Renderer.cpp"
+index aa5fa4f..2ca2ccf 100644
+--- "a/chapters/visibility-buffers-and-material-evaluation/Starter/Renderer.cpp"
++++ "b/chapters/visibility-buffers-and-material-evaluation/Starter/Renderer.cpp"
+@@ -19,7 +19,7 @@
+ #include <string>
+ #include <utility>
+ 
+-namespace ch15::visibility_buffer::starter
++namespace ch15::visibility_buffer::solution
+ {
+ namespace
+ {
+@@ -109,7 +109,7 @@ enum DescriptorIndex : UINT
+     {
+         return std::unexpected(lgp::framework::MakeHResultError(
+             "ID3D12Device::CreateRootSignature", createResult,
+-            std::string{"Failed to create the Chapter 15 Starter "} + label + " root signature."));
++            std::string{"Failed to create the Chapter 15 Solution "} + label + " root signature."));
+     }
+     return {};
+ }
+@@ -127,7 +127,7 @@ enum DescriptorIndex : UINT
+     {
+         return std::unexpected(lgp::framework::MakeHResultError(
+             "ID3D12Device::CreateComputePipelineState", result,
+-            "Failed to create the Chapter 15 Starter compute material-evaluation pipeline."));
++            "Failed to create the Chapter 15 Solution compute material-evaluation pipeline."));
+     }
+     return {};
+ }
+@@ -146,7 +146,7 @@ enum DescriptorIndex : UINT
+     {
+         return std::unexpected(lgp::framework::MakeHResultError(
+             "ID3D12Device10::CreateCommittedResource3", result,
+-            std::string{"Failed to create the Chapter 15 Starter "} + label + " texture."));
++            std::string{"Failed to create the Chapter 15 Solution "} + label + " texture."));
+     }
+     return {};
+ }
+@@ -168,7 +168,7 @@ lgp::framework::Status Renderer::ValidateRequiredFeatures()
+     {
+         return std::unexpected(
+             lgp::framework::MakeError("ID3D12Device::CheckFeatureSupport",
+-                                      "Chapter 15 Starter requires native pixel-shader SV_Barycentrics support."));
++                                      "Chapter 15 Solution requires native pixel-shader SV_Barycentrics support."));
+     }
+ 
+     D3D12_FEATURE_DATA_SHADER_MODEL shaderModel{D3D_SHADER_MODEL_6_1};
+@@ -177,7 +177,7 @@ lgp::framework::Status Renderer::ValidateRequiredFeatures()
+     if (FAILED(shaderModelResult) || shaderModel.HighestShaderModel < D3D_SHADER_MODEL_6_1)
+     {
+         return std::unexpected(lgp::framework::MakeError("ID3D12Device::CheckFeatureSupport",
+-                                                         "Chapter 15 Starter requires Shader Model 6.1 or newer."));
++                                                         "Chapter 15 Solution requires Shader Model 6.1 or newer."));
+     }
+     return {};
+ }
+@@ -314,7 +314,7 @@ lgp::framework::Status Renderer::CreatePipelines()
+     {
+         return std::unexpected(lgp::framework::MakeHResultError(
+             "ID3D12Device::CreateGraphicsPipelineState", forwardResult,
+-            "Failed to create the Chapter 15 Starter forward-depth visibility pipeline."));
++            "Failed to create the Chapter 15 Solution forward-depth visibility pipeline."));
+     }
+     description.DepthStencilState.DepthFunc = gpu::DepthFunction(gpu::DepthConvention::Reversed);
+     HRESULT const reversedResult = deviceResources_->device()->CreateGraphicsPipelineState(
+@@ -323,7 +323,7 @@ lgp::framework::Status Renderer::CreatePipelines()
+     {
+         return std::unexpected(lgp::framework::MakeHResultError(
+             "ID3D12Device::CreateGraphicsPipelineState", reversedResult,
+-            "Failed to create the Chapter 15 Starter reversed-depth visibility pipeline."));
++            "Failed to create the Chapter 15 Solution reversed-depth visibility pipeline."));
+     }
+     return CreateComputePipeline(*deviceResources_->device(), *computeRootSignature_.Get(), shadeShader_,
+                                  shadePipeline_);
+@@ -338,14 +338,14 @@ lgp::framework::Status Renderer::CreateGeometry()
+     }
+     auto vertices = gpu::CreateBuffer(
+         *deviceResources_->device(), static_cast<std::uint64_t>(diagnosticScene_.vertices.size()) * sizeof(gpu::Vertex),
+-        D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_FLAG_NONE, L"Ch15 Starter indexed vertices", true);
++        D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_FLAG_NONE, L"Ch15 Solution indexed vertices", true);
+     auto indices =
+         gpu::CreateBuffer(*deviceResources_->device(),
+                           static_cast<std::uint64_t>(diagnosticScene_.indices.size()) * sizeof(std::uint32_t),
+-                          D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_FLAG_NONE, L"Ch15 Starter indexed indices", true);
++                          D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_FLAG_NONE, L"Ch15 Solution indexed indices", true);
+     auto draws = gpu::CreateBuffer(
+         *deviceResources_->device(), static_cast<std::uint64_t>(diagnosticScene_.draws.size()) * sizeof(gpu::DrawData),
+-        D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_FLAG_NONE, L"Ch15 Starter checked draw ranges", true);
++        D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_FLAG_NONE, L"Ch15 Solution checked draw ranges", true);
+     if (!vertices)
+     {
+         return std::unexpected(vertices.error());
+@@ -520,21 +520,21 @@ lgp::framework::Status Renderer::CreateSizeDependentResources(lgp::framework::Ex
+         auto lights =
+             gpu::CreateBuffer(*deviceResources_->device(),
+                               static_cast<std::uint64_t>(gpu::kMaximumLightCount) * sizeof(gpu::PointLightData),
+-                              D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_FLAG_NONE, L"Ch15 Starter per-slot lights", true);
++                              D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_FLAG_NONE, L"Ch15 Solution per-slot lights", true);
+         auto cells = gpu::CreateBuffer(
+             *deviceResources_->device(),
+             static_cast<std::uint64_t>(gpu::kMaximumClusterCount) * sizeof(gpu::CellLightRange), D3D12_HEAP_TYPE_UPLOAD,
+-            D3D12_RESOURCE_FLAG_NONE, L"Ch15 Starter per-slot cluster ranges", true);
++            D3D12_RESOURCE_FLAG_NONE, L"Ch15 Solution per-slot cluster ranges", true);
+         auto lightIndices = gpu::CreateBuffer(
+             *deviceResources_->device(),
+             static_cast<std::uint64_t>(gpu::kMaximumLightIndexCount) * sizeof(std::uint32_t), D3D12_HEAP_TYPE_UPLOAD,
+-            D3D12_RESOURCE_FLAG_NONE, L"Ch15 Starter per-slot light indices", true);
++            D3D12_RESOURCE_FLAG_NONE, L"Ch15 Solution per-slot light indices", true);
+         auto diagnostics = gpu::CreateBuffer(*deviceResources_->device(), pixelCount * sizeof(gpu::PixelDiagnostics),
+                                              D3D12_HEAP_TYPE_DEFAULT, D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+-                                             L"Ch15 Starter pixel diagnostics");
++                                             L"Ch15 Solution pixel diagnostics");
+         auto diagnosticsReadback = gpu::CreateBuffer(
+             *deviceResources_->device(), pixelCount * sizeof(gpu::PixelDiagnostics), D3D12_HEAP_TYPE_READBACK,
+-            D3D12_RESOURCE_FLAG_NONE, L"Ch15 Starter diagnostics readback", true);
++            D3D12_RESOURCE_FLAG_NONE, L"Ch15 Solution diagnostics readback", true);
+         if (!lights)
+         {
+             return std::unexpected(lights.error());
+@@ -583,9 +583,9 @@ lgp::framework::Status Renderer::CreateSizeDependentResources(lgp::framework::Ex
+                                                               slot.descriptors.CpuHandle(DiagnosticsUav));
+ 
+         auto visibilityReadback = gpu::CreateTextureReadbackBuffer(
+-            *deviceResources_->device(), slot.visibility->GetDesc(), L"Ch15 Starter visibility readback");
++            *deviceResources_->device(), slot.visibility->GetDesc(), L"Ch15 Solution visibility readback");
+         auto depthReadback = gpu::CreateTextureReadbackBuffer(*deviceResources_->device(), slot.depth->GetDesc(),
+-                                                              L"Ch15 Starter depth readback");
++                                                              L"Ch15 Solution depth readback");
+         if (!visibilityReadback)
+         {
+             return std::unexpected(visibilityReadback.error());
+@@ -624,10 +624,10 @@ lgp::framework::Status Renderer::Initialize(lgp::framework::ApplicationInitConte
+     }
+     auto rtvHeap =
+         lgp::framework::CreateDescriptorHeap(*deviceResources_->device(), D3D12_DESCRIPTOR_HEAP_TYPE_RTV,
+-                                             deviceResources_->back_buffer_count(), false, L"Ch15 Starter RTV heap");
++                                             deviceResources_->back_buffer_count(), false, L"Ch15 Solution RTV heap");
+     auto dsvHeap =
+         lgp::framework::CreateDescriptorHeap(*deviceResources_->device(), D3D12_DESCRIPTOR_HEAP_TYPE_DSV,
+-                                             deviceResources_->back_buffer_count(), false, L"Ch15 Starter DSV heap");
++                                             deviceResources_->back_buffer_count(), false, L"Ch15 Solution DSV heap");
+     if (!rtvHeap)
+     {
+         return std::unexpected(rtvHeap.error());
+@@ -701,7 +701,7 @@ lgp::framework::Status Renderer::Render(lgp::framework::FrameContext const &fram
+         frameContext.frameSlot >= frameSlots_.size() || frameContext.renderTargetFormat != gpu::kOutputFormat)
+     {
+         return std::unexpected(
+-            lgp::framework::MakeError("Render", "The Chapter 15 Starter frame context is invalid."));
++            lgp::framework::MakeError("Render", "The Chapter 15 Solution frame context is invalid."));
+     }
+     if (auto const extent = gpu::ValidateExtent(frameContext.drawableSize); !extent)
+     {
+@@ -726,7 +726,7 @@ lgp::framework::Status Renderer::Render(lgp::framework::FrameContext const &fram
+     }
+     if (!tiles)
+     {
+-        return std::unexpected(lgp::framework::MakeError("Render", "The Chapter 15 Starter tile grid is invalid."));
++        return std::unexpected(lgp::framework::MakeError("Render", "The Chapter 15 Solution tile grid is invalid."));
+     }
+ 
+     FrameSlotResources &slot = frameSlots_[frameContext.frameSlot];
+@@ -752,7 +752,7 @@ lgp::framework::Status Renderer::Render(lgp::framework::FrameContext const &fram
+     if (!coefficients)
+     {
+         return std::unexpected(
+-            lgp::framework::MakeError("Render", "The Chapter 15 Starter depth projection is invalid."));
++            lgp::framework::MakeError("Render", "The Chapter 15 Solution depth projection is invalid."));
+     }
+     float const tangentHalfFov = std::tan(projection.verticalFieldOfViewRadians * 0.5F);
+     gpu::FrameConstants constants{};
+@@ -932,7 +932,7 @@ std::expected<Renderer::ReadbackOutputs, lgp::framework::Error> Renderer::ReadBa
+     if (frameSlots_.empty() || lastRenderedPixelCount_ == 0U)
+     {
+         return std::unexpected(
+-            lgp::framework::MakeError("ReadBackOutputs", "No Chapter 15 Starter frame has been rendered."));
++            lgp::framework::MakeError("ReadBackOutputs", "No Chapter 15 Solution frame has been rendered."));
+     }
+     auto const idle = deviceResources_->WaitForGpuIdle();
+     if (!idle)
+@@ -975,4 +975,4 @@ std::expected<Renderer::ReadbackOutputs, lgp::framework::Error> Renderer::ReadBa
+     };
+ }
+ 
+-} // namespace ch15::visibility_buffer::starter
++} // namespace ch15::visibility_buffer::solution
+diff --git "a/chapters/visibility-buffers-and-material-evaluation/Starter/Renderer.hpp" "b/chapters/visibility-buffers-and-material-evaluation/Starter/Renderer.hpp"
+index f83b42f..d55d6e6 100644
+--- "a/chapters/visibility-buffers-and-material-evaluation/Starter/Renderer.hpp"
++++ "b/chapters/visibility-buffers-and-material-evaluation/Starter/Renderer.hpp"
+@@ -10,7 +10,7 @@
+ #include <optional>
+ #include <vector>
+ 
+-namespace ch15::visibility_buffer::starter
++namespace ch15::visibility_buffer::solution
+ {
+ 
+ struct HeadlessTestConfiguration final
+@@ -107,4 +107,4 @@ class Renderer final : public lgp::framework::IChapterRenderer
+     bool headless_{};
+ };
+ 
+-} // namespace ch15::visibility_buffer::starter
++} // namespace ch15::visibility_buffer::solution

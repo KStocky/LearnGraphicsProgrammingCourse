@@ -1,0 +1,116 @@
+diff --git "a/chapters/visibility-buffers-and-material-evaluation/Starter/VisibilityBufferLab.hlsl" "b/chapters/visibility-buffers-and-material-evaluation/Starter/VisibilityBufferLab.hlsl"
+index 464b10a..3a3cb6a 100644
+--- "a/chapters/visibility-buffers-and-material-evaluation/Starter/VisibilityBufferLab.hlsl"
++++ "b/chapters/visibility-buffers-and-material-evaluation/Starter/VisibilityBufferLab.hlsl"
+@@ -99,6 +99,19 @@ bool DecodeVisibility(uint2 record, out uint drawIdentifier, out uint primitiveI
+     return true;
+ }
+ 
++float Cross2(float2 first, float2 second)
++{
++    return first.x * second.y - first.y * second.x;
++}
++
++float2 ProjectToPixel(float3 viewPosition)
++{
++    float4 clip = mul(float4(viewPosition, 1.0), gFrame.projection);
++    float2 ndc = clip.xy / clip.w;
++    return float2((ndc.x * 0.5 + 0.5) * float(gFrame.dimensions.x),
++                  (0.5 - ndc.y * 0.5) * float(gFrame.dimensions.y));
++}
++
+ bool ResolveTriangle(uint drawIdentifier, uint primitiveIdentifier, out DrawData draw,
+                      out VertexData vertices[3])
+ {
+@@ -178,6 +191,68 @@ bool PerspectiveWeights(float3 screenBarycentrics, VertexData vertices[3], out f
+     return true;
+ }
+ 
++bool ComputeAnalyticGradients(uint2 pixel, VertexData vertices[3], out float2 uv, out float2 textureDdx,
++                              out float2 textureDdy)
++{
++    float2 projected[3] = {
++        ProjectToPixel(vertices[0].position),
++        ProjectToPixel(vertices[1].position),
++        ProjectToPixel(vertices[2].position),
++    };
++    float2 edgeOne = projected[1] - projected[0];
++    float2 edgeTwo = projected[2] - projected[0];
++    float denominator = Cross2(edgeOne, edgeTwo);
++    if (abs(denominator) <= 1.0e-8)
++    {
++        uv = 0.0;
++        textureDdx = 0.0;
++        textureDdy = 0.0;
++        return false;
++    }
++
++    float2 samplePosition = float2(pixel) + 0.5;
++    float2 fromFirst = samplePosition - projected[0];
++    float second = Cross2(fromFirst, edgeTwo) / denominator;
++    float third = Cross2(edgeOne, fromFirst) / denominator;
++    float3 screen = float3(1.0 - second - third, second, third);
++    float3 barycentricDdx =
++        float3((edgeOne.y - edgeTwo.y) / denominator, edgeTwo.y / denominator, -edgeOne.y / denominator);
++    float3 barycentricDdy =
++        float3((edgeTwo.x - edgeOne.x) / denominator, -edgeTwo.x / denominator, edgeOne.x / denominator);
++    float3 reciprocalW =
++        float3(1.0 / vertices[0].position.z, 1.0 / vertices[1].position.z, 1.0 / vertices[2].position.z);
++    float3 weighted = screen * reciprocalW;
++    float3 weightedDdx = barycentricDdx * reciprocalW;
++    float3 weightedDdy = barycentricDdy * reciprocalW;
++    float perspectiveDenominator = weighted.x + weighted.y + weighted.z;
++    float denominatorDdx = weightedDdx.x + weightedDdx.y + weightedDdx.z;
++    float denominatorDdy = weightedDdy.x + weightedDdy.y + weightedDdy.z;
++    if (perspectiveDenominator <= 0.0)
++    {
++        uv = 0.0;
++        textureDdx = 0.0;
++        textureDdy = 0.0;
++        return false;
++    }
++
++    float2 numerator = weighted.x * vertices[0].textureCoordinates +
++                       weighted.y * vertices[1].textureCoordinates +
++                       weighted.z * vertices[2].textureCoordinates;
++    float2 numeratorDdx = weightedDdx.x * vertices[0].textureCoordinates +
++                          weightedDdx.y * vertices[1].textureCoordinates +
++                          weightedDdx.z * vertices[2].textureCoordinates;
++    float2 numeratorDdy = weightedDdy.x * vertices[0].textureCoordinates +
++                          weightedDdy.y * vertices[1].textureCoordinates +
++                          weightedDdy.z * vertices[2].textureCoordinates;
++    float denominatorSquared = perspectiveDenominator * perspectiveDenominator;
++    uv = numerator / perspectiveDenominator;
++    textureDdx =
++        (numeratorDdx * perspectiveDenominator - numerator * denominatorDdx) / denominatorSquared;
++    textureDdy =
++        (numeratorDdy * perspectiveDenominator - numerator * denominatorDdy) / denominatorSquared;
++    return true;
++}
++
+ void StoreBackground(uint2 pixel, uint linearIndex)
+ {
+     gOutput[pixel] = float4(0.0, 0.0, 0.0, 1.0);
+@@ -255,11 +330,17 @@ void ShadeCS(uint3 dispatchThreadId : SV_DispatchThreadID)
+         return;
+     }
+ 
+-    float2 uv = weights.x * vertices[0].textureCoordinates + weights.y * vertices[1].textureCoordinates +
+-                weights.z * vertices[2].textureCoordinates;
+-    float2 textureDdx = 0.0;
+-    float2 textureDdy = 0.0;
+-    float3 baseColor = gMaterialTexture.SampleLevel(gMaterialSampler, uv, 0.0).rgb * draw.baseTintAndRoughness.rgb;
++    float2 uv;
++    float2 textureDdx;
++    float2 textureDdy;
++    if (!ComputeAnalyticGradients(pixel, vertices, uv, textureDdx, textureDdy))
++    {
++        StoreInvalid(pixel, linearIndex, drawIdentifier, primitiveIdentifier);
++        return;
++    }
++    float3 baseColor =
++        gMaterialTexture.SampleGrad(gMaterialSampler, uv, textureDdx, textureDdy).rgb *
++        draw.baseTintAndRoughness.rgb;
+     uint clusterIndex;
+     if (!ComputeClusterIndex(pixel, viewPosition.z, clusterIndex))
+     {

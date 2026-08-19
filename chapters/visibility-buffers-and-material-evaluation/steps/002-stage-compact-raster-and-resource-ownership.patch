@@ -1,0 +1,895 @@
+diff --git "a/chapters/visibility-buffers-and-material-evaluation/Starter/Renderer.cpp" "b/chapters/visibility-buffers-and-material-evaluation/Starter/Renderer.cpp"
+index e89dd4b..aa5fa4f 100644
+--- "a/chapters/visibility-buffers-and-material-evaluation/Starter/Renderer.cpp"
++++ "b/chapters/visibility-buffers-and-material-evaluation/Starter/Renderer.cpp"
+@@ -14,7 +14,6 @@
+ #include <array>
+ #include <cmath>
+ #include <cstdint>
+-#include <cstring>
+ #include <filesystem>
+ #include <span>
+ #include <string>
+@@ -27,44 +26,35 @@ namespace
+ 
+ using Microsoft::WRL::ComPtr;
+ 
+-inline constexpr UINT kDescriptorsPerSlot = 14U;
++inline constexpr UINT kDescriptorsPerSlot = 11U;
+ 
+ enum GraphicsRootParameter : UINT
+ {
+     GraphicsFrameConstants = 0U,
+     GraphicsDrawConstants = 1U,
+-    GraphicsMaterialTable = 2U,
+ };
+ 
+ enum ComputeRootParameter : UINT
+ {
+     ComputeFrameConstants = 0U,
+-    ComputeSurfaceTable = 1U,
++    ComputeInputTable = 1U,
+     ComputeLightTable = 2U,
+     ComputeUavTable = 3U,
+ };
+ 
+ enum DescriptorIndex : UINT
+ {
+-    PositionSrv = 0U,
+-    NormalSrv = 1U,
+-    TangentSrv = 2U,
+-    BaseColorSrv = 3U,
+-    TextureCoordinatesSrv = 4U,
+-    TextureGradientsSrv = 5U,
+-    IdentitySrv = 6U,
+-    DepthSrv = 7U,
+-    MaterialSrv = 8U,
+-    LightSrv = 9U,
+-    CellSrv = 10U,
+-    LightIndexSrv = 11U,
+-    OutputUav = 12U,
+-    DiagnosticsUav = 13U,
+-};
+-
+-constexpr std::array<DXGI_FORMAT, gpu::kWideGBufferCount> kGBufferFormats{
+-    gpu::kSurfaceFloat4Format, gpu::kSurfaceFloat4Format, gpu::kSurfaceFloat4Format, gpu::kSurfaceFloat4Format,
+-    gpu::kSurfaceFloat2Format, gpu::kSurfaceFloat4Format, gpu::kVisibilityFormat,
++    VisibilitySrv = 0U,
++    DepthSrv = 1U,
++    VertexSrv = 2U,
++    IndexSrv = 3U,
++    DrawSrv = 4U,
++    MaterialSrv = 5U,
++    LightSrv = 6U,
++    CellSrv = 7U,
++    LightIndexSrv = 8U,
++    OutputUav = 9U,
++    DiagnosticsUav = 10U,
+ };
+ 
+ [[nodiscard]] std::filesystem::path ShaderPath()
+@@ -81,7 +71,7 @@ constexpr std::array<DXGI_FORMAT, gpu::kWideGBufferCount> kGBufferFormats{
+     return {static_cast<char const *>(blob->GetBufferPointer()), static_cast<std::size_t>(blob->GetBufferSize())};
+ }
+ 
+-[[nodiscard]] D3D12_STATIC_SAMPLER_DESC MaterialSampler(D3D12_SHADER_VISIBILITY visibility) noexcept
++[[nodiscard]] D3D12_STATIC_SAMPLER_DESC MaterialSampler() noexcept
+ {
+     D3D12_STATIC_SAMPLER_DESC sampler{};
+     sampler.Filter = D3D12_FILTER_MIN_MAG_MIP_LINEAR;
+@@ -93,7 +83,7 @@ constexpr std::array<DXGI_FORMAT, gpu::kWideGBufferCount> kGBufferFormats{
+     sampler.MinLOD = 0.0F;
+     sampler.MaxLOD = D3D12_FLOAT32_MAX;
+     sampler.ShaderRegister = 0U;
+-    sampler.ShaderVisibility = visibility;
++    sampler.ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+     return sampler;
+ }
+ 
+@@ -135,9 +125,9 @@ constexpr std::array<DXGI_FORMAT, gpu::kWideGBufferCount> kGBufferFormats{
+         device.CreateComputePipelineState(&description, IID_PPV_ARGS(pipeline.ReleaseAndGetAddressOf()));
+     if (FAILED(result))
+     {
+-        return std::unexpected(
+-            lgp::framework::MakeHResultError("ID3D12Device::CreateComputePipelineState", result,
+-                                             "Failed to create the Chapter 15 Starter compute shading pipeline."));
++        return std::unexpected(lgp::framework::MakeHResultError(
++            "ID3D12Device::CreateComputePipelineState", result,
++            "Failed to create the Chapter 15 Starter compute material-evaluation pipeline."));
+     }
+     return {};
+ }
+@@ -211,7 +201,7 @@ lgp::framework::Status Renderer::CreateShaders()
+     {
+         return status;
+     }
+-    if (auto status = gpu::CompileShader(compiler, options, L"RasterPS", L"ps_6_1", rasterPixelShader_); !status)
++    if (auto status = gpu::CompileShader(compiler, options, L"VisibilityPS", L"ps_6_1", rasterPixelShader_); !status)
+     {
+         return status;
+     }
+@@ -220,34 +210,20 @@ lgp::framework::Status Renderer::CreateShaders()
+ 
+ lgp::framework::Status Renderer::CreateRootSignatures()
+ {
+-    D3D12_DESCRIPTOR_RANGE materialRange{};
+-    materialRange.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
+-    materialRange.NumDescriptors = 1U;
+-    materialRange.BaseShaderRegister = 8U;
+-    materialRange.OffsetInDescriptorsFromTableStart = D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND;
+-
+-    D3D12_ROOT_PARAMETER graphicsParameters[3]{};
++    D3D12_ROOT_PARAMETER graphicsParameters[2]{};
+     graphicsParameters[GraphicsFrameConstants].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+     graphicsParameters[GraphicsFrameConstants].Constants.ShaderRegister = 0U;
+     graphicsParameters[GraphicsFrameConstants].Constants.Num32BitValues =
+         sizeof(gpu::FrameConstants) / sizeof(std::uint32_t);
+-    graphicsParameters[GraphicsFrameConstants].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
++    graphicsParameters[GraphicsFrameConstants].ShaderVisibility = D3D12_SHADER_VISIBILITY_VERTEX;
+     graphicsParameters[GraphicsDrawConstants].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+     graphicsParameters[GraphicsDrawConstants].Constants.ShaderRegister = 1U;
+     graphicsParameters[GraphicsDrawConstants].Constants.Num32BitValues =
+         sizeof(gpu::RasterDrawConstants) / sizeof(std::uint32_t);
+     graphicsParameters[GraphicsDrawConstants].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+-    graphicsParameters[GraphicsMaterialTable].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+-    graphicsParameters[GraphicsMaterialTable].DescriptorTable.NumDescriptorRanges = 1U;
+-    graphicsParameters[GraphicsMaterialTable].DescriptorTable.pDescriptorRanges = &materialRange;
+-    graphicsParameters[GraphicsMaterialTable].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+-    D3D12_STATIC_SAMPLER_DESC const graphicsSampler = MaterialSampler(D3D12_SHADER_VISIBILITY_PIXEL);
+-
+     D3D12_ROOT_SIGNATURE_DESC graphicsDescription{};
+     graphicsDescription.NumParameters = static_cast<UINT>(std::size(graphicsParameters));
+     graphicsDescription.pParameters = graphicsParameters;
+-    graphicsDescription.NumStaticSamplers = 1U;
+-    graphicsDescription.pStaticSamplers = &graphicsSampler;
+     graphicsDescription.Flags = D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT |
+                                 D3D12_ROOT_SIGNATURE_FLAG_DENY_HULL_SHADER_ROOT_ACCESS |
+                                 D3D12_ROOT_SIGNATURE_FLAG_DENY_DOMAIN_SHADER_ROOT_ACCESS |
+@@ -259,11 +235,11 @@ lgp::framework::Status Renderer::CreateRootSignatures()
+         return status;
+     }
+ 
+-    D3D12_DESCRIPTOR_RANGE surfaceRange{};
+-    surfaceRange.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
+-    surfaceRange.NumDescriptors = 8U;
+-    surfaceRange.BaseShaderRegister = 0U;
+-    surfaceRange.OffsetInDescriptorsFromTableStart = D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND;
++    D3D12_DESCRIPTOR_RANGE inputRange{};
++    inputRange.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
++    inputRange.NumDescriptors = 6U;
++    inputRange.BaseShaderRegister = 0U;
++    inputRange.OffsetInDescriptorsFromTableStart = D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND;
+     D3D12_DESCRIPTOR_RANGE lightRange{};
+     lightRange.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
+     lightRange.NumDescriptors = 3U;
+@@ -274,17 +250,16 @@ lgp::framework::Status Renderer::CreateRootSignatures()
+     uavRange.NumDescriptors = 2U;
+     uavRange.BaseShaderRegister = 0U;
+     uavRange.OffsetInDescriptorsFromTableStart = D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND;
+-
+     D3D12_ROOT_PARAMETER computeParameters[4]{};
+     computeParameters[ComputeFrameConstants].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+     computeParameters[ComputeFrameConstants].Constants.ShaderRegister = 0U;
+     computeParameters[ComputeFrameConstants].Constants.Num32BitValues =
+         sizeof(gpu::FrameConstants) / sizeof(std::uint32_t);
+     computeParameters[ComputeFrameConstants].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+-    computeParameters[ComputeSurfaceTable].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+-    computeParameters[ComputeSurfaceTable].DescriptorTable.NumDescriptorRanges = 1U;
+-    computeParameters[ComputeSurfaceTable].DescriptorTable.pDescriptorRanges = &surfaceRange;
+-    computeParameters[ComputeSurfaceTable].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
++    computeParameters[ComputeInputTable].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
++    computeParameters[ComputeInputTable].DescriptorTable.NumDescriptorRanges = 1U;
++    computeParameters[ComputeInputTable].DescriptorTable.pDescriptorRanges = &inputRange;
++    computeParameters[ComputeInputTable].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+     computeParameters[ComputeLightTable].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+     computeParameters[ComputeLightTable].DescriptorTable.NumDescriptorRanges = 1U;
+     computeParameters[ComputeLightTable].DescriptorTable.pDescriptorRanges = &lightRange;
+@@ -293,10 +268,12 @@ lgp::framework::Status Renderer::CreateRootSignatures()
+     computeParameters[ComputeUavTable].DescriptorTable.NumDescriptorRanges = 1U;
+     computeParameters[ComputeUavTable].DescriptorTable.pDescriptorRanges = &uavRange;
+     computeParameters[ComputeUavTable].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+-
++    D3D12_STATIC_SAMPLER_DESC const sampler = MaterialSampler();
+     D3D12_ROOT_SIGNATURE_DESC computeDescription{};
+     computeDescription.NumParameters = static_cast<UINT>(std::size(computeParameters));
+     computeDescription.pParameters = computeParameters;
++    computeDescription.NumStaticSamplers = 1U;
++    computeDescription.pStaticSamplers = &sampler;
+     return SerializeRootSignature(*deviceResources_->device(), computeDescription, "compute", computeRootSignature_);
+ }
+ 
+@@ -304,19 +281,13 @@ lgp::framework::Status Renderer::CreatePipelines()
+ {
+     D3D12_INPUT_ELEMENT_DESC const inputLayout[]{
+         {"POSITION", 0U, DXGI_FORMAT_R32G32B32_FLOAT, 0U, 0U, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0U},
+-        {"NORMAL", 0U, DXGI_FORMAT_R32G32B32_FLOAT, 0U, 12U, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0U},
+-        {"TANGENT", 0U, DXGI_FORMAT_R32G32B32A32_FLOAT, 0U, 24U, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0U},
+-        {"TEXCOORD", 0U, DXGI_FORMAT_R32G32_FLOAT, 0U, 40U, D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA, 0U},
+     };
+     D3D12_RASTERIZER_DESC rasterizer{};
+     rasterizer.FillMode = D3D12_FILL_MODE_SOLID;
+     rasterizer.CullMode = D3D12_CULL_MODE_NONE;
+     rasterizer.DepthClipEnable = TRUE;
+     D3D12_BLEND_DESC blend{};
+-    for (D3D12_RENDER_TARGET_BLEND_DESC &target : blend.RenderTarget)
+-    {
+-        target.RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
+-    }
++    blend.RenderTarget[0].RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
+     D3D12_DEPTH_STENCIL_DESC depth{};
+     depth.DepthEnable = TRUE;
+     depth.DepthWriteMask = D3D12_DEPTH_WRITE_MASK_ALL;
+@@ -331,11 +302,8 @@ lgp::framework::Status Renderer::CreatePipelines()
+     description.DepthStencilState = depth;
+     description.InputLayout = {inputLayout, static_cast<UINT>(std::size(inputLayout))};
+     description.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+-    description.NumRenderTargets = static_cast<UINT>(kGBufferFormats.size());
+-    for (std::size_t index = 0U; index < kGBufferFormats.size(); ++index)
+-    {
+-        description.RTVFormats[index] = kGBufferFormats[index];
+-    }
++    description.NumRenderTargets = 1U;
++    description.RTVFormats[0] = gpu::kVisibilityFormat;
+     description.DSVFormat = gpu::kDepthDsvFormat;
+     description.SampleDesc.Count = 1U;
+ 
+@@ -344,9 +312,9 @@ lgp::framework::Status Renderer::CreatePipelines()
+         &description, IID_PPV_ARGS(rasterForwardPipeline_.ReleaseAndGetAddressOf()));
+     if (FAILED(forwardResult))
+     {
+-        return std::unexpected(
+-            lgp::framework::MakeHResultError("ID3D12Device::CreateGraphicsPipelineState", forwardResult,
+-                                             "Failed to create the Chapter 15 Starter forward-depth raster pipeline."));
++        return std::unexpected(lgp::framework::MakeHResultError(
++            "ID3D12Device::CreateGraphicsPipelineState", forwardResult,
++            "Failed to create the Chapter 15 Starter forward-depth visibility pipeline."));
+     }
+     description.DepthStencilState.DepthFunc = gpu::DepthFunction(gpu::DepthConvention::Reversed);
+     HRESULT const reversedResult = deviceResources_->device()->CreateGraphicsPipelineState(
+@@ -355,7 +323,7 @@ lgp::framework::Status Renderer::CreatePipelines()
+     {
+         return std::unexpected(lgp::framework::MakeHResultError(
+             "ID3D12Device::CreateGraphicsPipelineState", reversedResult,
+-            "Failed to create the Chapter 15 Starter reversed-depth raster pipeline."));
++            "Failed to create the Chapter 15 Starter reversed-depth visibility pipeline."));
+     }
+     return CreateComputePipeline(*deviceResources_->device(), *computeRootSignature_.Get(), shadeShader_,
+                                  shadePipeline_);
+@@ -368,7 +336,6 @@ lgp::framework::Status Renderer::CreateGeometry()
+     {
+         return std::unexpected(validation.error());
+     }
+-
+     auto vertices = gpu::CreateBuffer(
+         *deviceResources_->device(), static_cast<std::uint64_t>(diagnosticScene_.vertices.size()) * sizeof(gpu::Vertex),
+         D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_FLAG_NONE, L"Ch15 Starter indexed vertices", true);
+@@ -376,6 +343,9 @@ lgp::framework::Status Renderer::CreateGeometry()
+         gpu::CreateBuffer(*deviceResources_->device(),
+                           static_cast<std::uint64_t>(diagnosticScene_.indices.size()) * sizeof(std::uint32_t),
+                           D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_FLAG_NONE, L"Ch15 Starter indexed indices", true);
++    auto draws = gpu::CreateBuffer(
++        *deviceResources_->device(), static_cast<std::uint64_t>(diagnosticScene_.draws.size()) * sizeof(gpu::DrawData),
++        D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_FLAG_NONE, L"Ch15 Starter checked draw ranges", true);
+     if (!vertices)
+     {
+         return std::unexpected(vertices.error());
+@@ -384,8 +354,13 @@ lgp::framework::Status Renderer::CreateGeometry()
+     {
+         return std::unexpected(indices.error());
+     }
++    if (!draws)
++    {
++        return std::unexpected(draws.error());
++    }
+     mesh_.vertices = std::move(*vertices);
+     mesh_.indices = std::move(*indices);
++    mesh_.draws = std::move(*draws);
+     if (auto status = gpu::WriteBuffer(mesh_.vertices, std::span<gpu::Vertex const>{diagnosticScene_.vertices});
+         !status)
+     {
+@@ -396,6 +371,10 @@ lgp::framework::Status Renderer::CreateGeometry()
+     {
+         return status;
+     }
++    if (auto status = gpu::WriteBuffer(mesh_.draws, std::span<gpu::DrawData const>{diagnosticScene_.draws}); !status)
++    {
++        return status;
++    }
+     mesh_.vertexView.BufferLocation = mesh_.vertices.Get()->GetGPUVirtualAddress();
+     mesh_.vertexView.SizeInBytes = static_cast<UINT>(diagnosticScene_.vertices.size() * sizeof(gpu::Vertex));
+     mesh_.vertexView.StrideInBytes = sizeof(gpu::Vertex);
+@@ -409,15 +388,12 @@ void Renderer::ReleaseSizeDependentResources() noexcept
+ {
+     for (FrameSlotResources &slot : frameSlots_)
+     {
+-        for (ComPtr<ID3D12Resource> &texture : slot.gbuffer)
+-        {
+-            texture.Reset();
+-        }
++        slot.visibility.Reset();
+         slot.depth.Reset();
+         slot.output.Reset();
+-        if (slot.rtvs)
++        if (slot.rtv)
+         {
+-            rtvHeap_.Free(slot.rtvs);
++            rtvHeap_.Free(slot.rtv);
+         }
+         if (slot.dsv)
+         {
+@@ -427,7 +403,7 @@ void Renderer::ReleaseSizeDependentResources() noexcept
+         {
+             deviceResources_->shader_visible_cbv_srv_uav_heap().Free(slot.descriptors);
+         }
+-        slot.rtvs = {};
++        slot.rtv = {};
+         slot.dsv = {};
+         slot.descriptors = {};
+     }
+@@ -449,12 +425,12 @@ lgp::framework::Status Renderer::CreateSizeDependentResources(lgp::framework::Ex
+     frameSlots_.resize(deviceResources_->back_buffer_count());
+     for (FrameSlotResources &slot : frameSlots_)
+     {
+-        auto rtvs = rtvHeap_.Allocate(static_cast<UINT>(gpu::kWideGBufferCount));
++        auto rtv = rtvHeap_.Allocate();
+         auto dsv = dsvHeap_.Allocate();
+         auto descriptors = deviceResources_->shader_visible_cbv_srv_uav_heap().Allocate(kDescriptorsPerSlot);
+-        if (!rtvs)
++        if (!rtv)
+         {
+-            return std::unexpected(rtvs.error());
++            return std::unexpected(rtv.error());
+         }
+         if (!dsv)
+         {
+@@ -464,31 +440,27 @@ lgp::framework::Status Renderer::CreateSizeDependentResources(lgp::framework::Ex
+         {
+             return std::unexpected(descriptors.error());
+         }
+-        slot.rtvs = *rtvs;
++        slot.rtv = *rtv;
+         slot.dsv = *dsv;
+         slot.descriptors = *descriptors;
+ 
+-        for (std::size_t index = 0U; index < slot.gbuffer.size(); ++index)
++        if (auto status = CreateTexture(*deviceResources_->device(), size, gpu::kVisibilityFormat,
++                                        D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET, "visibility", slot.visibility);
++            !status)
+         {
+-            if (auto status = CreateTexture(*deviceResources_->device(), size, kGBufferFormats[index],
+-                                            D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET, "G-buffer", slot.gbuffer[index]);
+-                !status)
+-            {
+-                return status;
+-            }
+-            D3D12_RENDER_TARGET_VIEW_DESC rtv{};
+-            rtv.Format = kGBufferFormats[index];
+-            rtv.ViewDimension = D3D12_RTV_DIMENSION_TEXTURE2D;
+-            deviceResources_->device()->CreateRenderTargetView(slot.gbuffer[index].Get(), &rtv,
+-                                                               slot.rtvs.CpuHandle(static_cast<UINT>(index)));
+-            D3D12_SHADER_RESOURCE_VIEW_DESC srv{};
+-            srv.Format = kGBufferFormats[index];
+-            srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+-            srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+-            srv.Texture2D.MipLevels = 1U;
+-            deviceResources_->device()->CreateShaderResourceView(slot.gbuffer[index].Get(), &srv,
+-                                                                 slot.descriptors.CpuHandle(static_cast<UINT>(index)));
++            return status;
+         }
++        D3D12_RENDER_TARGET_VIEW_DESC visibilityRtv{};
++        visibilityRtv.Format = gpu::kVisibilityFormat;
++        visibilityRtv.ViewDimension = D3D12_RTV_DIMENSION_TEXTURE2D;
++        deviceResources_->device()->CreateRenderTargetView(slot.visibility.Get(), &visibilityRtv, slot.rtv.CpuHandle());
++        D3D12_SHADER_RESOURCE_VIEW_DESC visibilitySrv{};
++        visibilitySrv.Format = gpu::kVisibilityFormat;
++        visibilitySrv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
++        visibilitySrv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
++        visibilitySrv.Texture2D.MipLevels = 1U;
++        deviceResources_->device()->CreateShaderResourceView(slot.visibility.Get(), &visibilitySrv,
++                                                             slot.descriptors.CpuHandle(VisibilitySrv));
+ 
+         if (auto status = CreateTexture(*deviceResources_->device(), size, gpu::kDepthResourceFormat,
+                                         D3D12_RESOURCE_FLAG_ALLOW_DEPTH_STENCIL, "depth", slot.depth);
+@@ -520,6 +492,23 @@ lgp::framework::Status Renderer::CreateSizeDependentResources(lgp::framework::Ex
+         deviceResources_->device()->CreateUnorderedAccessView(slot.output.Get(), nullptr, &outputUav,
+                                                               slot.descriptors.CpuHandle(OutputUav));
+ 
++        D3D12_SHADER_RESOURCE_VIEW_DESC structuredSrv{};
++        structuredSrv.ViewDimension = D3D12_SRV_DIMENSION_BUFFER;
++        structuredSrv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
++        structuredSrv.Format = DXGI_FORMAT_UNKNOWN;
++        structuredSrv.Buffer.NumElements = static_cast<UINT>(diagnosticScene_.vertices.size());
++        structuredSrv.Buffer.StructureByteStride = sizeof(gpu::Vertex);
++        deviceResources_->device()->CreateShaderResourceView(mesh_.vertices.Get(), &structuredSrv,
++                                                             slot.descriptors.CpuHandle(VertexSrv));
++        structuredSrv.Buffer.NumElements = static_cast<UINT>(diagnosticScene_.indices.size());
++        structuredSrv.Buffer.StructureByteStride = sizeof(std::uint32_t);
++        deviceResources_->device()->CreateShaderResourceView(mesh_.indices.Get(), &structuredSrv,
++                                                             slot.descriptors.CpuHandle(IndexSrv));
++        structuredSrv.Buffer.NumElements = static_cast<UINT>(diagnosticScene_.draws.size());
++        structuredSrv.Buffer.StructureByteStride = sizeof(gpu::DrawData);
++        deviceResources_->device()->CreateShaderResourceView(mesh_.draws.Get(), &structuredSrv,
++                                                             slot.descriptors.CpuHandle(DrawSrv));
++
+         D3D12_SHADER_RESOURCE_VIEW_DESC materialSrv{};
+         materialSrv.Format = gpu::kMaterialFormat;
+         materialSrv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+@@ -572,10 +561,6 @@ lgp::framework::Status Renderer::CreateSizeDependentResources(lgp::framework::Ex
+         slot.diagnostics = std::move(*diagnostics);
+         slot.diagnosticsReadback = std::move(*diagnosticsReadback);
+ 
+-        D3D12_SHADER_RESOURCE_VIEW_DESC structuredSrv{};
+-        structuredSrv.ViewDimension = D3D12_SRV_DIMENSION_BUFFER;
+-        structuredSrv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+-        structuredSrv.Format = DXGI_FORMAT_UNKNOWN;
+         structuredSrv.Buffer.NumElements = gpu::kMaximumLightCount;
+         structuredSrv.Buffer.StructureByteStride = sizeof(gpu::PointLightData);
+         deviceResources_->device()->CreateShaderResourceView(slot.lights.Get(), &structuredSrv,
+@@ -596,12 +581,20 @@ lgp::framework::Status Renderer::CreateSizeDependentResources(lgp::framework::Ex
+         diagnosticsUav.Buffer.StructureByteStride = sizeof(gpu::PixelDiagnostics);
+         deviceResources_->device()->CreateUnorderedAccessView(slot.diagnostics.Get(), nullptr, &diagnosticsUav,
+                                                               slot.descriptors.CpuHandle(DiagnosticsUav));
++
++        auto visibilityReadback = gpu::CreateTextureReadbackBuffer(
++            *deviceResources_->device(), slot.visibility->GetDesc(), L"Ch15 Starter visibility readback");
+         auto depthReadback = gpu::CreateTextureReadbackBuffer(*deviceResources_->device(), slot.depth->GetDesc(),
+                                                               L"Ch15 Starter depth readback");
++        if (!visibilityReadback)
++        {
++            return std::unexpected(visibilityReadback.error());
++        }
+         if (!depthReadback)
+         {
+             return std::unexpected(depthReadback.error());
+         }
++        slot.visibilityReadback = std::move(*visibilityReadback);
+         slot.depthReadback = std::move(*depthReadback);
+     }
+     return {};
+@@ -629,10 +622,9 @@ lgp::framework::Status Renderer::Initialize(lgp::framework::ApplicationInitConte
+     {
+         return status;
+     }
+-    auto rtvHeap = lgp::framework::CreateDescriptorHeap(*deviceResources_->device(), D3D12_DESCRIPTOR_HEAP_TYPE_RTV,
+-                                                        deviceResources_->back_buffer_count() *
+-                                                            static_cast<UINT>(gpu::kWideGBufferCount),
+-                                                        false, L"Ch15 Starter RTV heap");
++    auto rtvHeap =
++        lgp::framework::CreateDescriptorHeap(*deviceResources_->device(), D3D12_DESCRIPTOR_HEAP_TYPE_RTV,
++                                             deviceResources_->back_buffer_count(), false, L"Ch15 Starter RTV heap");
+     auto dsvHeap =
+         lgp::framework::CreateDescriptorHeap(*deviceResources_->device(), D3D12_DESCRIPTOR_HEAP_TYPE_DSV,
+                                              deviceResources_->back_buffer_count(), false, L"Ch15 Starter DSV heap");
+@@ -708,7 +700,8 @@ lgp::framework::Status Renderer::Render(lgp::framework::FrameContext const &fram
+     if (frameContext.commandList == nullptr || frameContext.renderTarget == nullptr ||
+         frameContext.frameSlot >= frameSlots_.size() || frameContext.renderTargetFormat != gpu::kOutputFormat)
+     {
+-        return std::unexpected(lgp::framework::MakeError("Render", "The Chapter 15 Starter frame context is invalid."));
++        return std::unexpected(
++            lgp::framework::MakeError("Render", "The Chapter 15 Starter frame context is invalid."));
+     }
+     if (auto const extent = gpu::ValidateExtent(frameContext.drawableSize); !extent)
+     {
+@@ -804,16 +797,11 @@ lgp::framework::Status Renderer::Render(lgp::framework::FrameContext const &fram
+     commandList.IASetVertexBuffers(0U, 1U, &mesh_.vertexView);
+     commandList.IASetIndexBuffer(&mesh_.indexView);
+ 
+-    std::vector<D3D12_TEXTURE_BARRIER> textureBarriers{};
+-    textureBarriers.reserve(gpu::kWideGBufferCount + 3U);
+-    for (ComPtr<ID3D12Resource> const &texture : slot.gbuffer)
+-    {
+-        textureBarriers.push_back(
+-            gpu::MakeTextureBarrier(*texture.Get(), gpu::CommonState(), gpu::RenderTargetState()));
+-    }
+-    textureBarriers.push_back(gpu::MakeTextureBarrier(*slot.depth.Get(), gpu::CommonState(), gpu::DepthWriteState()));
+-    textureBarriers.push_back(
+-        gpu::MakeTextureBarrier(*slot.output.Get(), gpu::CommonState(), gpu::UnorderedAccessState()));
++    std::vector<D3D12_TEXTURE_BARRIER> textureBarriers{
++        gpu::MakeTextureBarrier(*slot.visibility.Get(), gpu::CommonState(), gpu::RenderTargetState()),
++        gpu::MakeTextureBarrier(*slot.depth.Get(), gpu::CommonState(), gpu::DepthWriteState()),
++        gpu::MakeTextureBarrier(*slot.output.Get(), gpu::CommonState(), gpu::UnorderedAccessState()),
++    };
+     gpu::SubmitTextureBarriers(commandList, textureBarriers);
+     std::vector<D3D12_BUFFER_BARRIER> bufferBarriers{
+         gpu::MakeBufferBarrier(*slot.diagnostics.Get(),
+@@ -822,24 +810,16 @@ lgp::framework::Status Renderer::Render(lgp::framework::FrameContext const &fram
+     };
+     gpu::SubmitBufferBarriers(commandList, bufferBarriers);
+ 
+-    float const clearColor[]{0.0F, 0.0F, 0.0F, 0.0F};
+-    for (std::size_t index = 0U; index < slot.gbuffer.size(); ++index)
+-    {
+-        commandList.ClearRenderTargetView(slot.rtvs.CpuHandle(static_cast<UINT>(index)), clearColor, 0U, nullptr);
+-    }
++    float const clearVisibility[]{0.0F, 0.0F, 0.0F, 0.0F};
++    commandList.ClearRenderTargetView(slot.rtv.CpuHandle(), clearVisibility, 0U, nullptr);
+     commandList.ClearDepthStencilView(slot.dsv.CpuHandle(), D3D12_CLEAR_FLAG_DEPTH,
+                                       gpu::DepthClearValue(configuration.depthConvention), 0U, 0U, nullptr);
+-    std::array<D3D12_CPU_DESCRIPTOR_HANDLE, gpu::kWideGBufferCount> renderTargets{};
+-    for (std::size_t index = 0U; index < renderTargets.size(); ++index)
+-    {
+-        renderTargets[index] = slot.rtvs.CpuHandle(static_cast<UINT>(index));
+-    }
++    D3D12_CPU_DESCRIPTOR_HANDLE const visibilityRtv = slot.rtv.CpuHandle();
+     D3D12_CPU_DESCRIPTOR_HANDLE const dsv = slot.dsv.CpuHandle();
+-    commandList.OMSetRenderTargets(static_cast<UINT>(renderTargets.size()), renderTargets.data(), FALSE, &dsv);
++    commandList.OMSetRenderTargets(1U, &visibilityRtv, FALSE, &dsv);
+     commandList.SetGraphicsRootSignature(graphicsRootSignature_.Get());
+     commandList.SetGraphicsRoot32BitConstants(GraphicsFrameConstants, sizeof(constants) / sizeof(std::uint32_t),
+                                               &constants, 0U);
+-    commandList.SetGraphicsRootDescriptorTable(GraphicsMaterialTable, slot.descriptors.GpuHandle(MaterialSrv));
+     commandList.SetPipelineState(configuration.depthConvention == gpu::DepthConvention::Forward
+                                      ? rasterForwardPipeline_.Get()
+                                      : rasterReversedPipeline_.Get());
+@@ -866,37 +846,29 @@ lgp::framework::Status Renderer::Render(lgp::framework::FrameContext const &fram
+                                          static_cast<INT>(draw.range.vertexOffset), 0U);
+     }
+ 
+-    textureBarriers.clear();
+-    for (ComPtr<ID3D12Resource> const &texture : slot.gbuffer)
+-    {
+-        textureBarriers.push_back(
+-            gpu::MakeTextureBarrier(*texture.Get(), gpu::RenderTargetState(), gpu::ComputeShaderResourceState()));
+-    }
+-    textureBarriers.push_back(
+-        gpu::MakeTextureBarrier(*slot.depth.Get(), gpu::DepthWriteState(), gpu::ComputeShaderResourceState()));
++    textureBarriers = {
++        gpu::MakeTextureBarrier(*slot.visibility.Get(), gpu::RenderTargetState(), gpu::ComputeShaderResourceState()),
++        gpu::MakeTextureBarrier(*slot.depth.Get(), gpu::DepthWriteState(), gpu::ComputeShaderResourceState()),
++    };
+     gpu::SubmitTextureBarriers(commandList, textureBarriers);
+ 
+     commandList.SetComputeRootSignature(computeRootSignature_.Get());
+     commandList.SetComputeRoot32BitConstants(ComputeFrameConstants, sizeof(constants) / sizeof(std::uint32_t),
+                                              &constants, 0U);
+-    commandList.SetComputeRootDescriptorTable(ComputeSurfaceTable, slot.descriptors.GpuHandle(PositionSrv));
++    commandList.SetComputeRootDescriptorTable(ComputeInputTable, slot.descriptors.GpuHandle(VisibilitySrv));
+     commandList.SetComputeRootDescriptorTable(ComputeLightTable, slot.descriptors.GpuHandle(LightSrv));
+     commandList.SetComputeRootDescriptorTable(ComputeUavTable, slot.descriptors.GpuHandle(OutputUav));
+     commandList.SetPipelineState(shadePipeline_.Get());
+     commandList.Dispatch((frameContext.drawableSize.width + 7U) / 8U, (frameContext.drawableSize.height + 7U) / 8U, 1U);
+ 
+-    textureBarriers.clear();
+-    for (ComPtr<ID3D12Resource> const &texture : slot.gbuffer)
+-    {
+-        textureBarriers.push_back(
+-            gpu::MakeTextureBarrier(*texture.Get(), gpu::ComputeShaderResourceState(), gpu::CommonState()));
+-    }
+-    textureBarriers.push_back(
+-        gpu::MakeTextureBarrier(*slot.depth.Get(), gpu::ComputeShaderResourceState(), gpu::CopySourceTextureState()));
+-    textureBarriers.push_back(
+-        gpu::MakeTextureBarrier(*slot.output.Get(), gpu::UnorderedAccessState(), gpu::CopySourceTextureState()));
+-    textureBarriers.push_back(gpu::MakeTextureBarrier(*frameContext.renderTarget, gpu::FrameStartState(frameContext),
+-                                                      gpu::CopyDestTextureState()));
++    textureBarriers = {
++        gpu::MakeTextureBarrier(*slot.visibility.Get(), gpu::ComputeShaderResourceState(),
++                                gpu::CopySourceTextureState()),
++        gpu::MakeTextureBarrier(*slot.depth.Get(), gpu::ComputeShaderResourceState(), gpu::CopySourceTextureState()),
++        gpu::MakeTextureBarrier(*slot.output.Get(), gpu::UnorderedAccessState(), gpu::CopySourceTextureState()),
++        gpu::MakeTextureBarrier(*frameContext.renderTarget, gpu::FrameStartState(frameContext),
++                                gpu::CopyDestTextureState()),
++    };
+     gpu::SubmitTextureBarriers(commandList, textureBarriers);
+     bufferBarriers = {
+         gpu::MakeBufferBarrier(*slot.diagnostics.Get(), gpu::ComputeUnorderedAccessState(),
+@@ -905,12 +877,14 @@ lgp::framework::Status Renderer::Render(lgp::framework::FrameContext const &fram
+     gpu::SubmitBufferBarriers(commandList, bufferBarriers);
+ 
+     commandList.CopyResource(frameContext.renderTarget, slot.output.Get());
++    gpu::CopyTextureToReadback(commandList, *slot.visibility.Get(), slot.visibilityReadback);
+     gpu::CopyTextureToReadback(commandList, *slot.depth.Get(), slot.depthReadback);
+     std::uint64_t const diagnosticBytes = static_cast<std::uint64_t>(frameContext.drawableSize.width) *
+                                           frameContext.drawableSize.height * sizeof(gpu::PixelDiagnostics);
+     commandList.CopyBufferRegion(slot.diagnosticsReadback.Get(), 0U, slot.diagnostics.Get(), 0U, diagnosticBytes);
+ 
+     textureBarriers = {
++        gpu::MakeTextureBarrier(*slot.visibility.Get(), gpu::CopySourceTextureState(), gpu::CommonState()),
+         gpu::MakeTextureBarrier(*slot.depth.Get(), gpu::CopySourceTextureState(), gpu::CommonState()),
+         gpu::MakeTextureBarrier(*slot.output.Get(), gpu::CopySourceTextureState(), gpu::CommonState()),
+         gpu::MakeTextureBarrier(*frameContext.renderTarget, gpu::CopyDestTextureState(),
+@@ -971,6 +945,8 @@ std::expected<Renderer::ReadbackOutputs, lgp::framework::Error> Renderer::ReadBa
+     auto diagnostics = gpu::ResolveDiagnostics(slot.diagnosticsReadback, lastRenderedPixelCount_);
+     auto depth =
+         gpu::ResolveTextureReadback(slot.depthReadback, deviceResources_->drawable_size(), gpu::kDepthResourceFormat);
++    auto visibility =
++        gpu::ResolveTextureReadback(slot.visibilityReadback, deviceResources_->drawable_size(), gpu::kVisibilityFormat);
+     if (!lists)
+     {
+         return std::unexpected(lists.error());
+@@ -983,6 +959,10 @@ std::expected<Renderer::ReadbackOutputs, lgp::framework::Error> Renderer::ReadBa
+     {
+         return std::unexpected(depth.error());
+     }
++    if (!visibility)
++    {
++        return std::unexpected(visibility.error());
++    }
+     return ReadbackOutputs{
+         .configuration = lastConfiguration_,
+         .projection = lastProjection_,
+@@ -990,7 +970,7 @@ std::expected<Renderer::ReadbackOutputs, lgp::framework::Error> Renderer::ReadBa
+         .lights = currentLights_,
+         .diagnostics = std::move(*diagnostics),
+         .depth = std::move(*depth),
+-        .visibility = std::nullopt,
++        .visibility = std::move(*visibility),
+         .frameSlot = lastRenderedFrameSlot_,
+     };
+ }
+diff --git "a/chapters/visibility-buffers-and-material-evaluation/Starter/Renderer.hpp" "b/chapters/visibility-buffers-and-material-evaluation/Starter/Renderer.hpp"
+index 23bd33e..f83b42f 100644
+--- "a/chapters/visibility-buffers-and-material-evaluation/Starter/Renderer.hpp"
++++ "b/chapters/visibility-buffers-and-material-evaluation/Starter/Renderer.hpp"
+@@ -6,7 +6,6 @@
+ #include <lgp/framework/descriptors.hpp>
+ #include <lgp/framework/shader_compiler.hpp>
+ 
+-#include <array>
+ #include <expected>
+ #include <optional>
+ #include <vector>
+@@ -49,13 +48,14 @@ class Renderer final : public lgp::framework::IChapterRenderer
+     {
+         gpu::BufferResource vertices{};
+         gpu::BufferResource indices{};
++        gpu::BufferResource draws{};
+         D3D12_VERTEX_BUFFER_VIEW vertexView{};
+         D3D12_INDEX_BUFFER_VIEW indexView{};
+     };
+ 
+     struct FrameSlotResources final
+     {
+-        std::array<Microsoft::WRL::ComPtr<ID3D12Resource>, gpu::kWideGBufferCount> gbuffer{};
++        Microsoft::WRL::ComPtr<ID3D12Resource> visibility{};
+         Microsoft::WRL::ComPtr<ID3D12Resource> depth{};
+         Microsoft::WRL::ComPtr<ID3D12Resource> output{};
+         gpu::BufferResource lights{};
+@@ -63,8 +63,9 @@ class Renderer final : public lgp::framework::IChapterRenderer
+         gpu::BufferResource lightIndices{};
+         gpu::BufferResource diagnostics{};
+         gpu::BufferResource diagnosticsReadback{};
++        gpu::TextureReadbackBuffer visibilityReadback{};
+         gpu::TextureReadbackBuffer depthReadback{};
+-        lgp::framework::DescriptorAllocation rtvs{};
++        lgp::framework::DescriptorAllocation rtv{};
+         lgp::framework::DescriptorAllocation dsv{};
+         lgp::framework::DescriptorAllocation descriptors{};
+         bool diagnosticsInitialized{};
+diff --git "a/chapters/visibility-buffers-and-material-evaluation/Starter/VisibilityBufferLab.hlsl" "b/chapters/visibility-buffers-and-material-evaluation/Starter/VisibilityBufferLab.hlsl"
+index cd4c427..76ca1b5 100644
+--- "a/chapters/visibility-buffers-and-material-evaluation/Starter/VisibilityBufferLab.hlsl"
++++ "b/chapters/visibility-buffers-and-material-evaluation/Starter/VisibilityBufferLab.hlsl"
+@@ -7,16 +7,21 @@ struct RasterDrawConstants
+     float4 materialParameters;
+ };
+ 
++struct VertexData
++{
++    float3 position;
++    float3 normal;
++    float4 tangent;
++    float2 textureCoordinates;
++};
++
+ ConstantBuffer<RasterDrawConstants> gDraw : register(b1);
+-Texture2D<float4> gPositionRoughness : register(t0);
+-Texture2D<float4> gNormalMetalness : register(t1);
+-Texture2D<float4> gTangent : register(t2);
+-Texture2D<float4> gBaseColor : register(t3);
+-Texture2D<float2> gTextureCoordinates : register(t4);
+-Texture2D<float4> gTextureGradients : register(t5);
+-Texture2D<uint2> gIdentity : register(t6);
+-Texture2D<float> gDepth : register(t7);
+-Texture2D<float4> gMaterialTexture : register(t8);
++Texture2D<uint2> gVisibility : register(t0);
++Texture2D<float> gDepth : register(t1);
++StructuredBuffer<VertexData> gVertices : register(t2);
++StructuredBuffer<uint> gIndices : register(t3);
++StructuredBuffer<DrawData> gDraws : register(t4);
++Texture2D<float4> gMaterialTexture : register(t5);
+ RWTexture2D<float4> gOutput : register(u0);
+ RWStructuredBuffer<PixelDiagnostics> gDiagnostics : register(u1);
+ SamplerState gMaterialSampler : register(s0);
+@@ -24,58 +29,17 @@ SamplerState gMaterialSampler : register(s0);
+ struct VertexInput
+ {
+     float3 position : POSITION;
+-    float3 normal : NORMAL;
+-    float4 tangent : TANGENT;
+-    float2 textureCoordinates : TEXCOORD0;
+ };
+ 
+ struct RasterVertexOutput
+ {
+     float4 position : SV_Position;
+-    float3 viewPosition : POSITION0;
+-    float3 normal : NORMAL0;
+-    float4 tangent : TANGENT0;
+-    float2 textureCoordinates : TEXCOORD0;
+-};
+-
+-struct GBufferOutput
+-{
+-    float4 positionRoughness : SV_Target0;
+-    float4 normalMetalness : SV_Target1;
+-    float4 tangent : SV_Target2;
+-    float4 baseColor : SV_Target3;
+-    float2 textureCoordinates : SV_Target4;
+-    float4 textureGradients : SV_Target5;
+-    uint2 identity : SV_Target6;
+ };
+ 
+ RasterVertexOutput RasterVS(VertexInput input)
+ {
+     RasterVertexOutput output;
+     output.position = mul(float4(input.position, 1.0), gFrame.projection);
+-    output.viewPosition = input.position;
+-    output.normal = input.normal;
+-    output.tangent = input.tangent;
+-    output.textureCoordinates = input.textureCoordinates;
+-    return output;
+-}
+-
+-GBufferOutput RasterPS(RasterVertexOutput input, uint primitiveIdentifier : SV_PrimitiveID)
+-{
+-    GBufferOutput output;
+-    float2 textureDdx = ddx(input.textureCoordinates);
+-    float2 textureDdy = ddy(input.textureCoordinates);
+-    float3 material = gMaterialTexture.Sample(gMaterialSampler, input.textureCoordinates).rgb;
+-    float3 normal = normalize(input.normal);
+-    float3 tangent = normalize(input.tangent.xyz - normal * dot(normal, input.tangent.xyz));
+-
+-    output.positionRoughness = float4(input.viewPosition, gDraw.baseTintAndRoughness.w);
+-    output.normalMetalness = float4(normal, gDraw.materialParameters.x);
+-    output.tangent = float4(tangent, input.tangent.w);
+-    output.baseColor = float4(material * gDraw.baseTintAndRoughness.rgb, 1.0);
+-    output.textureCoordinates = input.textureCoordinates;
+-    output.textureGradients = float4(textureDdx, textureDdy);
+-    output.identity = uint2(gDraw.identifiers.x, primitiveIdentifier);
+     return output;
+ }
+ 
+@@ -108,6 +72,41 @@ uint2 VisibilityPS(uint primitiveIdentifier : SV_PrimitiveID,
+     return uint2(word0, word1);
+ }
+ 
++bool DecodeVisibility(uint2 record, out uint drawIdentifier, out uint primitiveIdentifier,
++                      out float3 screenBarycentrics)
++{
++    static const uint MaximumBarycentric = 16383u;
++    drawIdentifier = record.x & 0xffffu;
++    uint primitiveLow = record.x >> 16u;
++    uint primitiveHigh = record.y & 0xfu;
++    primitiveIdentifier = primitiveLow | (primitiveHigh << 16u);
++    uint first = (record.y >> 4u) & MaximumBarycentric;
++    uint second = (record.y >> 18u) & MaximumBarycentric;
++    if (drawIdentifier == 0u || first + second > MaximumBarycentric)
++    {
++        screenBarycentrics = 0.0;
++        return false;
++    }
++    screenBarycentrics =
++        float3(float(first), float(second), float(MaximumBarycentric - first - second)) /
++        float(MaximumBarycentric);
++    return true;
++}
++
++bool ResolveTriangleUnchecked(uint drawIdentifier, uint primitiveIdentifier, out DrawData draw,
++                              out VertexData vertices[3])
++{
++    draw = gDraws[drawIdentifier - 1u];
++    uint triangleOffset = draw.indexOffset + primitiveIdentifier * 3u;
++    [unroll]
++    for (uint corner = 0u; corner < 3u; ++corner)
++    {
++        uint localVertex = gIndices[triangleOffset + corner];
++        vertices[corner] = gVertices[draw.vertexOffset + localVertex];
++    }
++    return true;
++}
++
+ void StoreBackground(uint2 pixel, uint linearIndex)
+ {
+     gOutput[pixel] = float4(0.0, 0.0, 0.0, 1.0);
+@@ -134,53 +133,76 @@ void ShadeCS(uint3 dispatchThreadId : SV_DispatchThreadID)
+         return;
+     }
+     uint linearIndex = pixel.y * gFrame.dimensions.x + pixel.x;
+-    float depth = gDepth.Load(int3(pixel, 0));
+-    float backgroundDepth = gFrame.slicing.w == 0.0 ? 1.0 : 0.0;
+-    if (depth == backgroundDepth)
++    uint2 record = gVisibility.Load(int3(pixel, 0));
++    if (all(record == 0u))
+     {
+         StoreBackground(pixel, linearIndex);
+         return;
+     }
+ 
+-    float4 positionRoughness = gPositionRoughness.Load(int3(pixel, 0));
+-    float4 normalMetalness = gNormalMetalness.Load(int3(pixel, 0));
+-    float4 tangent = gTangent.Load(int3(pixel, 0));
+-    float3 baseColor = gBaseColor.Load(int3(pixel, 0)).rgb;
+-    float2 uv = gTextureCoordinates.Load(int3(pixel, 0));
+-    float4 gradients = gTextureGradients.Load(int3(pixel, 0));
+-    uint2 identity = gIdentity.Load(int3(pixel, 0));
+-    if (identity.x == 0u || identity.x > gFrame.counts.x || identity.y >= 64u)
++    uint drawIdentifier;
++    uint primitiveIdentifier;
++    float3 screenBarycentrics;
++    if (!DecodeVisibility(record, drawIdentifier, primitiveIdentifier, screenBarycentrics))
++    {
++        StoreInvalid(pixel, linearIndex, drawIdentifier, primitiveIdentifier);
++        return;
++    }
++
++    DrawData draw;
++    VertexData vertices[3];
++    if (!ResolveTriangleUnchecked(drawIdentifier, primitiveIdentifier, draw, vertices))
++    {
++        StoreInvalid(pixel, linearIndex, drawIdentifier, primitiveIdentifier);
++        return;
++    }
++    float backgroundDepth = gFrame.slicing.w == 0.0 ? 1.0 : 0.0;
++    if (gDepth.Load(int3(pixel, 0)) == backgroundDepth)
+     {
+-        StoreInvalid(pixel, linearIndex, identity.x, identity.y);
++        StoreInvalid(pixel, linearIndex, drawIdentifier, primitiveIdentifier);
+         return;
+     }
+ 
++    float3 weights = screenBarycentrics;
++    float3 viewPosition =
++        weights.x * vertices[0].position + weights.y * vertices[1].position + weights.z * vertices[2].position;
++    float3 normal =
++        normalize(weights.x * vertices[0].normal + weights.y * vertices[1].normal + weights.z * vertices[2].normal);
++    float3 tangentDirection = normalize(weights.x * vertices[0].tangent.xyz +
++                                        weights.y * vertices[1].tangent.xyz +
++                                        weights.z * vertices[2].tangent.xyz);
++    float handedness = vertices[0].tangent.w;
++    float2 uv = weights.x * vertices[0].textureCoordinates + weights.y * vertices[1].textureCoordinates +
++                weights.z * vertices[2].textureCoordinates;
++    float2 textureDdx = 0.0;
++    float2 textureDdy = 0.0;
++    float3 baseColor = gMaterialTexture.SampleLevel(gMaterialSampler, uv, 0.0).rgb * draw.baseTintAndRoughness.rgb;
+     uint clusterIndex;
+-    if (!ComputeClusterIndex(pixel, positionRoughness.z, clusterIndex))
++    if (!ComputeClusterIndex(pixel, viewPosition.z, clusterIndex))
+     {
+-        StoreInvalid(pixel, linearIndex, identity.x, identity.y);
++        StoreInvalid(pixel, linearIndex, drawIdentifier, primitiveIdentifier);
+         return;
+     }
+     float3 linearColor;
+-    if (!ShadeCluster(clusterIndex, positionRoughness.xyz, normalize(normalMetalness.xyz), baseColor,
+-                      positionRoughness.w, normalMetalness.w, linearColor))
++    if (!ShadeCluster(clusterIndex, viewPosition, normal, baseColor, draw.baseTintAndRoughness.w,
++                      draw.materialParameters.x, linearColor))
+     {
+-        StoreInvalid(pixel, linearIndex, identity.x, identity.y);
++        StoreInvalid(pixel, linearIndex, drawIdentifier, primitiveIdentifier);
+         return;
+     }
+ 
+     gOutput[pixel] =
+-        DebugOutput(linearColor, uv, gradients.xy, gradients.zw, identity.x, identity.y);
++        DebugOutput(linearColor, uv, textureDdx, textureDdy, drawIdentifier, primitiveIdentifier);
+     PixelDiagnostics diagnostics = (PixelDiagnostics)0;
+-    diagnostics.viewPosition = positionRoughness.xyz;
++    diagnostics.viewPosition = viewPosition;
+     diagnostics.status = 1u;
+-    diagnostics.normal = normalize(normalMetalness.xyz);
+-    diagnostics.drawIdentifier = identity.x;
+-    diagnostics.tangent = tangent;
++    diagnostics.normal = normal;
++    diagnostics.drawIdentifier = drawIdentifier;
++    diagnostics.tangent = float4(tangentDirection, handedness);
+     diagnostics.textureCoordinates = uv;
+-    diagnostics.textureDdx = gradients.xy;
+-    diagnostics.textureDdy = gradients.zw;
+-    diagnostics.primitiveIdentifier = identity.y;
++    diagnostics.textureDdx = textureDdx;
++    diagnostics.textureDdy = textureDdy;
++    diagnostics.primitiveIdentifier = primitiveIdentifier;
+     diagnostics.clusterIndex = clusterIndex;
+     gDiagnostics[linearIndex] = diagnostics;
+ }

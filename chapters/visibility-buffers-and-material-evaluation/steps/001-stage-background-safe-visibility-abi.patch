@@ -1,0 +1,103 @@
+diff --git "a/chapters/visibility-buffers-and-material-evaluation/Starter/Renderer.cpp" "b/chapters/visibility-buffers-and-material-evaluation/Starter/Renderer.cpp"
+index 1278dad..e89dd4b 100644
+--- "a/chapters/visibility-buffers-and-material-evaluation/Starter/Renderer.cpp"
++++ "b/chapters/visibility-buffers-and-material-evaluation/Starter/Renderer.cpp"
+@@ -163,6 +163,35 @@ constexpr std::array<DXGI_FORMAT, gpu::kWideGBufferCount> kGBufferFormats{
+ 
+ } // namespace
+ 
++lgp::framework::Status Renderer::ValidateRequiredFeatures()
++{
++    D3D12_FEATURE_DATA_D3D12_OPTIONS3 options{};
++    HRESULT const optionsResult =
++        deviceResources_->device()->CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS3, &options, sizeof(options));
++    if (FAILED(optionsResult))
++    {
++        return std::unexpected(
++            lgp::framework::MakeHResultError("ID3D12Device::CheckFeatureSupport", optionsResult,
++                                             "Failed to query the Chapter 15 barycentrics capability."));
++    }
++    if (!options.BarycentricsSupported)
++    {
++        return std::unexpected(
++            lgp::framework::MakeError("ID3D12Device::CheckFeatureSupport",
++                                      "Chapter 15 Starter requires native pixel-shader SV_Barycentrics support."));
++    }
++
++    D3D12_FEATURE_DATA_SHADER_MODEL shaderModel{D3D_SHADER_MODEL_6_1};
++    HRESULT const shaderModelResult =
++        deviceResources_->device()->CheckFeatureSupport(D3D12_FEATURE_SHADER_MODEL, &shaderModel, sizeof(shaderModel));
++    if (FAILED(shaderModelResult) || shaderModel.HighestShaderModel < D3D_SHADER_MODEL_6_1)
++    {
++        return std::unexpected(lgp::framework::MakeError("ID3D12Device::CheckFeatureSupport",
++                                                         "Chapter 15 Starter requires Shader Model 6.1 or newer."));
++    }
++    return {};
++}
++
+ lgp::framework::Status Renderer::CreateShaders()
+ {
+     auto compilerResult = lgp::framework::ShaderCompiler::Create();
+@@ -596,6 +625,10 @@ lgp::framework::Status Renderer::Initialize(lgp::framework::ApplicationInitConte
+ {
+     deviceResources_ = &context.deviceResources;
+     headless_ = context.commandLine.headless;
++    if (auto status = ValidateRequiredFeatures(); !status)
++    {
++        return status;
++    }
+     auto rtvHeap = lgp::framework::CreateDescriptorHeap(*deviceResources_->device(), D3D12_DESCRIPTOR_HEAP_TYPE_RTV,
+                                                         deviceResources_->back_buffer_count() *
+                                                             static_cast<UINT>(gpu::kWideGBufferCount),
+diff --git "a/chapters/visibility-buffers-and-material-evaluation/Starter/Renderer.hpp" "b/chapters/visibility-buffers-and-material-evaluation/Starter/Renderer.hpp"
+index ad46726..23bd33e 100644
+--- "a/chapters/visibility-buffers-and-material-evaluation/Starter/Renderer.hpp"
++++ "b/chapters/visibility-buffers-and-material-evaluation/Starter/Renderer.hpp"
+@@ -70,6 +70,7 @@ class Renderer final : public lgp::framework::IChapterRenderer
+         bool diagnosticsInitialized{};
+     };
+ 
++    [[nodiscard]] lgp::framework::Status ValidateRequiredFeatures();
+     [[nodiscard]] lgp::framework::Status CreateShaders();
+     [[nodiscard]] lgp::framework::Status CreateRootSignatures();
+     [[nodiscard]] lgp::framework::Status CreatePipelines();
+diff --git "a/chapters/visibility-buffers-and-material-evaluation/Starter/VisibilityBufferLab.hlsl" "b/chapters/visibility-buffers-and-material-evaluation/Starter/VisibilityBufferLab.hlsl"
+index 8825e9f..cd4c427 100644
+--- "a/chapters/visibility-buffers-and-material-evaluation/Starter/VisibilityBufferLab.hlsl"
++++ "b/chapters/visibility-buffers-and-material-evaluation/Starter/VisibilityBufferLab.hlsl"
+@@ -79,6 +79,35 @@ GBufferOutput RasterPS(RasterVertexOutput input, uint primitiveIdentifier : SV_P
+     return output;
+ }
+ 
++uint2 VisibilityPS(uint primitiveIdentifier : SV_PrimitiveID,
++                   noperspective float3 screenBarycentrics : SV_Barycentrics) : SV_Target0
++{
++    static const uint MaximumBarycentric = 16383u;
++    float3 canonical = max(screenBarycentrics, 0.0);
++    canonical /= canonical.x + canonical.y + canonical.z;
++    float scaledFirst = canonical.x * float(MaximumBarycentric);
++    float scaledSecond = canonical.y * float(MaximumBarycentric);
++    uint first = uint(floor(scaledFirst + 0.5));
++    uint second = uint(floor(scaledSecond + 0.5));
++    if (first + second > MaximumBarycentric)
++    {
++        float firstError = float(first) - scaledFirst;
++        float secondError = float(second) - scaledSecond;
++        if (first > 0u && (second == 0u || firstError >= secondError))
++        {
++            --first;
++        }
++        else
++        {
++            --second;
++        }
++    }
++
++    uint word0 = gDraw.identifiers.x | ((primitiveIdentifier & 0xffffu) << 16u);
++    uint word1 = (primitiveIdentifier >> 16u) | (first << 4u) | (second << 18u);
++    return uint2(word0, word1);
++}
++
+ void StoreBackground(uint2 pixel, uint linearIndex)
+ {
+     gOutput[pixel] = float4(0.0, 0.0, 0.0, 1.0);

@@ -1,0 +1,98 @@
+diff --git "a/chapters/visibility-buffers-and-material-evaluation/Starter/VisibilityBufferLab.hlsl" "b/chapters/visibility-buffers-and-material-evaluation/Starter/VisibilityBufferLab.hlsl"
+index 76ca1b5..bb39f18 100644
+--- "a/chapters/visibility-buffers-and-material-evaluation/Starter/VisibilityBufferLab.hlsl"
++++ "b/chapters/visibility-buffers-and-material-evaluation/Starter/VisibilityBufferLab.hlsl"
+@@ -72,6 +72,12 @@ uint2 VisibilityPS(uint primitiveIdentifier : SV_PrimitiveID,
+     return uint2(word0, word1);
+ }
+ 
++bool CheckedAdd(uint left, uint right, out uint result)
++{
++    result = left + right;
++    return result >= left;
++}
++
+ bool DecodeVisibility(uint2 record, out uint drawIdentifier, out uint primitiveIdentifier,
+                       out float3 screenBarycentrics)
+ {
+@@ -93,16 +99,66 @@ bool DecodeVisibility(uint2 record, out uint drawIdentifier, out uint primitiveI
+     return true;
+ }
+ 
+-bool ResolveTriangleUnchecked(uint drawIdentifier, uint primitiveIdentifier, out DrawData draw,
+-                              out VertexData vertices[3])
++bool ResolveTriangle(uint drawIdentifier, uint primitiveIdentifier, out DrawData draw,
++                     out VertexData vertices[3])
+ {
++    uint drawBufferCount;
++    uint drawStride;
++    uint vertexBufferCount;
++    uint vertexStride;
++    uint indexBufferCount;
++    uint indexStride;
++    gDraws.GetDimensions(drawBufferCount, drawStride);
++    gVertices.GetDimensions(vertexBufferCount, vertexStride);
++    gIndices.GetDimensions(indexBufferCount, indexStride);
++    if (drawIdentifier == 0u || drawIdentifier > gFrame.counts.x || drawIdentifier > drawBufferCount ||
++        drawIdentifier > 4u)
++    {
++        return false;
++    }
++
+     draw = gDraws[drawIdentifier - 1u];
+-    uint triangleOffset = draw.indexOffset + primitiveIdentifier * 3u;
++    if (draw.vertexCount == 0u || draw.indexCount == 0u || draw.indexCount % 3u != 0u ||
++        draw.vertexCount > 64u || draw.indexCount > 192u)
++    {
++        return false;
++    }
++    uint vertexEnd;
++    uint indexEnd;
++    if (!CheckedAdd(draw.vertexOffset, draw.vertexCount, vertexEnd) ||
++        !CheckedAdd(draw.indexOffset, draw.indexCount, indexEnd) || vertexEnd > gFrame.counts.y ||
++        vertexEnd > vertexBufferCount || indexEnd > gFrame.counts.z || indexEnd > indexBufferCount ||
++        primitiveIdentifier >= draw.indexCount / 3u || primitiveIdentifier >= 64u)
++    {
++        return false;
++    }
++
++    uint primitiveOffset = primitiveIdentifier * 3u;
++    uint triangleOffset;
++    if (!CheckedAdd(draw.indexOffset, primitiveOffset, triangleOffset))
++    {
++        return false;
++    }
+     [unroll]
+     for (uint corner = 0u; corner < 3u; ++corner)
+     {
+-        uint localVertex = gIndices[triangleOffset + corner];
+-        vertices[corner] = gVertices[draw.vertexOffset + localVertex];
++        uint indexOffset;
++        if (!CheckedAdd(triangleOffset, corner, indexOffset))
++        {
++            return false;
++        }
++        uint localVertex = gIndices[indexOffset];
++        uint absoluteVertex;
++        if (localVertex >= draw.vertexCount || !CheckedAdd(draw.vertexOffset, localVertex, absoluteVertex) ||
++            absoluteVertex >= vertexEnd)
++        {
++            return false;
++        }
++        vertices[corner] = gVertices[absoluteVertex];
++        if (vertices[corner].position.z <= 0.0)
++        {
++            return false;
++        }
+     }
+     return true;
+ }
+@@ -151,7 +207,7 @@ void ShadeCS(uint3 dispatchThreadId : SV_DispatchThreadID)
+ 
+     DrawData draw;
+     VertexData vertices[3];
+-    if (!ResolveTriangleUnchecked(drawIdentifier, primitiveIdentifier, draw, vertices))
++    if (!ResolveTriangle(drawIdentifier, primitiveIdentifier, draw, vertices))
+     {
+         StoreInvalid(pixel, linearIndex, drawIdentifier, primitiveIdentifier);
+         return;

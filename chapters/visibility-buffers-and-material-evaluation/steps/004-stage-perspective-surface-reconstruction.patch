@@ -1,0 +1,58 @@
+diff --git "a/chapters/visibility-buffers-and-material-evaluation/Starter/VisibilityBufferLab.hlsl" "b/chapters/visibility-buffers-and-material-evaluation/Starter/VisibilityBufferLab.hlsl"
+index bb39f18..464b10a 100644
+--- "a/chapters/visibility-buffers-and-material-evaluation/Starter/VisibilityBufferLab.hlsl"
++++ "b/chapters/visibility-buffers-and-material-evaluation/Starter/VisibilityBufferLab.hlsl"
+@@ -163,6 +163,21 @@ bool ResolveTriangle(uint drawIdentifier, uint primitiveIdentifier, out DrawData
+     return true;
+ }
+ 
++bool PerspectiveWeights(float3 screenBarycentrics, VertexData vertices[3], out float3 weights)
++{
++    float3 reciprocalW =
++        float3(1.0 / vertices[0].position.z, 1.0 / vertices[1].position.z, 1.0 / vertices[2].position.z);
++    float3 weighted = screenBarycentrics * reciprocalW;
++    float denominator = weighted.x + weighted.y + weighted.z;
++    if (denominator <= 0.0)
++    {
++        weights = 0.0;
++        return false;
++    }
++    weights = weighted / denominator;
++    return true;
++}
++
+ void StoreBackground(uint2 pixel, uint linearIndex)
+ {
+     gOutput[pixel] = float4(0.0, 0.0, 0.0, 1.0);
+@@ -219,15 +234,27 @@ void ShadeCS(uint3 dispatchThreadId : SV_DispatchThreadID)
+         return;
+     }
+ 
+-    float3 weights = screenBarycentrics;
++    float3 weights;
++    if (!PerspectiveWeights(screenBarycentrics, vertices, weights))
++    {
++        StoreInvalid(pixel, linearIndex, drawIdentifier, primitiveIdentifier);
++        return;
++    }
+     float3 viewPosition =
+         weights.x * vertices[0].position + weights.y * vertices[1].position + weights.z * vertices[2].position;
+     float3 normal =
+         normalize(weights.x * vertices[0].normal + weights.y * vertices[1].normal + weights.z * vertices[2].normal);
+-    float3 tangentDirection = normalize(weights.x * vertices[0].tangent.xyz +
+-                                        weights.y * vertices[1].tangent.xyz +
+-                                        weights.z * vertices[2].tangent.xyz);
++    float3 interpolatedTangent = weights.x * vertices[0].tangent.xyz + weights.y * vertices[1].tangent.xyz +
++                                 weights.z * vertices[2].tangent.xyz;
++    float3 tangentDirection = normalize(interpolatedTangent - normal * dot(normal, interpolatedTangent));
+     float handedness = vertices[0].tangent.w;
++    float3 bitangent = cross(normal, tangentDirection) * handedness;
++    if (dot(bitangent, bitangent) <= 0.0)
++    {
++        StoreInvalid(pixel, linearIndex, drawIdentifier, primitiveIdentifier);
++        return;
++    }
++
+     float2 uv = weights.x * vertices[0].textureCoordinates + weights.y * vertices[1].textureCoordinates +
+                 weights.z * vertices[2].textureCoordinates;
+     float2 textureDdx = 0.0;
