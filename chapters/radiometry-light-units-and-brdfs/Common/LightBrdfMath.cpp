@@ -9,7 +9,7 @@ namespace ch05::lighting
 namespace
 {
 
-inline constexpr float kPi = 3.14159265358979323846F;
+inline constexpr float kBrdfPi = 3.14159265358979323846F;
 inline constexpr float kDirectionLengthTolerance = 1.0e-4F;
 
 [[nodiscard]] bool IsFinite(Float3 value) noexcept
@@ -280,7 +280,7 @@ std::expected<IncidentLight, LightingError> EvaluatePointLight(PointLight const 
 
 LinearRgb LambertDiffuse(LinearRgb baseColor) noexcept
 {
-    return Multiply(baseColor, 1.0F / kPi);
+    return Multiply(baseColor, 1.0F / kBrdfPi);
 }
 
 LinearRgb SchlickFresnel(LinearRgb f0, float vDotH) noexcept
@@ -301,7 +301,7 @@ float GgxTrowbridgeReitzNdf(float nDotH, float roughness) noexcept
     float const alpha = effectiveRoughness * effectiveRoughness;
     float const alphaSquared = alpha * alpha;
     float const denominatorTerm = ((cosine * cosine) * (alphaSquared - 1.0F)) + 1.0F;
-    return alphaSquared / (kPi * denominatorTerm * denominatorTerm);
+    return alphaSquared / (kBrdfPi * denominatorTerm * denominatorTerm);
 }
 
 float SmithGgxMaskingShadowing(float nDotV, float nDotL, float roughness) noexcept

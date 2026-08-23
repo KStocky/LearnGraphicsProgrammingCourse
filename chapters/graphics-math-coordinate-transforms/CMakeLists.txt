@@ -112,6 +112,7 @@ add_library(
 target_link_libraries(
     ch01_graphics_math_starter_logic
     PUBLIC
+        ch01_graphics_math_common
         LGP::Framework
         Microsoft::DirectXMath)
 
@@ -148,6 +149,7 @@ add_library(
 target_link_libraries(
     ch01_graphics_math_solution_logic
     PUBLIC
+        ch01_graphics_math_common
         LGP::Framework
         Microsoft::DirectXMath)
 

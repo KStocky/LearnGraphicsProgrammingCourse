@@ -8,7 +8,7 @@ namespace ch05::lighting
 namespace
 {
 
-inline constexpr float kPi = 3.14159265358979323846F;
+inline constexpr float kGeometryPi = 3.14159265358979323846F;
 inline constexpr std::size_t kMaximumVertexCount = 4U * 1024U * 1024U;
 inline constexpr std::size_t kMaximumIndexCount = 24U * 1024U * 1024U;
 
@@ -54,12 +54,13 @@ std::expected<GeometryMesh, GeometryError> GenerateSphere(float radius, std::uin
 
     for (std::uint32_t latitude = 1U; latitude < latitudeSegments; ++latitude)
     {
-        float const theta = kPi * static_cast<float>(latitude) / static_cast<float>(latitudeSegments);
+        float const theta = kGeometryPi * static_cast<float>(latitude) / static_cast<float>(latitudeSegments);
         float const sinTheta = std::sin(theta);
         float const cosTheta = std::cos(theta);
         for (std::uint32_t longitude = 0U; longitude < longitudeSegments; ++longitude)
         {
-            float const phi = 2.0F * kPi * static_cast<float>(longitude) / static_cast<float>(longitudeSegments);
+            float const phi =
+                2.0F * kGeometryPi * static_cast<float>(longitude) / static_cast<float>(longitudeSegments);
             Float3 const normal{sinTheta * std::cos(phi), cosTheta, sinTheta * std::sin(phi)};
             mesh.vertices.push_back({{radius * normal.x, radius * normal.y, radius * normal.z}, normal});
         }
