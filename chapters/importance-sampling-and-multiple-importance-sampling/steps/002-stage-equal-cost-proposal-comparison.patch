@@ -1,0 +1,46 @@
+diff --git a/chapters/importance-sampling-and-multiple-importance-sampling/Starter/ImportanceSamplingLab.hlsl b/chapters/importance-sampling-and-multiple-importance-sampling/Starter/ImportanceSamplingLab.hlsl
+index 0335e8e..6ff723d 100644
+--- a/chapters/importance-sampling-and-multiple-importance-sampling/Starter/ImportanceSamplingLab.hlsl
++++ b/chapters/importance-sampling-and-multiple-importance-sampling/Starter/ImportanceSamplingLab.hlsl
+@@ -143,7 +143,8 @@ void SampleCS(uint3 dispatchThreadId : SV_DispatchThreadID)
+         moments = Moments[pixelIndex];
+         bool simpleCountWouldOverflow =
+             moments.uniformEstimator.sampleCount > 0xFFFFFFFFu - IntegrandEvaluationsPerDispatch ||
+-            moments.matched.sampleCount > 0xFFFFFFFFu - IntegrandEvaluationsPerDispatch;
++            moments.matched.sampleCount > 0xFFFFFFFFu - IntegrandEvaluationsPerDispatch ||
++            moments.mismatched.sampleCount > 0xFFFFFFFFu - IntegrandEvaluationsPerDispatch;
+         if (simpleCountWouldOverflow)
+         {
+             moments.uniformEstimator = EmptyMoments();
+@@ -164,6 +165,12 @@ void SampleCS(uint3 dispatchThreadId : SV_DispatchThreadID)
+         PushContribution(
+             moments.matched,
+             PowerCosineContribution(matchedUnitSample, TargetExponent, TargetExponent));
++
++        uint mismatchedSampleIndex = moments.mismatched.sampleCount;
++        float mismatchedUnitSample = UnitSample(pixelIndex, mismatchedSampleIndex, 2u).x;
++        PushContribution(
++            moments.mismatched,
++            PowerCosineContribution(mismatchedUnitSample, TargetExponent, ProposalExponent));
+     }
+     Moments[pixelIndex] = moments;
+ 
+@@ -177,6 +184,7 @@ void SampleCS(uint3 dispatchThreadId : SV_DispatchThreadID)
+     statistics.status = 0u;
+     statistics.status |= IsFiniteStatistics(statistics.uniformEstimator) ? 1u : 0u;
+     statistics.status |= IsFiniteStatistics(statistics.matched) ? 2u : 0u;
++    statistics.status |= IsFiniteStatistics(statistics.mismatched) ? 4u : 0u;
+     statistics.reserved = 0u;
+     Statistics[pixelIndex] = statistics;
+ }
+@@ -218,6 +226,10 @@ EstimatorStatistics SelectEstimator(PixelStatistics statistics, uint estimatorIn
+     {
+         return statistics.matched;
+     }
++    if (estimatorIndex == 2u)
++    {
++        return statistics.mismatched;
++    }
+     return statistics.uniformEstimator;
+ }
+ 

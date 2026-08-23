@@ -1,0 +1,142 @@
+diff --git a/chapters/importance-sampling-and-multiple-importance-sampling/Starter/ImportanceSamplingLab.hlsl b/chapters/importance-sampling-and-multiple-importance-sampling/Starter/ImportanceSamplingLab.hlsl
+index 80df49d..0335e8e 100644
+--- a/chapters/importance-sampling-and-multiple-importance-sampling/Starter/ImportanceSamplingLab.hlsl
++++ b/chapters/importance-sampling-and-multiple-importance-sampling/Starter/ImportanceSamplingLab.hlsl
+@@ -90,7 +90,7 @@ void PushContribution(inout EstimatorMoments moments, float contribution)
+     moments.sumSquaredDifferences += delta * deltaAfterMeanUpdate;
+ }
+ 
+-EstimatorStatistics Summarize(EstimatorMoments moments)
++EstimatorStatistics Summarize(EstimatorMoments moments, uint evaluationsPerSample)
+ {
+     EstimatorStatistics statistics;
+     statistics.estimate = moments.mean;
+@@ -98,10 +98,29 @@ EstimatorStatistics Summarize(EstimatorMoments moments)
+         moments.sampleCount > 1u ? moments.sumSquaredDifferences / float(moments.sampleCount - 1u) : 0.0;
+     statistics.standardError =
+         moments.sampleCount > 0u ? sqrt(max(statistics.sampleVariance, 0.0) / float(moments.sampleCount)) : 0.0;
+-    statistics.integrandEvaluationCount = moments.sampleCount;
++    statistics.integrandEvaluationCount = moments.sampleCount * evaluationsPerSample;
+     return statistics;
+ }
+ 
++float PowerCosinePdf(float cosine, float proposalExponent)
++{
++    return ((proposalExponent + 1.0) / (2.0 * Pi)) * pow(cosine, proposalExponent);
++}
++
++float PowerCosineContribution(float unitSample, float targetExponent, float proposalExponent)
++{
++    float cosine = pow(unitSample, 1.0 / (proposalExponent + 1.0));
++    float target = pow(cosine, targetExponent);
++    return target / PowerCosinePdf(cosine, proposalExponent);
++}
++
++bool IsFiniteStatistics(EstimatorStatistics statistics)
++{
++    return all(isfinite(float3(statistics.estimate, statistics.sampleVariance, statistics.standardError))) &&
++           statistics.sampleVariance >= 0.0 && statistics.standardError >= 0.0 &&
++           statistics.integrandEvaluationCount > 0u;
++}
++
+ [numthreads(8, 8, 1)]
+ void SampleCS(uint3 dispatchThreadId : SV_DispatchThreadID)
+ {
+@@ -122,9 +141,10 @@ void SampleCS(uint3 dispatchThreadId : SV_DispatchThreadID)
+     else
+     {
+         moments = Moments[pixelIndex];
+-        bool countWouldOverflow =
+-            moments.uniformEstimator.sampleCount > 0xFFFFFFFFu - IntegrandEvaluationsPerDispatch;
+-        if (countWouldOverflow)
++        bool simpleCountWouldOverflow =
++            moments.uniformEstimator.sampleCount > 0xFFFFFFFFu - IntegrandEvaluationsPerDispatch ||
++            moments.matched.sampleCount > 0xFFFFFFFFu - IntegrandEvaluationsPerDispatch;
++        if (simpleCountWouldOverflow)
+         {
+             moments.uniformEstimator = EmptyMoments();
+             moments.matched = EmptyMoments();
+@@ -135,26 +155,28 @@ void SampleCS(uint3 dispatchThreadId : SV_DispatchThreadID)
+ 
+     for (uint localEvaluation = 0u; localEvaluation < IntegrandEvaluationsPerDispatch; ++localEvaluation)
+     {
+-        uint sampleIndex = moments.uniformEstimator.sampleCount;
+-        float cosine = UnitSample(pixelIndex, sampleIndex, 0u).x;
+-        float contribution = 2.0 * Pi * pow(cosine, TargetExponent);
+-        PushContribution(moments.uniformEstimator, contribution);
++        uint uniformSampleIndex = moments.uniformEstimator.sampleCount;
++        float uniformCosine = UnitSample(pixelIndex, uniformSampleIndex, 0u).x;
++        PushContribution(moments.uniformEstimator, 2.0 * Pi * pow(uniformCosine, TargetExponent));
++
++        uint matchedSampleIndex = moments.matched.sampleCount;
++        float matchedUnitSample = UnitSample(pixelIndex, matchedSampleIndex, 1u).x;
++        PushContribution(
++            moments.matched,
++            PowerCosineContribution(matchedUnitSample, TargetExponent, TargetExponent));
+     }
+     Moments[pixelIndex] = moments;
+ 
+     PixelStatistics statistics;
+-    statistics.uniformEstimator = Summarize(moments.uniformEstimator);
+-    statistics.matched = Summarize(moments.matched);
+-    statistics.mismatched = Summarize(moments.mismatched);
+-    statistics.mis = Summarize(moments.mis);
++    statistics.uniformEstimator = Summarize(moments.uniformEstimator, 1u);
++    statistics.matched = Summarize(moments.matched, 1u);
++    statistics.mismatched = Summarize(moments.mismatched, 1u);
++    statistics.mis = Summarize(moments.mis, 1u);
+     statistics.exact = 2.0 * Pi / (TargetExponent + 1.0);
+     statistics.misPairCount = 0u;
+-    statistics.status =
+-        all(isfinite(float3(statistics.uniformEstimator.estimate,
+-                            statistics.uniformEstimator.sampleVariance,
+-                            statistics.uniformEstimator.standardError)))
+-            ? 1u
+-            : 0u;
++    statistics.status = 0u;
++    statistics.status |= IsFiniteStatistics(statistics.uniformEstimator) ? 1u : 0u;
++    statistics.status |= IsFiniteStatistics(statistics.matched) ? 2u : 0u;
+     statistics.reserved = 0u;
+     Statistics[pixelIndex] = statistics;
+ }
+@@ -190,6 +212,15 @@ float3 HeatMap(float value)
+     return saturate(float3(1.5 * t, 1.5 - abs(3.0 * t - 1.5), 1.5 * (1.0 - t)));
+ }
+ 
++EstimatorStatistics SelectEstimator(PixelStatistics statistics, uint estimatorIndex)
++{
++    if (estimatorIndex == 1u)
++    {
++        return statistics.matched;
++    }
++    return statistics.uniformEstimator;
++}
++
+ float4 DisplayPS(float4 position : SV_Position) : SV_Target0
+ {
+     uint2 pixel = min(uint2(position.xy), uint2(DisplayWidth - 1u, DisplayHeight - 1u));
+@@ -200,19 +231,20 @@ float4 DisplayPS(float4 position : SV_Position) : SV_Target0
+     }
+ 
+     float exact = max(statistics.exact, 1.0e-6);
+-    float3 color = saturate(statistics.uniformEstimator.estimate / (2.0 * exact)).xxx;
++    EstimatorStatistics selected = SelectEstimator(statistics, DebugView);
++    float3 color = saturate(selected.estimate / (2.0 * exact)).xxx;
+     if (DebugView == 4u)
+     {
+-        float relativeError = abs(statistics.uniformEstimator.estimate - statistics.exact) / exact;
++        float relativeError = abs(selected.estimate - statistics.exact) / exact;
+         color = HeatMap(relativeError * 4.0);
+     }
+     else if (DebugView == 5u)
+     {
+-        color = HeatMap(statistics.uniformEstimator.standardError / exact * 8.0);
++        color = HeatMap(selected.standardError / exact * 8.0);
+     }
+     else if (DebugView == 6u)
+     {
+-        color = HeatMap(log2(float(statistics.uniformEstimator.integrandEvaluationCount) + 1.0) / 12.0);
++        color = HeatMap(log2(float(selected.integrandEvaluationCount) + 1.0) / 12.0);
+     }
+     return float4(color, 1.0);
+ }

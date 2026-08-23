@@ -1,0 +1,118 @@
+diff --git a/chapters/importance-sampling-and-multiple-importance-sampling/Starter/ImportanceSamplingLab.hlsl b/chapters/importance-sampling-and-multiple-importance-sampling/Starter/ImportanceSamplingLab.hlsl
+index b498dea..ab6ed70 100644
+--- a/chapters/importance-sampling-and-multiple-importance-sampling/Starter/ImportanceSamplingLab.hlsl
++++ b/chapters/importance-sampling-and-multiple-importance-sampling/Starter/ImportanceSamplingLab.hlsl
+@@ -281,6 +281,23 @@ EstimatorStatistics SelectEstimator(PixelStatistics statistics, uint estimatorIn
+     return statistics.mis;
+ }
+ 
++float3 EstimatorTint(uint estimatorIndex)
++{
++    if (estimatorIndex == 0u)
++    {
++        return float3(1.0, 0.55, 0.25);
++    }
++    if (estimatorIndex == 1u)
++    {
++        return float3(0.25, 1.0, 0.55);
++    }
++    if (estimatorIndex == 2u)
++    {
++        return float3(0.35, 0.55, 1.0);
++    }
++    return float3(1.0, 0.35, 0.9);
++}
++
+ float4 DisplayPS(float4 position : SV_Position) : SV_Target0
+ {
+     uint2 pixel = min(uint2(position.xy), uint2(DisplayWidth - 1u, DisplayHeight - 1u));
+@@ -291,20 +308,29 @@ float4 DisplayPS(float4 position : SV_Position) : SV_Target0
+     }
+ 
+     float exact = max(statistics.exact, 1.0e-6);
+-    EstimatorStatistics selected = SelectEstimator(statistics, DebugView);
+-    float3 color = saturate(selected.estimate / (2.0 * exact)).xxx;
++    if (DebugView <= 3u)
++    {
++        EstimatorStatistics selected = SelectEstimator(statistics, DebugView);
++        float value = saturate(selected.estimate / (2.0 * exact));
++        return float4(value * EstimatorTint(DebugView), 1.0);
++    }
++
++    uint band = min(3u, (pixel.x * 4u) / DisplayWidth);
++    EstimatorStatistics comparison = SelectEstimator(statistics, band);
++    float3 color;
+     if (DebugView == 4u)
+     {
+-        float relativeError = abs(selected.estimate - statistics.exact) / exact;
++        float relativeError = abs(comparison.estimate - statistics.exact) / exact;
+         color = HeatMap(relativeError * 4.0);
+     }
+     else if (DebugView == 5u)
+     {
+-        color = HeatMap(selected.standardError / exact * 8.0);
++        color = HeatMap(comparison.standardError / exact * 8.0);
+     }
+-    else if (DebugView == 6u)
++    else
+     {
+-        color = HeatMap(log2(float(selected.integrandEvaluationCount) + 1.0) / 12.0);
++        float work = log2(float(comparison.integrandEvaluationCount) + 1.0) / 12.0;
++        color = HeatMap(work) * EstimatorTint(band);
+     }
+     return float4(color, 1.0);
+ }
+diff --git a/chapters/importance-sampling-and-multiple-importance-sampling/Starter/Main.cpp b/chapters/importance-sampling-and-multiple-importance-sampling/Starter/Main.cpp
+index b2c9297..c033b26 100644
+--- a/chapters/importance-sampling-and-multiple-importance-sampling/Starter/Main.cpp
++++ b/chapters/importance-sampling-and-multiple-importance-sampling/Starter/Main.cpp
+@@ -4,10 +4,10 @@
+ 
+ int wmain(int argc, wchar_t **argv)
+ {
+-    ch17::importance_sampling::starter::Renderer renderer{};
++    ch17::importance_sampling::solution::Renderer renderer{};
+ 
+     lgp::framework::ApplicationConfiguration configuration{};
+-    configuration.title = L"Ch17 Importance Sampling Starter (progressive uniform estimator)";
++    configuration.title = L"Ch17 Importance Sampling Solution (equal-cost estimator comparison)";
+     configuration.width = 320U;
+     configuration.height = 180U;
+     configuration.enableDebugLayer = false;
+diff --git a/chapters/importance-sampling-and-multiple-importance-sampling/Starter/Renderer.cpp b/chapters/importance-sampling-and-multiple-importance-sampling/Starter/Renderer.cpp
+index ac3349f..ea9589c 100644
+--- a/chapters/importance-sampling-and-multiple-importance-sampling/Starter/Renderer.cpp
++++ b/chapters/importance-sampling-and-multiple-importance-sampling/Starter/Renderer.cpp
+@@ -1,6 +1,6 @@
+ #include "Renderer.hpp"
+ 
+-namespace ch17::importance_sampling::starter
++namespace ch17::importance_sampling::solution
+ {
+ 
+ Renderer::Renderer()
+@@ -9,4 +9,4 @@ Renderer::Renderer()
+ {
+ }
+ 
+-} // namespace ch17::importance_sampling::starter
++} // namespace ch17::importance_sampling::solution
+diff --git a/chapters/importance-sampling-and-multiple-importance-sampling/Starter/Renderer.hpp b/chapters/importance-sampling-and-multiple-importance-sampling/Starter/Renderer.hpp
+index 4be3e40..4c2fe71 100644
+--- a/chapters/importance-sampling-and-multiple-importance-sampling/Starter/Renderer.hpp
++++ b/chapters/importance-sampling-and-multiple-importance-sampling/Starter/Renderer.hpp
+@@ -2,7 +2,7 @@
+ 
+ #include "../Common/GpuLabSupport.hpp"
+ 
+-namespace ch17::importance_sampling::starter
++namespace ch17::importance_sampling::solution
+ {
+ 
+ using HeadlessTestConfiguration = gpu::LabConfiguration;
+@@ -13,4 +13,4 @@ class Renderer final : public gpu::RendererCore
+     Renderer();
+ };
+ 
+-} // namespace ch17::importance_sampling::starter
++} // namespace ch17::importance_sampling::solution

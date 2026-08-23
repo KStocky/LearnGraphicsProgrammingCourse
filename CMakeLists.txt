@@ -24,7 +24,7 @@ option(LGP_ENABLE_IMGUI "Enable the chapter diagnostics UI" ON)
 option(LGP_ENABLE_D3D12_DEBUG_LAYER "Enable D3D12 debug-layer support" ON)
 option(LGP_ENABLE_CLANG_TIDY "Run clang-tidy while compiling first-party targets" OFF)
 
-set(LGP_COURSE_VERSION "course-v2026.08.23.5" CACHE STRING "Published course version" FORCE)
+set(LGP_COURSE_VERSION "course-v2026.08.23.6" CACHE STRING "Published course version" FORCE)
 set(CMAKE_CXX_STANDARD 23)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)

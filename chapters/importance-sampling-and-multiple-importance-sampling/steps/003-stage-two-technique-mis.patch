@@ -1,0 +1,131 @@
+diff --git a/chapters/importance-sampling-and-multiple-importance-sampling/Starter/ImportanceSamplingLab.hlsl b/chapters/importance-sampling-and-multiple-importance-sampling/Starter/ImportanceSamplingLab.hlsl
+index 6ff723d..b498dea 100644
+--- a/chapters/importance-sampling-and-multiple-importance-sampling/Starter/ImportanceSamplingLab.hlsl
++++ b/chapters/importance-sampling-and-multiple-importance-sampling/Starter/ImportanceSamplingLab.hlsl
+@@ -1,4 +1,5 @@
+ static const float Pi = 3.14159265358979323846;
++static const float UniformPdf = 1.0 / (2.0 * Pi);
+ 
+ struct EstimatorMoments
+ {
+@@ -114,6 +115,39 @@ float PowerCosineContribution(float unitSample, float targetExponent, float prop
+     return target / PowerCosinePdf(cosine, proposalExponent);
+ }
+ 
++float MisWeight(float selectedDensity, float competingDensity)
++{
++    if (MisHeuristic == 0u)
++    {
++        return selectedDensity / (selectedDensity + competingDensity);
++    }
++
++    float densityScale = max(selectedDensity, competingDensity);
++    float selected = selectedDensity / densityScale;
++    float competing = competingDensity / densityScale;
++    float selectedSquared = selected * selected;
++    float competingSquared = competing * competing;
++    return selectedSquared / (selectedSquared + competingSquared);
++}
++
++float PairedMisContribution(uint pixelIndex, uint pairIndex)
++{
++    float uniformCosine = UnitSample(pixelIndex, pairIndex, 3u).x;
++    float uniformTarget = pow(uniformCosine, TargetExponent);
++    float proposalAtUniform = PowerCosinePdf(uniformCosine, ProposalExponent);
++    float uniformContribution =
++        MisWeight(UniformPdf, proposalAtUniform) * (uniformTarget / UniformPdf);
++
++    float proposalUnitSample = UnitSample(pixelIndex, pairIndex, 4u).x;
++    float proposalCosine = pow(proposalUnitSample, 1.0 / (ProposalExponent + 1.0));
++    float proposalTarget = pow(proposalCosine, TargetExponent);
++    float selectedProposalPdf = PowerCosinePdf(proposalCosine, ProposalExponent);
++    float proposalContribution =
++        MisWeight(selectedProposalPdf, UniformPdf) * (proposalTarget / selectedProposalPdf);
++
++    return uniformContribution + proposalContribution;
++}
++
+ bool IsFiniteStatistics(EstimatorStatistics statistics)
+ {
+     return all(isfinite(float3(statistics.estimate, statistics.sampleVariance, statistics.standardError))) &&
+@@ -130,6 +164,7 @@ void SampleCS(uint3 dispatchThreadId : SV_DispatchThreadID)
+     }
+ 
+     uint pixelIndex = dispatchThreadId.y * Width + dispatchThreadId.x;
++    uint pairCountPerDispatch = IntegrandEvaluationsPerDispatch / 2u;
+     PixelMoments moments;
+     if (Reset != 0u)
+     {
+@@ -145,7 +180,9 @@ void SampleCS(uint3 dispatchThreadId : SV_DispatchThreadID)
+             moments.uniformEstimator.sampleCount > 0xFFFFFFFFu - IntegrandEvaluationsPerDispatch ||
+             moments.matched.sampleCount > 0xFFFFFFFFu - IntegrandEvaluationsPerDispatch ||
+             moments.mismatched.sampleCount > 0xFFFFFFFFu - IntegrandEvaluationsPerDispatch;
+-        if (simpleCountWouldOverflow)
++        bool misCountWouldOverflow =
++            moments.mis.sampleCount > (0xFFFFFFFFu / 2u) - pairCountPerDispatch;
++        if (simpleCountWouldOverflow || misCountWouldOverflow)
+         {
+             moments.uniformEstimator = EmptyMoments();
+             moments.matched = EmptyMoments();
+@@ -172,19 +209,26 @@ void SampleCS(uint3 dispatchThreadId : SV_DispatchThreadID)
+             moments.mismatched,
+             PowerCosineContribution(mismatchedUnitSample, TargetExponent, ProposalExponent));
+     }
++
++    for (uint localPair = 0u; localPair < pairCountPerDispatch; ++localPair)
++    {
++        uint pairIndex = moments.mis.sampleCount;
++        PushContribution(moments.mis, PairedMisContribution(pixelIndex, pairIndex));
++    }
+     Moments[pixelIndex] = moments;
+ 
+     PixelStatistics statistics;
+     statistics.uniformEstimator = Summarize(moments.uniformEstimator, 1u);
+     statistics.matched = Summarize(moments.matched, 1u);
+     statistics.mismatched = Summarize(moments.mismatched, 1u);
+-    statistics.mis = Summarize(moments.mis, 1u);
++    statistics.mis = Summarize(moments.mis, 2u);
+     statistics.exact = 2.0 * Pi / (TargetExponent + 1.0);
+-    statistics.misPairCount = 0u;
++    statistics.misPairCount = moments.mis.sampleCount;
+     statistics.status = 0u;
+     statistics.status |= IsFiniteStatistics(statistics.uniformEstimator) ? 1u : 0u;
+     statistics.status |= IsFiniteStatistics(statistics.matched) ? 2u : 0u;
+     statistics.status |= IsFiniteStatistics(statistics.mismatched) ? 4u : 0u;
++    statistics.status |= IsFiniteStatistics(statistics.mis) ? 8u : 0u;
+     statistics.reserved = 0u;
+     Statistics[pixelIndex] = statistics;
+ }
+@@ -222,6 +266,10 @@ float3 HeatMap(float value)
+ 
+ EstimatorStatistics SelectEstimator(PixelStatistics statistics, uint estimatorIndex)
+ {
++    if (estimatorIndex == 0u)
++    {
++        return statistics.uniformEstimator;
++    }
+     if (estimatorIndex == 1u)
+     {
+         return statistics.matched;
+@@ -230,7 +278,7 @@ EstimatorStatistics SelectEstimator(PixelStatistics statistics, uint estimatorIn
+     {
+         return statistics.mismatched;
+     }
+-    return statistics.uniformEstimator;
++    return statistics.mis;
+ }
+ 
+ float4 DisplayPS(float4 position : SV_Position) : SV_Target0
+diff --git a/chapters/importance-sampling-and-multiple-importance-sampling/Starter/Renderer.cpp b/chapters/importance-sampling-and-multiple-importance-sampling/Starter/Renderer.cpp
+index 98c8aca..ac3349f 100644
+--- a/chapters/importance-sampling-and-multiple-importance-sampling/Starter/Renderer.cpp
++++ b/chapters/importance-sampling-and-multiple-importance-sampling/Starter/Renderer.cpp
+@@ -5,7 +5,7 @@ namespace ch17::importance_sampling::starter
+ 
+ Renderer::Renderer()
+     : RendererCore(std::filesystem::path{__FILE__}.parent_path() / "ImportanceSamplingLab.hlsl",
+-                   gpu::LabVariant::Starter)
++                   gpu::LabVariant::Solution)
+ {
+ }
+ 
