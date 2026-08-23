@@ -1,10 +1,10 @@
 # Learn Graphics Programming
 
-Published learner version: `course-v2026.08.23.2`
+Published learner version: `course-v2026.08.23.3`
 
 This is a complete standalone learner repository. It contains the framework,
 Starter and Solution projects, assets, and cumulative teaching patches for every
-chapter available in `course-v2026.08.23.2`. It does not require a checkout of the private
+chapter available in `course-v2026.08.23.3`. It does not require a checkout of the private
 authoring repository.
 
 ## Requirements
@@ -46,5 +46,5 @@ not included in this learner distribution.
 - [Tiled, Forward+, and Clustered Lighting](chapters/tiled-forward-plus-and-clustered-lighting)
 - [Visibility Buffers and Deferred Material Evaluation](chapters/visibility-buffers-and-material-evaluation)
 
-The matching course site and tagged source archive use the same `course-v2026.08.23.2`
+The matching course site and tagged source archive use the same `course-v2026.08.23.3`
 identifier. Report learner-facing problems in this repository's Issues page.
