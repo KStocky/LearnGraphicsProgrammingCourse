@@ -1,0 +1,57 @@
+diff --git a/chapters/shader-execution-register-pressure-and-occupancy/Starter/Renderer.cpp b/chapters/shader-execution-register-pressure-and-occupancy/Starter/Renderer.cpp
+index 38afa6a..9c02a75 100644
+--- a/chapters/shader-execution-register-pressure-and-occupancy/Starter/Renderer.cpp
++++ b/chapters/shader-execution-register-pressure-and-occupancy/Starter/Renderer.cpp
+@@ -4,7 +4,7 @@ namespace ch18::shader_occupancy::starter
+ {
+ 
+ Renderer::Renderer()
+-    : RendererCore(std::filesystem::path{__FILE__}.parent_path() / "ShaderOccupancyLab.hlsl", gpu::LabEdition::Starter)
++    : RendererCore(std::filesystem::path{__FILE__}.parent_path() / "ShaderOccupancyLab.hlsl", gpu::LabEdition::Solution)
+ {
+ }
+ 
+diff --git a/chapters/shader-execution-register-pressure-and-occupancy/Starter/ShaderOccupancyLab.hlsl b/chapters/shader-execution-register-pressure-and-occupancy/Starter/ShaderOccupancyLab.hlsl
+index 4b23c9a..f435892 100644
+--- a/chapters/shader-execution-register-pressure-and-occupancy/Starter/ShaderOccupancyLab.hlsl
++++ b/chapters/shader-execution-register-pressure-and-occupancy/Starter/ShaderOccupancyLab.hlsl
+@@ -78,6 +78,39 @@ void CoherentLowPressureCS(uint3 dispatchThreadId : SV_DispatchThreadID,
+     }
+ }
+ 
++[numthreads(64, 1, 1)]
++void DivergentLowPressureCS(uint3 dispatchThreadId : SV_DispatchThreadID,
++                            uint3 groupThreadId : SV_GroupThreadID)
++{
++    uint threadIndex = dispatchThreadId.x;
++    if (threadIndex < ElementCount)
++    {
++        RunLowPressure(threadIndex, (groupThreadId.x & 1u) == 0u);
++    }
++}
++
++[numthreads(64, 1, 1)]
++void CoherentHighLiveRangeCS(uint3 dispatchThreadId : SV_DispatchThreadID,
++                             uint3 groupId : SV_GroupID)
++{
++    uint threadIndex = dispatchThreadId.x;
++    if (threadIndex < ElementCount)
++    {
++        RunLowPressure(threadIndex, (groupId.x & 1u) == 0u);
++    }
++}
++
++[numthreads(64, 1, 1)]
++void CoherentShortLiveRangeCS(uint3 dispatchThreadId : SV_DispatchThreadID,
++                              uint3 groupId : SV_GroupID)
++{
++    uint threadIndex = dispatchThreadId.x;
++    if (threadIndex < ElementCount)
++    {
++        RunLowPressure(threadIndex, (groupId.x & 1u) == 0u);
++    }
++}
++
+ struct FullscreenVertex
+ {
+     float4 position : SV_Position;

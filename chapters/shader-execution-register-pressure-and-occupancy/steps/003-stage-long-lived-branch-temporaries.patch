@@ -1,0 +1,97 @@
+diff --git a/chapters/shader-execution-register-pressure-and-occupancy/Starter/ShaderOccupancyLab.hlsl b/chapters/shader-execution-register-pressure-and-occupancy/Starter/ShaderOccupancyLab.hlsl
+index f435892..f2a6f1c 100644
+--- a/chapters/shader-execution-register-pressure-and-occupancy/Starter/ShaderOccupancyLab.hlsl
++++ b/chapters/shader-execution-register-pressure-and-occupancy/Starter/ShaderOccupancyLab.hlsl
+@@ -94,10 +94,90 @@ void CoherentHighLiveRangeCS(uint3 dispatchThreadId : SV_DispatchThreadID,
+                              uint3 groupId : SV_GroupID)
+ {
+     uint threadIndex = dispatchThreadId.x;
+-    if (threadIndex < ElementCount)
++    if (threadIndex >= ElementCount)
+     {
+-        RunLowPressure(threadIndex, (groupId.x & 1u) == 0u);
++        return;
+     }
++
++    float4 base = BaseValue(threadIndex);
++    bool takeThenPath = (groupId.x & 1u) == 0u;
++    precise float4 t0;
++    precise float4 t1;
++    precise float4 t2;
++    precise float4 t3;
++    precise float4 t4;
++    precise float4 t5;
++    precise float4 t6;
++    precise float4 t7;
++    precise float4 t8;
++    precise float4 t9;
++    precise float4 t10;
++    precise float4 t11;
++    precise float4 t12;
++    precise float4 t13;
++    precise float4 t14;
++    precise float4 t15;
++    [branch]
++    if (takeThenPath)
++    {
++        precise float4 shifted = base + 0.125;
++        precise float4 branchBase = shifted - 0.125;
++        t0 = branchBase * 0.000030517578125;
++        t1 = branchBase * 0.000030517578125;
++        t2 = branchBase * 0.00006103515625;
++        t3 = branchBase * 0.0001220703125;
++        t4 = branchBase * 0.000244140625;
++        t5 = branchBase * 0.00048828125;
++        t6 = branchBase * 0.0009765625;
++        t7 = branchBase * 0.001953125;
++        t8 = branchBase * 0.00390625;
++        t9 = branchBase * 0.0078125;
++        t10 = branchBase * 0.015625;
++        t11 = branchBase * 0.03125;
++        t12 = branchBase * 0.0625;
++        t13 = branchBase * 0.125;
++        t14 = branchBase * 0.25;
++        t15 = branchBase * 0.5;
++    }
++    else
++    {
++        precise float4 shifted = base - 0.125;
++        precise float4 branchBase = shifted + 0.125;
++        t0 = branchBase * 0.5;
++        t1 = branchBase * 0.25;
++        t2 = branchBase * 0.125;
++        t3 = branchBase * 0.0625;
++        t4 = branchBase * 0.03125;
++        t5 = branchBase * 0.015625;
++        t6 = branchBase * 0.0078125;
++        t7 = branchBase * 0.00390625;
++        t8 = branchBase * 0.001953125;
++        t9 = branchBase * 0.0009765625;
++        t10 = branchBase * 0.00048828125;
++        t11 = branchBase * 0.000244140625;
++        t12 = branchBase * 0.0001220703125;
++        t13 = branchBase * 0.00006103515625;
++        t14 = branchBase * 0.000030517578125;
++        t15 = branchBase * 0.000030517578125;
++    }
++
++    precise float4 value = t0;
++    value += t1;
++    value += t2;
++    value += t3;
++    value += t4;
++    value += t5;
++    value += t6;
++    value += t7;
++    value += t8;
++    value += t9;
++    value += t10;
++    value += t11;
++    value += t12;
++    value += t13;
++    value += t14;
++    value += t15;
++    StoreOutput(threadIndex, takeThenPath, value);
+ }
+ 
+ [numthreads(64, 1, 1)]

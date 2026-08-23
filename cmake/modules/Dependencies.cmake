@@ -321,7 +321,9 @@ function(lgp_add_d3d12_agility_sdk_exports)
         "${_lgp_agility_sdk_path}")
 
     string(MAKE_C_IDENTIFIER "${ARG_TARGET}" _lgp_target_identifier)
-    set(_lgp_generated_source "${CMAKE_CURRENT_BINARY_DIR}/${_lgp_target_identifier}_d3d12_agility_exports.cpp")
+    string(SHA256 _lgp_target_hash "${_lgp_target_identifier}")
+    string(SUBSTRING "${_lgp_target_hash}" 0 12 _lgp_target_hash)
+    set(_lgp_generated_source "${CMAKE_CURRENT_BINARY_DIR}/lgp_agility_${_lgp_target_hash}.cpp")
 
     set(LGP_AGILITY_SDK_VERSION "${_lgp_agility_sdk_version}")
     set(LGP_AGILITY_SDK_PATH "${_lgp_export_literal}")

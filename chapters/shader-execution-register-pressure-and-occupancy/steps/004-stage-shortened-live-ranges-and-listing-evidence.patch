@@ -1,0 +1,65 @@
+diff --git a/chapters/shader-execution-register-pressure-and-occupancy/Starter/ShaderOccupancyLab.hlsl b/chapters/shader-execution-register-pressure-and-occupancy/Starter/ShaderOccupancyLab.hlsl
+index 33e72b7..9f2ad6a 100644
+--- a/chapters/shader-execution-register-pressure-and-occupancy/Starter/ShaderOccupancyLab.hlsl
++++ b/chapters/shader-execution-register-pressure-and-occupancy/Starter/ShaderOccupancyLab.hlsl
+@@ -185,10 +185,58 @@ void CoherentShortLiveRangeCS(uint3 dispatchThreadId : SV_DispatchThreadID,
+                               uint3 groupId : SV_GroupID)
+ {
+     uint threadIndex = dispatchThreadId.x;
+-    if (threadIndex < ElementCount)
++    if (threadIndex >= ElementCount)
+     {
+-        RunLowPressure(threadIndex, (groupId.x & 1u) == 0u);
++        return;
++    }
++
++    float4 base = BaseValue(threadIndex);
++    bool takeThenPath = (groupId.x & 1u) == 0u;
++    precise float4 value;
++    [branch]
++    if (takeThenPath)
++    {
++        precise float4 shifted = base + 0.125;
++        precise float4 branchBase = shifted - 0.125;
++        value = branchBase * 0.5;
++        value += branchBase * 0.25;
++        value += branchBase * 0.125;
++        value += branchBase * 0.0625;
++        value += branchBase * 0.03125;
++        value += branchBase * 0.015625;
++        value += branchBase * 0.0078125;
++        value += branchBase * 0.00390625;
++        value += branchBase * 0.001953125;
++        value += branchBase * 0.0009765625;
++        value += branchBase * 0.00048828125;
++        value += branchBase * 0.000244140625;
++        value += branchBase * 0.0001220703125;
++        value += branchBase * 0.00006103515625;
++        value += branchBase * 0.000030517578125;
++        value += branchBase * 0.000030517578125;
++    }
++    else
++    {
++        precise float4 shifted = base - 0.125;
++        precise float4 branchBase = shifted + 0.125;
++        value = branchBase * 0.5;
++        value += branchBase * 0.25;
++        value += branchBase * 0.125;
++        value += branchBase * 0.0625;
++        value += branchBase * 0.03125;
++        value += branchBase * 0.015625;
++        value += branchBase * 0.0078125;
++        value += branchBase * 0.00390625;
++        value += branchBase * 0.001953125;
++        value += branchBase * 0.0009765625;
++        value += branchBase * 0.00048828125;
++        value += branchBase * 0.000244140625;
++        value += branchBase * 0.0001220703125;
++        value += branchBase * 0.00006103515625;
++        value += branchBase * 0.000030517578125;
++        value += branchBase * 0.000030517578125;
+     }
++    StoreOutput(threadIndex, takeThenPath, value);
+ }
+ 
+ struct FullscreenVertex

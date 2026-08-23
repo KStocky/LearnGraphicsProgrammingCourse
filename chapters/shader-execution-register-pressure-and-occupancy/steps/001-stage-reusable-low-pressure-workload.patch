@@ -1,0 +1,42 @@
+diff --git a/chapters/shader-execution-register-pressure-and-occupancy/Starter/ShaderOccupancyLab.hlsl b/chapters/shader-execution-register-pressure-and-occupancy/Starter/ShaderOccupancyLab.hlsl
+index 3c5ac6b..4b23c9a 100644
+--- a/chapters/shader-execution-register-pressure-and-occupancy/Starter/ShaderOccupancyLab.hlsl
++++ b/chapters/shader-execution-register-pressure-and-occupancy/Starter/ShaderOccupancyLab.hlsl
+@@ -49,18 +49,9 @@ void StoreOutput(uint threadIndex, bool takeThenPath, float4 value)
+     Outputs[threadIndex] = output;
+ }
+ 
+-[numthreads(64, 1, 1)]
+-void CoherentLowPressureCS(uint3 dispatchThreadId : SV_DispatchThreadID,
+-                           uint3 groupId : SV_GroupID)
++void RunLowPressure(uint threadIndex, bool takeThenPath)
+ {
+-    uint threadIndex = dispatchThreadId.x;
+-    if (threadIndex >= ElementCount)
+-    {
+-        return;
+-    }
+-
+     float4 base = BaseValue(threadIndex);
+-    bool takeThenPath = (groupId.x & 1u) == 0u;
+     precise float4 value;
+     [branch]
+     if (takeThenPath)
+@@ -76,6 +67,17 @@ void CoherentLowPressureCS(uint3 dispatchThreadId : SV_DispatchThreadID,
+     StoreOutput(threadIndex, takeThenPath, value);
+ }
+ 
++[numthreads(64, 1, 1)]
++void CoherentLowPressureCS(uint3 dispatchThreadId : SV_DispatchThreadID,
++                           uint3 groupId : SV_GroupID)
++{
++    uint threadIndex = dispatchThreadId.x;
++    if (threadIndex < ElementCount)
++    {
++        RunLowPressure(threadIndex, (groupId.x & 1u) == 0u);
++    }
++}
++
+ struct FullscreenVertex
+ {
+     float4 position : SV_Position;
