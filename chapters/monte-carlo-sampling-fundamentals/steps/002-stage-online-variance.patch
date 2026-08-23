@@ -1,0 +1,57 @@
+diff --git a/chapters/monte-carlo-sampling-fundamentals/Starter/MonteCarloLab.hlsl b/chapters/monte-carlo-sampling-fundamentals/Starter/MonteCarloLab.hlsl
+index ad41271..8eb1ba9 100644
+--- a/chapters/monte-carlo-sampling-fundamentals/Starter/MonteCarloLab.hlsl
++++ b/chapters/monte-carlo-sampling-fundamentals/Starter/MonteCarloLab.hlsl
+@@ -57,31 +57,37 @@ void SampleCS(uint3 dispatchThreadId : SV_DispatchThreadID)
+     uint pixelIndex = dispatchThreadId.y * Width + dispatchThreadId.x;
+     float4 moments = Reset != 0u ? float4(0.0, 0.0, 0.0, 0.0) : Moments[pixelIndex];
+     uint sampleCount = Reset != 0u ? 0u : PreviousSampleCount;
+-    float cosine = 0.0;
+-    float azimuth = 0.0;
++    float lastCosine = 0.0;
++    float lastAzimuth = 0.0;
++
+     for (uint localSample = 0u; localSample < SamplesPerDispatch; ++localSample)
+     {
+-        float2 unitSample = UnitSample(pixelIndex, sampleCount);
+-        cosine = unitSample.x;
+-        azimuth = 2.0 * Pi * unitSample.y;
+-        float contribution = 2.0 * Pi * pow(cosine, Exponent);
++        uint sampleIndex = sampleCount;
++        float2 unitSample = UnitSample(pixelIndex, sampleIndex);
++        lastCosine = unitSample.x;
++        lastAzimuth = 2.0 * Pi * unitSample.y;
++
++        float contribution = 2.0 * Pi * pow(lastCosine, Exponent);
+         sampleCount += 1u;
+-        moments.x += (contribution - moments.x) / float(sampleCount);
++        float delta = contribution - moments.x;
++        moments.x += delta / float(sampleCount);
++        float deltaAfterMeanUpdate = contribution - moments.x;
++        moments.y += delta * deltaAfterMeanUpdate;
+     }
+-    float exact = 2.0 * Pi / (Exponent + 1.0);
+-
+     moments.z = float(sampleCount);
+-    moments.w = cosine;
++    moments.w = lastCosine;
+     Moments[pixelIndex] = moments;
++
++    float sampleVariance = sampleCount > 1u ? moments.y / float(sampleCount - 1u) : 0.0;
+     PixelStatistics statistics;
+     statistics.estimate = moments.x;
+-    statistics.exact = exact;
+-    statistics.sampleVariance = 0.0;
+-    statistics.standardError = 0.0;
++    statistics.exact = 2.0 * Pi / (Exponent + 1.0);
++    statistics.sampleVariance = sampleVariance;
++    statistics.standardError = sqrt(sampleVariance / float(sampleCount));
+     statistics.sampleCount = sampleCount;
+     statistics.status = 1u;
+-    statistics.lastCosine = cosine;
+-    statistics.lastAzimuth = azimuth;
++    statistics.lastCosine = lastCosine;
++    statistics.lastAzimuth = lastAzimuth;
+     Statistics[pixelIndex] = statistics;
+ }
+ 

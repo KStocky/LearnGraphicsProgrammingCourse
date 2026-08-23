@@ -1,0 +1,54 @@
+diff --git a/chapters/monte-carlo-sampling-fundamentals/Starter/MonteCarloLab.hlsl b/chapters/monte-carlo-sampling-fundamentals/Starter/MonteCarloLab.hlsl
+index 20a71a5..ad41271 100644
+--- a/chapters/monte-carlo-sampling-fundamentals/Starter/MonteCarloLab.hlsl
++++ b/chapters/monte-carlo-sampling-fundamentals/Starter/MonteCarloLab.hlsl
+@@ -55,19 +55,30 @@ void SampleCS(uint3 dispatchThreadId : SV_DispatchThreadID)
+     }
+ 
+     uint pixelIndex = dispatchThreadId.y * Width + dispatchThreadId.x;
+-    float2 unitSample = UnitSample(pixelIndex, 0u);
+-    float cosine = unitSample.x;
+-    float azimuth = 2.0 * Pi * unitSample.y;
+-    float contribution = 2.0 * Pi * pow(cosine, Exponent);
++    float4 moments = Reset != 0u ? float4(0.0, 0.0, 0.0, 0.0) : Moments[pixelIndex];
++    uint sampleCount = Reset != 0u ? 0u : PreviousSampleCount;
++    float cosine = 0.0;
++    float azimuth = 0.0;
++    for (uint localSample = 0u; localSample < SamplesPerDispatch; ++localSample)
++    {
++        float2 unitSample = UnitSample(pixelIndex, sampleCount);
++        cosine = unitSample.x;
++        azimuth = 2.0 * Pi * unitSample.y;
++        float contribution = 2.0 * Pi * pow(cosine, Exponent);
++        sampleCount += 1u;
++        moments.x += (contribution - moments.x) / float(sampleCount);
++    }
+     float exact = 2.0 * Pi / (Exponent + 1.0);
+ 
+-    Moments[pixelIndex] = float4(contribution, 0.0, 1.0, cosine);
++    moments.z = float(sampleCount);
++    moments.w = cosine;
++    Moments[pixelIndex] = moments;
+     PixelStatistics statistics;
+-    statistics.estimate = contribution;
++    statistics.estimate = moments.x;
+     statistics.exact = exact;
+     statistics.sampleVariance = 0.0;
+     statistics.standardError = 0.0;
+-    statistics.sampleCount = 1u;
++    statistics.sampleCount = sampleCount;
+     statistics.status = 1u;
+     statistics.lastCosine = cosine;
+     statistics.lastAzimuth = azimuth;
+diff --git a/chapters/monte-carlo-sampling-fundamentals/Starter/Renderer.cpp b/chapters/monte-carlo-sampling-fundamentals/Starter/Renderer.cpp
+index 9a20401..930fc04 100644
+--- a/chapters/monte-carlo-sampling-fundamentals/Starter/Renderer.cpp
++++ b/chapters/monte-carlo-sampling-fundamentals/Starter/Renderer.cpp
+@@ -3,6 +3,6 @@
+ namespace ch16::monte_carlo::starter
+ {
+ 
+-Renderer::Renderer() : RendererCore(std::filesystem::path{__FILE__}.parent_path() / "MonteCarloLab.hlsl", false) {}
++Renderer::Renderer() : RendererCore(std::filesystem::path{__FILE__}.parent_path() / "MonteCarloLab.hlsl", true) {}
+ 
+ } // namespace ch16::monte_carlo::starter

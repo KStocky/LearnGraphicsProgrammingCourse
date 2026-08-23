@@ -1,0 +1,94 @@
+diff --git a/chapters/monte-carlo-sampling-fundamentals/Starter/Main.cpp b/chapters/monte-carlo-sampling-fundamentals/Starter/Main.cpp
+index 943f4f6..f023931 100644
+--- a/chapters/monte-carlo-sampling-fundamentals/Starter/Main.cpp
++++ b/chapters/monte-carlo-sampling-fundamentals/Starter/Main.cpp
+@@ -4,10 +4,10 @@
+ 
+ int wmain(int argc, wchar_t **argv)
+ {
+-    ch16::monte_carlo::starter::Renderer renderer{};
++    ch16::monte_carlo::solution::Renderer renderer{};
+ 
+     lgp::framework::ApplicationConfiguration configuration{};
+-    configuration.title = L"Ch16 Monte Carlo Starter (one sample per pixel)";
++    configuration.title = L"Ch16 Monte Carlo Solution (progressive mean and variance)";
+     configuration.width = 320U;
+     configuration.height = 180U;
+     configuration.enableDebugLayer = false;
+diff --git a/chapters/monte-carlo-sampling-fundamentals/Starter/MonteCarloLab.hlsl b/chapters/monte-carlo-sampling-fundamentals/Starter/MonteCarloLab.hlsl
+index 8eb1ba9..13827e5 100644
+--- a/chapters/monte-carlo-sampling-fundamentals/Starter/MonteCarloLab.hlsl
++++ b/chapters/monte-carlo-sampling-fundamentals/Starter/MonteCarloLab.hlsl
+@@ -74,6 +74,7 @@ void SampleCS(uint3 dispatchThreadId : SV_DispatchThreadID)
+         float deltaAfterMeanUpdate = contribution - moments.x;
+         moments.y += delta * deltaAfterMeanUpdate;
+     }
++
+     moments.z = float(sampleCount);
+     moments.w = lastCosine;
+     Moments[pixelIndex] = moments;
+@@ -115,10 +116,30 @@ cbuffer DisplayConstants : register(b0)
+ 
+ StructuredBuffer<PixelStatistics> DisplayStatistics : register(t0);
+ 
++float3 HeatMap(float value)
++{
++    float t = saturate(value);
++    return saturate(float3(1.5 * t, 1.5 - abs(3.0 * t - 1.5), 1.5 * (1.0 - t)));
++}
++
+ float4 DisplayPS(float4 position : SV_Position) : SV_Target0
+ {
+     uint2 pixel = min(uint2(position.xy), uint2(DisplayWidth - 1u, DisplayHeight - 1u));
+     PixelStatistics statistics = DisplayStatistics[pixel.y * DisplayWidth + pixel.x];
++    float relativeError = abs(statistics.estimate - statistics.exact) / max(statistics.exact, 1.0e-6);
++
+     float3 color = statistics.estimate.xxx / max(2.0 * statistics.exact, 1.0e-6);
++    if (DebugView == 1u)
++    {
++        color = HeatMap(relativeError * 4.0);
++    }
++    else if (DebugView == 2u)
++    {
++        color = HeatMap(statistics.standardError / max(statistics.exact, 1.0e-6) * 8.0);
++    }
++    else if (DebugView == 3u)
++    {
++        color = HeatMap(log2(float(statistics.sampleCount) + 1.0) / 12.0);
++    }
+     return float4(color, 1.0);
+ }
+diff --git a/chapters/monte-carlo-sampling-fundamentals/Starter/Renderer.cpp b/chapters/monte-carlo-sampling-fundamentals/Starter/Renderer.cpp
+index 930fc04..b9cff4f 100644
+--- a/chapters/monte-carlo-sampling-fundamentals/Starter/Renderer.cpp
++++ b/chapters/monte-carlo-sampling-fundamentals/Starter/Renderer.cpp
+@@ -1,8 +1,8 @@
+ #include "Renderer.hpp"
+ 
+-namespace ch16::monte_carlo::starter
++namespace ch16::monte_carlo::solution
+ {
+ 
+ Renderer::Renderer() : RendererCore(std::filesystem::path{__FILE__}.parent_path() / "MonteCarloLab.hlsl", true) {}
+ 
+-} // namespace ch16::monte_carlo::starter
++} // namespace ch16::monte_carlo::solution
+diff --git a/chapters/monte-carlo-sampling-fundamentals/Starter/Renderer.hpp b/chapters/monte-carlo-sampling-fundamentals/Starter/Renderer.hpp
+index d819dfc..ce78ae1 100644
+--- a/chapters/monte-carlo-sampling-fundamentals/Starter/Renderer.hpp
++++ b/chapters/monte-carlo-sampling-fundamentals/Starter/Renderer.hpp
+@@ -2,7 +2,7 @@
+ 
+ #include "../Common/GpuLabSupport.hpp"
+ 
+-namespace ch16::monte_carlo::starter
++namespace ch16::monte_carlo::solution
+ {
+ 
+ using HeadlessTestConfiguration = gpu::LabConfiguration;
+@@ -13,4 +13,4 @@ class Renderer final : public gpu::RendererCore
+     Renderer();
+ };
+ 
+-} // namespace ch16::monte_carlo::starter
++} // namespace ch16::monte_carlo::solution
