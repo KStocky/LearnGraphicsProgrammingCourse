@@ -177,4 +177,7 @@ jobs:
 
       - name: Deploy Pages
         id: deployment
+        # Remove when actions/deploy-pages#434 is fixed in a release.
+        env:
+          NODE_OPTIONS: --disable-warning=DEP0040
         uses: actions/deploy-pages@v5.0.0
