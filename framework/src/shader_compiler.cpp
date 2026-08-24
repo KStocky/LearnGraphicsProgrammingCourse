@@ -41,7 +41,8 @@ namespace
         return std::unexpected(MakeError("ShaderCompiler::Compile", "A source path is required."));
     }
 
-    if (options.entryPoint.empty())
+    bool const libraryTarget = options.targetProfile.starts_with(L"lib_");
+    if (options.entryPoint.empty() && !libraryTarget)
     {
         return std::unexpected(MakeError("ShaderCompiler::Compile", "An HLSL entry point is required."));
     }

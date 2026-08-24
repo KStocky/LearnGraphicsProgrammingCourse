@@ -27,6 +27,10 @@ set(LGP_WINPIXEVENTRUNTIME_VERSION "1.0.240308001")
 set(LGP_WINPIXEVENTRUNTIME_URL "https://api.nuget.org/v3-flatcontainer/winpixeventruntime/1.0.240308001/winpixeventruntime.1.0.240308001.nupkg")
 set(LGP_WINPIXEVENTRUNTIME_SHA256 "726acc93d6968e2146261a1e415521747d50ad69894c2b42b5d0d4c29fd66ec4")
 
+set(LGP_WARP_VERSION "1.0.20")
+set(LGP_WARP_URL "https://api.nuget.org/v3-flatcontainer/microsoft.direct3d.warp/1.0.20/microsoft.direct3d.warp.1.0.20.nupkg")
+set(LGP_WARP_SHA256 "e5fe5de661ce98b58ef9cfb736e73c0a7a2623d3bbf5f14839b2d55566d87e40")
+
 function(_lgp_require_dependency_path dependency path)
     if(NOT EXISTS "${path}")
         message(FATAL_ERROR "Pinned dependency ${dependency} is missing ${path}.")
@@ -234,6 +238,25 @@ function(_lgp_add_winpix_target source_dir)
             LGP_PACKAGE_VERSION "${LGP_WINPIXEVENTRUNTIME_VERSION}"
             LGP_PACKAGE_SHA256 "${LGP_WINPIXEVENTRUNTIME_SHA256}"
             LGP_RUNTIME_FILES "${_lgp_runtime_dll}")
+endfunction()
+
+function(_lgp_add_warp_target source_dir)
+    if(TARGET Microsoft::Direct3DWARP)
+        return()
+    endif()
+
+    _lgp_get_nuget_x64_path(_lgp_runtime_file "${source_dir}" "build/native/bin/x64/d3d10warp.dll")
+    _lgp_require_dependency_path("Microsoft::Direct3DWARP" "${_lgp_runtime_file}")
+    _lgp_require_dependency_path("Microsoft::Direct3DWARP" "${source_dir}/LICENSE.TXT")
+
+    add_library(Microsoft::Direct3DWARP INTERFACE IMPORTED GLOBAL)
+    set_target_properties(
+        Microsoft::Direct3DWARP
+        PROPERTIES
+            LGP_PACKAGE_VERSION "${LGP_WARP_VERSION}"
+            LGP_PACKAGE_SHA256 "${LGP_WARP_SHA256}"
+            LGP_RUNTIME_FILES "${_lgp_runtime_file}"
+            LGP_TESTING_ONLY TRUE)
 endfunction()
 
 function(lgp_stage_runtime_dependencies)
@@ -448,4 +471,14 @@ function(lgp_acquire_dependencies)
         URL_HASH "SHA256=${LGP_WINPIXEVENTRUNTIME_SHA256}"
         DOWNLOAD_ONLY YES)
     _lgp_add_winpix_target("${winpixeventruntime_SOURCE_DIR}")
+
+    if(LGP_BUILD_TESTS)
+        message(STATUS "Acquiring testing-only WARP ${LGP_WARP_VERSION}")
+        CPMAddPackage(
+            NAME direct3dwarp
+            URL "${LGP_WARP_URL}"
+            URL_HASH "SHA256=${LGP_WARP_SHA256}"
+            DOWNLOAD_ONLY YES)
+        _lgp_add_warp_target("${direct3dwarp_SOURCE_DIR}")
+    endif()
 endfunction()
