@@ -1,0 +1,37 @@
+diff --git a/chapters/d3d12-work-graphs-and-dynamic-gpu-scheduling/Starter/WorkGraphsLab.hlsl b/chapters/d3d12-work-graphs-and-dynamic-gpu-scheduling/Starter/WorkGraphsLab.hlsl
+--- a/chapters/d3d12-work-graphs-and-dynamic-gpu-scheduling/Starter/WorkGraphsLab.hlsl
++++ b/chapters/d3d12-work-graphs-and-dynamic-gpu-scheduling/Starter/WorkGraphsLab.hlsl
+@@ -355,3 +355,33 @@
+     return float4(capability, 1.0);
+ }
+ #endif
++
++#ifdef LGP_ENABLE_WORK_GRAPH_NODES
++struct WorkGraphEntry
++{
++    uint dispatchGrid : SV_DispatchGrid;
++    uint stableId;
++    uint bucketSeed;
++    int sourceValue;
++};
++
++[Shader("node")]
++[NodeIsProgramEntry]
++[NodeLaunch("broadcasting")]
++[NodeMaxDispatchGrid(1, 1, 1)]
++[NumThreads(1, 1, 1)]
++void ClassifyNode(DispatchNodeInputRecord<WorkGraphEntry> inputRecord,
++                  [MaxRecords(1)] NodeOutput<ClassifiedRecord> TransformNode)
++{
++    EntryRecord input;
++    input.dispatchGrid = inputRecord.Get().dispatchGrid;
++    input.stableId = inputRecord.Get().stableId;
++    input.bucketSeed = inputRecord.Get().bucketSeed;
++    input.sourceValue = inputRecord.Get().sourceValue;
++
++    ClassifiedRecord classified = Classify(input);
++    ClassifiedOutputs[input.stableId] = classified;
++    RecordClassifyEvidence(input, classified);
++    InterlockedOr(Counters[6], kClassifyStageBit);
++}
++#endif

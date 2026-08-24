@@ -1,0 +1,28 @@
+diff --git a/chapters/d3d12-work-graphs-and-dynamic-gpu-scheduling/Starter/Renderer.cpp b/chapters/d3d12-work-graphs-and-dynamic-gpu-scheduling/Starter/Renderer.cpp
+--- a/chapters/d3d12-work-graphs-and-dynamic-gpu-scheduling/Starter/Renderer.cpp
++++ b/chapters/d3d12-work-graphs-and-dynamic-gpu-scheduling/Starter/Renderer.cpp
+@@ -4,7 +4,7 @@
+ {
+ 
+ Renderer::Renderer()
+-    : RendererCore(std::filesystem::path{__FILE__}.parent_path() / "WorkGraphsLab.hlsl", gpu::LabEdition::Starter)
++    : RendererCore(std::filesystem::path{__FILE__}.parent_path() / "WorkGraphsLab.hlsl", gpu::LabEdition::Solution)
+ {
+ }
+ 
+diff --git a/chapters/d3d12-work-graphs-and-dynamic-gpu-scheduling/Starter/WorkGraphsLab.hlsl b/chapters/d3d12-work-graphs-and-dynamic-gpu-scheduling/Starter/WorkGraphsLab.hlsl
+--- a/chapters/d3d12-work-graphs-and-dynamic-gpu-scheduling/Starter/WorkGraphsLab.hlsl
++++ b/chapters/d3d12-work-graphs-and-dynamic-gpu-scheduling/Starter/WorkGraphsLab.hlsl
+@@ -412,4 +412,12 @@
+     InterlockedOr(Counters[6], kTransformStageBit);
+     outputs.OutputComplete();
+ }
++
++[Shader("node")]
++[NodeLaunch("thread")]
++void FinalizeNode(ThreadNodeInputRecord<TransformedRecord> inputRecord)
++{
++    StoreCanonical(inputRecord.Get());
++    InterlockedOr(Counters[6], kFinalizeStageBit);
++}
+ #endif

@@ -1,0 +1,28 @@
+diff --git a/chapters/d3d12-work-graphs-and-dynamic-gpu-scheduling/Starter/WorkGraphsLab.hlsl b/chapters/d3d12-work-graphs-and-dynamic-gpu-scheduling/Starter/WorkGraphsLab.hlsl
+--- a/chapters/d3d12-work-graphs-and-dynamic-gpu-scheduling/Starter/WorkGraphsLab.hlsl
++++ b/chapters/d3d12-work-graphs-and-dynamic-gpu-scheduling/Starter/WorkGraphsLab.hlsl
+@@ -392,4 +392,24 @@
+     }
+     output.OutputComplete();
+ }
++
++[Shader("node")]
++[NodeLaunch("coalescing")]
++[NumThreads(32, 1, 1)]
++void TransformNode([MaxRecords(32)] GroupNodeInputRecords<ClassifiedRecord> inputRecords,
++                   [MaxRecords(32)] NodeOutput<TransformedRecord> FinalizeNode,
++                   uint threadIndex : SV_GroupIndex)
++{
++    uint recordCount = inputRecords.Count();
++    GroupNodeOutputRecords<TransformedRecord> outputs = FinalizeNode.GetGroupNodeOutputRecords(recordCount);
++    if (threadIndex < recordCount)
++    {
++        TransformedRecord transformed = Transform(inputRecords[threadIndex]);
++        TransformedOutputs[transformed.stableId] = transformed;
++        RecordTransformEvidence(transformed);
++        outputs[threadIndex] = transformed;
++    }
++    InterlockedOr(Counters[6], kTransformStageBit);
++    outputs.OutputComplete();
++}
+ #endif

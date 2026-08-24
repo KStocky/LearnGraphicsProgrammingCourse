@@ -1,0 +1,17 @@
+diff --git a/chapters/d3d12-work-graphs-and-dynamic-gpu-scheduling/Starter/WorkGraphsLab.hlsl b/chapters/d3d12-work-graphs-and-dynamic-gpu-scheduling/Starter/WorkGraphsLab.hlsl
+--- a/chapters/d3d12-work-graphs-and-dynamic-gpu-scheduling/Starter/WorkGraphsLab.hlsl
++++ b/chapters/d3d12-work-graphs-and-dynamic-gpu-scheduling/Starter/WorkGraphsLab.hlsl
+@@ -383,5 +383,13 @@
+     ClassifiedOutputs[input.stableId] = classified;
+     RecordClassifyEvidence(input, classified);
+     InterlockedOr(Counters[6], kClassifyStageBit);
++
++    uint outputCount = classified.selected;
++    ThreadNodeOutputRecords<ClassifiedRecord> output = TransformNode.GetThreadNodeOutputRecords(outputCount);
++    if (outputCount != 0u)
++    {
++        output.Get() = classified;
++    }
++    output.OutputComplete();
+ }
+ #endif

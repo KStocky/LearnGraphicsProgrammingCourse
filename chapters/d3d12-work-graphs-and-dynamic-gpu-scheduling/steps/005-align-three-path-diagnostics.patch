@@ -1,0 +1,51 @@
+diff --git a/chapters/d3d12-work-graphs-and-dynamic-gpu-scheduling/Starter/Main.cpp b/chapters/d3d12-work-graphs-and-dynamic-gpu-scheduling/Starter/Main.cpp
+--- a/chapters/d3d12-work-graphs-and-dynamic-gpu-scheduling/Starter/Main.cpp
++++ b/chapters/d3d12-work-graphs-and-dynamic-gpu-scheduling/Starter/Main.cpp
+@@ -4,10 +4,10 @@
+ 
+ int wmain(int argc, wchar_t **argv)
+ {
+-    ch20::work_graphs::starter::Renderer renderer{};
++    ch20::work_graphs::solution::Renderer renderer{};
+ 
+     lgp::framework::ApplicationConfiguration configuration{};
+-    configuration.title = L"Ch20 Work Graphs Starter (explicit fixed Dispatch stages)";
++    configuration.title = L"Ch20 Work Graphs Solution (Dispatch / ExecuteIndirect / Work Graph)";
+     configuration.width = 640U;
+     configuration.height = 360U;
+     configuration.enableDebugLayer = false;
+diff --git a/chapters/d3d12-work-graphs-and-dynamic-gpu-scheduling/Starter/Renderer.cpp b/chapters/d3d12-work-graphs-and-dynamic-gpu-scheduling/Starter/Renderer.cpp
+--- a/chapters/d3d12-work-graphs-and-dynamic-gpu-scheduling/Starter/Renderer.cpp
++++ b/chapters/d3d12-work-graphs-and-dynamic-gpu-scheduling/Starter/Renderer.cpp
+@@ -1,6 +1,6 @@
+ #include "Renderer.hpp"
+ 
+-namespace ch20::work_graphs::starter
++namespace ch20::work_graphs::solution
+ {
+ 
+ Renderer::Renderer()
+@@ -8,4 +8,4 @@
+ {
+ }
+ 
+-} // namespace ch20::work_graphs::starter
++} // namespace ch20::work_graphs::solution
+diff --git a/chapters/d3d12-work-graphs-and-dynamic-gpu-scheduling/Starter/Renderer.hpp b/chapters/d3d12-work-graphs-and-dynamic-gpu-scheduling/Starter/Renderer.hpp
+--- a/chapters/d3d12-work-graphs-and-dynamic-gpu-scheduling/Starter/Renderer.hpp
++++ b/chapters/d3d12-work-graphs-and-dynamic-gpu-scheduling/Starter/Renderer.hpp
+@@ -2,7 +2,7 @@
+ 
+ #include "../Common/GpuLabSupport.hpp"
+ 
+-namespace ch20::work_graphs::starter
++namespace ch20::work_graphs::solution
+ {
+ 
+ using HeadlessTestConfiguration = gpu::LabConfiguration;
+@@ -13,4 +13,4 @@
+     Renderer();
+ };
+ 
+-} // namespace ch20::work_graphs::starter
++} // namespace ch20::work_graphs::solution
