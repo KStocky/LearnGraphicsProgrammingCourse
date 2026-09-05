@@ -66,7 +66,7 @@ function(lgp_chapter_is_selected chapter result)
     endif()
 endfunction()
 
-set(LGP_COURSE_VERSION "course-v2026.09.05.2" CACHE STRING "Published course version" FORCE)
+set(LGP_COURSE_VERSION "course-v2026.09.05.3" CACHE STRING "Published course version" FORCE)
 set(CMAKE_CXX_STANDARD 23)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
