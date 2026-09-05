@@ -43,6 +43,7 @@ set(
     gpu-work-distribution-and-indirect-execution
     shader-execution-register-pressure-and-occupancy
     d3d12-work-graphs-and-dynamic-gpu-scheduling
+    gpu-driven-scene-submission-culling-and-lod
     motion-vectors-and-reprojection
     gbuffer-and-deferred-shading
     tiled-forward-plus-and-clustered-lighting
@@ -64,7 +65,7 @@ function(lgp_chapter_is_selected chapter result)
     endif()
 endfunction()
 
-set(LGP_COURSE_VERSION "course-v2026.09.04.1" CACHE STRING "Published course version" FORCE)
+set(LGP_COURSE_VERSION "course-v2026.09.05.1" CACHE STRING "Published course version" FORCE)
 set(CMAKE_CXX_STANDARD 23)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)

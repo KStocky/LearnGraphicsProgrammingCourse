@@ -1,0 +1,50 @@
+diff --git a/chapters/gpu-driven-scene-submission-culling-and-lod/Starter/GpuDrivenLab.hlsl b/chapters/gpu-driven-scene-submission-culling-and-lod/Starter/GpuDrivenLab.hlsl
+index b56d259..3ca198b 100644
+--- a/chapters/gpu-driven-scene-submission-culling-and-lod/Starter/GpuDrivenLab.hlsl
++++ b/chapters/gpu-driven-scene-submission-culling-and-lod/Starter/GpuDrivenLab.hlsl
+@@ -44,6 +44,45 @@ static const uint kThreadCount = 64;
+ static const uint kCommandStride = 32;
+ static const uint kGuardValue = 0xcdcdcdcdu;
+ 
++bool SphereVisible(float4 sphere)
++{
++    const float4 planes[6] = {
++        float4(1.0, 0.0, 0.75, 0.0),
++        float4(-1.0, 0.0, 0.75, 0.0),
++        float4(0.0, 1.0, 0.75, 0.0),
++        float4(0.0, -1.0, 0.75, 0.0),
++        float4(0.0, 0.0, 1.0, -0.5),
++        float4(0.0, 0.0, -1.0, 30.0),
++    };
++    [unroll]
++    for (uint planeIndex = 0; planeIndex < 6; ++planeIndex)
++    {
++        float scaledRadius = sphere.w * length(planes[planeIndex].xyz);
++        if (dot(planes[planeIndex].xyz, sphere.xyz) + planes[planeIndex].w < -scaledRadius)
++        {
++            return false;
++        }
++    }
++    return true;
++}
++
++uint SelectLod(float4 sphere, uint previousLod)
++{
++    float nearestDepth = max(sphere.z - sphere.w, gNearPlane);
++    float radiusPixels = sphere.w * gProjectionScale * (0.5 * float(gViewportHeight)) / nearestDepth;
++    uint selected = min(previousLod, 2u);
++    const float thresholds[2] = {80.0, 32.0};
++    while (selected > 0u && radiusPixels > thresholds[selected - 1u] + 4.0)
++    {
++        --selected;
++    }
++    while (selected < 2u && radiusPixels < thresholds[selected] - 4.0)
++    {
++        ++selected;
++    }
++    return selected;
++}
++
+ float2 VertexPosition(uint vertexId)
+ {
+     const float2 positions[4] = {

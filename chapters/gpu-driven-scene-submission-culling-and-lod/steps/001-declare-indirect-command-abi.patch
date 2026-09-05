@@ -1,0 +1,44 @@
+diff --git a/chapters/gpu-driven-scene-submission-culling-and-lod/Starter/GpuDrivenLab.hlsl b/chapters/gpu-driven-scene-submission-culling-and-lod/Starter/GpuDrivenLab.hlsl
+index 9cbcc57..b56d259 100644
+--- a/chapters/gpu-driven-scene-submission-culling-and-lod/Starter/GpuDrivenLab.hlsl
++++ b/chapters/gpu-driven-scene-submission-culling-and-lod/Starter/GpuDrivenLab.hlsl
+@@ -10,7 +10,18 @@ struct InstanceData
+     uint3 padding;
+ };
+ 
++struct DrawTemplate
++{
++    uint indexCount;
++    uint startIndex;
++    int baseVertex;
++    uint materialIndex;
++};
++
+ StructuredBuffer<InstanceData> gInstances : register(t0);
++StructuredBuffer<DrawTemplate> gDrawTemplates : register(t1);
++RWByteAddressBuffer gCommands : register(u0);
++RWStructuredBuffer<uint> gCount : register(u1);
+ 
+ cbuffer DrawConstants : register(b0)
+ {
+@@ -19,6 +30,20 @@ cbuffer DrawConstants : register(b0)
+     uint gInstanceDataIndex;
+ };
+ 
++cbuffer DispatchConstants : register(b0)
++{
++    uint gInstanceCount;
++    uint gCapacity;
++    uint gViewportHeight;
++    float gProjectionScale;
++    float gNearPlane;
++    uint3 gReserved;
++};
++
++static const uint kThreadCount = 64;
++static const uint kCommandStride = 32;
++static const uint kGuardValue = 0xcdcdcdcdu;
++
+ float2 VertexPosition(uint vertexId)
+ {
+     const float2 positions[4] = {

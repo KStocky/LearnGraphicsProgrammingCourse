@@ -1,0 +1,59 @@
+diff --git a/chapters/gpu-driven-scene-submission-culling-and-lod/Starter/GpuDrivenLab.hlsl b/chapters/gpu-driven-scene-submission-culling-and-lod/Starter/GpuDrivenLab.hlsl
+index 3ca198b..13078a3 100644
+--- a/chapters/gpu-driven-scene-submission-culling-and-lod/Starter/GpuDrivenLab.hlsl
++++ b/chapters/gpu-driven-scene-submission-culling-and-lod/Starter/GpuDrivenLab.hlsl
+@@ -83,6 +83,54 @@ uint SelectLod(float4 sphere, uint previousLod)
+     return selected;
+ }
+ 
++[numthreads(kThreadCount, 1, 1)]
++void ResetCS(uint3 dispatchThreadId : SV_DispatchThreadID)
++{
++    uint commandDwordCount = (gCapacity + 1u) * (kCommandStride / 4u);
++    for (uint dwordIndex = dispatchThreadId.x; dwordIndex < commandDwordCount; dwordIndex += kThreadCount)
++    {
++        gCommands.Store(dwordIndex * 4u, kGuardValue);
++    }
++    if (dispatchThreadId.x == 0u)
++    {
++        gCount[0] = 0u;
++    }
++}
++
++[numthreads(kThreadCount, 1, 1)]
++void CullAndBuildCS(uint3 dispatchThreadId : SV_DispatchThreadID)
++{
++    uint physicalIndex = dispatchThreadId.x;
++    if (physicalIndex >= gInstanceCount)
++    {
++        return;
++    }
++    InstanceData instance = gInstances[physicalIndex];
++    if (!SphereVisible(instance.bounds))
++    {
++        return;
++    }
++
++    uint outputIndex;
++    InterlockedAdd(gCount[0], 1u, outputIndex);
++    if (outputIndex >= gCapacity)
++    {
++        return;
++    }
++
++    uint lod = min(SelectLod(instance.bounds, instance.previousLod), instance.lodCount - 1u);
++    DrawTemplate draw = gDrawTemplates[instance.firstDrawTemplate + lod];
++    uint offset = outputIndex * kCommandStride;
++    gCommands.Store(offset + 0u, instance.stableId);
++    gCommands.Store(offset + 4u, lod);
++    gCommands.Store(offset + 8u, instance.instanceDataIndex);
++    gCommands.Store(offset + 12u, draw.indexCount);
++    gCommands.Store(offset + 16u, 1u);
++    gCommands.Store(offset + 20u, draw.startIndex);
++    gCommands.Store(offset + 24u, asuint(draw.baseVertex));
++    gCommands.Store(offset + 28u, instance.instanceDataIndex);
++}
++
+ float2 VertexPosition(uint vertexId)
+ {
+     const float2 positions[4] = {

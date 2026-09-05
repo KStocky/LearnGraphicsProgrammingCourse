@@ -1,0 +1,55 @@
+diff --git a/chapters/gpu-driven-scene-submission-culling-and-lod/Starter/Main.cpp b/chapters/gpu-driven-scene-submission-culling-and-lod/Starter/Main.cpp
+index 12ab876..86f37ed 100644
+--- a/chapters/gpu-driven-scene-submission-culling-and-lod/Starter/Main.cpp
++++ b/chapters/gpu-driven-scene-submission-culling-and-lod/Starter/Main.cpp
+@@ -4,10 +4,10 @@
+ 
+ int wmain(int argc, wchar_t **argv)
+ {
+-    ch21::gpu_driven::starter::Renderer renderer{};
++    ch21::gpu_driven::solution::Renderer renderer{};
+ 
+     lgp::framework::ApplicationConfiguration configuration{};
+-    configuration.title = L"Ch21 GPU-Driven Submission Starter";
++    configuration.title = L"Ch21 GPU-Driven Submission Solution";
+     configuration.width = 1600U;
+     configuration.height = 900U;
+     configuration.enableDebugLayer = false;
+diff --git a/chapters/gpu-driven-scene-submission-culling-and-lod/Starter/Renderer.cpp b/chapters/gpu-driven-scene-submission-culling-and-lod/Starter/Renderer.cpp
+index a8e8313..90332fb 100644
+--- a/chapters/gpu-driven-scene-submission-culling-and-lod/Starter/Renderer.cpp
++++ b/chapters/gpu-driven-scene-submission-culling-and-lod/Starter/Renderer.cpp
+@@ -6,7 +6,7 @@
+ #include <filesystem>
+ #include <string>
+ 
+-namespace ch21::gpu_driven::starter
++namespace ch21::gpu_driven::solution
+ {
+ namespace
+ {
+@@ -498,4 +498,4 @@ gpu::CpuReference const &Renderer::LastReference() const noexcept
+     return reference_;
+ }
+ 
+-} // namespace ch21::gpu_driven::starter
++} // namespace ch21::gpu_driven::solution
+diff --git a/chapters/gpu-driven-scene-submission-culling-and-lod/Starter/Renderer.hpp b/chapters/gpu-driven-scene-submission-culling-and-lod/Starter/Renderer.hpp
+index a55b25e..e83610a 100644
+--- a/chapters/gpu-driven-scene-submission-culling-and-lod/Starter/Renderer.hpp
++++ b/chapters/gpu-driven-scene-submission-culling-and-lod/Starter/Renderer.hpp
+@@ -12,7 +12,7 @@
+ #include <optional>
+ #include <vector>
+ 
+-namespace ch21::gpu_driven::starter
++namespace ch21::gpu_driven::solution
+ {
+ 
+ using HeadlessTestConfiguration = gpu::LabConfiguration;
+@@ -70,4 +70,4 @@ class Renderer final : public lgp::framework::IChapterRenderer
+     bool headless_{};
+ };
+ 
+-} // namespace ch21::gpu_driven::starter
++} // namespace ch21::gpu_driven::solution
