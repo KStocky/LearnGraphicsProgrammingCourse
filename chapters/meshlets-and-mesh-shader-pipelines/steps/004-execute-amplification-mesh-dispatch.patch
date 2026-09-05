@@ -1,0 +1,115 @@
+diff --git a/chapters/meshlets-and-mesh-shader-pipelines/Starter/Renderer.cpp b/chapters/meshlets-and-mesh-shader-pipelines/Starter/Renderer.cpp
+index a3a5a06..2f94a72 100644
+--- a/chapters/meshlets-and-mesh-shader-pipelines/Starter/Renderer.cpp
++++ b/chapters/meshlets-and-mesh-shader-pipelines/Starter/Renderer.cpp
+@@ -438,6 +438,44 @@ void Renderer::RecordClassic(lgp::framework::FrameContext const &frameContext, F
+     gpu::SubmitTextureBarriers(commandList, barriers);
+ }
+ 
++lgp::framework::Status Renderer::RecordMesh(lgp::framework::FrameContext const &frameContext, FrameSlot &slot)
++{
++    ID3D12GraphicsCommandList7 &commandList = *frameContext.commandList;
++    gpu::BufferBarrierState const before = slot.statsStateInitialized ? gpu::CopySourceState() : gpu::NoAccessState();
++    std::vector<D3D12_BUFFER_BARRIER> bufferBarriers{
++        gpu::MakeBufferBarrier(*slot.stats.Get(), before, gpu::CopyDestState())};
++    gpu::SubmitBufferBarriers(commandList, bufferBarriers);
++    commandList.CopyBufferRegion(slot.stats.Get(), 0U, slot.statsZero.Get(), 0U, gpu::kStatsBytes);
++    bufferBarriers = {gpu::MakeBufferBarrier(*slot.stats.Get(), gpu::CopyDestState(), gpu::MeshUnorderedAccessState())};
++    gpu::SubmitBufferBarriers(commandList, bufferBarriers);
++
++    std::vector<D3D12_TEXTURE_BARRIER> textureBarriers{gpu::MakeTextureBarrier(
++        *frameContext.renderTarget, gpu::FrameStartState(frameContext), gpu::RenderTargetState())};
++    gpu::SubmitTextureBarriers(commandList, textureBarriers);
++    float const clear[]{0.01F, 0.015F, 0.025F, 1.0F};
++    commandList.ClearRenderTargetView(frameContext.renderTargetView, clear, 0U, nullptr);
++    commandList.OMSetRenderTargets(1U, &frameContext.renderTargetView, FALSE, nullptr);
++    commandList.RSSetViewports(1U, &frameContext.viewport);
++    commandList.RSSetScissorRects(1U, &frameContext.scissorRect);
++    commandList.SetGraphicsRootSignature(meshRootSignature_.Get());
++    std::uint32_t const meshletCount = scene_.meshletCount;
++    commandList.SetGraphicsRoot32BitConstants(0U, 1U, &meshletCount, 0U);
++    commandList.SetGraphicsRootDescriptorTable(1U, slot.descriptors.GpuHandle(kMeshSrvTableBase));
++    commandList.SetGraphicsRootDescriptorTable(2U, slot.descriptors.GpuHandle(kStatsUavDescriptor));
++    commandList.SetPipelineState(meshPipeline_.Get());
++    commandList.DispatchMesh(1U, 1U, 1U);
++    textureBarriers = {gpu::MakeTextureBarrier(*frameContext.renderTarget, gpu::RenderTargetState(),
++                                               gpu::FrameEndState(frameContext))};
++    gpu::SubmitTextureBarriers(commandList, textureBarriers);
++
++    bufferBarriers = {
++        gpu::MakeBufferBarrier(*slot.stats.Get(), gpu::MeshUnorderedAccessState(), gpu::CopySourceState())};
++    gpu::SubmitBufferBarriers(commandList, bufferBarriers);
++    commandList.CopyBufferRegion(slot.statsReadback.Get(), 0U, slot.stats.Get(), 0U, gpu::kStatsBytes);
++    slot.statsStateInitialized = true;
++    return {};
++}
++
+ lgp::framework::Status Renderer::Render(lgp::framework::FrameContext const &frameContext)
+ {
+     FrameSlot &slot = frameSlots_.at(frameContext.frameSlot);
+@@ -478,10 +516,21 @@ lgp::framework::Status Renderer::Render(lgp::framework::FrameContext const &fram
+     ID3D12DescriptorHeap *heaps[]{frameContext.shaderVisibleCbvSrvUavHeap};
+     commandList.SetDescriptorHeaps(1U, heaps);
+ 
+-    RecordClassic(frameContext, slot);
++    gpu::ExecutedPath const path = ResolvePath();
++    if (path == gpu::ExecutedPath::MeshShader)
++    {
++        if (auto status = RecordMesh(frameContext, slot); !status)
++        {
++            return status;
++        }
++    }
++    else
++    {
++        RecordClassic(frameContext, slot);
++    }
+ 
+     lastEvidence_ = {};
+-    lastEvidence_.executedPath = gpu::ExecutedPath::Classic;
++    lastEvidence_.executedPath = path;
+     lastEvidence_.capabilities = capabilities_;
+     lastEvidence_.meshletCount = scene_.meshletCount;
+     lastFrameSlot_ = frameContext.frameSlot;
+@@ -510,6 +559,29 @@ void Renderer::ConfigureHeadlessTest(HeadlessTestConfiguration const &configurat
+     headlessConfiguration_ = configuration;
+ }
+ 
++std::expected<gpu::MeshEvidence, lgp::framework::Error> Renderer::ReadBackEvidence()
++{
++    if (auto status = deviceResources_->WaitForGpuIdle(); !status)
++    {
++        return std::unexpected(std::move(status.error()));
++    }
++    gpu::MeshEvidence evidence = lastEvidence_;
++    if (evidence.executedPath == gpu::ExecutedPath::MeshShader)
++    {
++        FrameSlot const &slot = frameSlots_.at(lastFrameSlot_);
++        auto const *stats = reinterpret_cast<std::uint32_t const *>(slot.statsReadback.mapped_data());
++        if (stats == nullptr)
++        {
++            return std::unexpected(
++                lgp::framework::MakeError("ReadBackEvidence", "Chapter 22 stats readback is not mapped."));
++        }
++        evidence.dispatchedMeshletGroups = stats[0];
++        evidence.emittedVertices = stats[1];
++        evidence.emittedPrimitives = stats[2];
++    }
++    return evidence;
++}
++
+ gpu::GpuScene const &Renderer::LastScene() const noexcept
+ {
+     return scene_;
+diff --git a/chapters/meshlets-and-mesh-shader-pipelines/Starter/Renderer.hpp b/chapters/meshlets-and-mesh-shader-pipelines/Starter/Renderer.hpp
+index 385682a..4cb30c8 100644
+--- a/chapters/meshlets-and-mesh-shader-pipelines/Starter/Renderer.hpp
++++ b/chapters/meshlets-and-mesh-shader-pipelines/Starter/Renderer.hpp
+@@ -55,6 +55,7 @@ class Renderer final : public lgp::framework::IChapterRenderer
+     [[nodiscard]] lgp::framework::Status CreateMeshPipeline();
+     [[nodiscard]] lgp::framework::Status CreateFrameSlots();
+     void RecordClassic(lgp::framework::FrameContext const &frameContext, FrameSlot &slot);
++    [[nodiscard]] lgp::framework::Status RecordMesh(lgp::framework::FrameContext const &frameContext, FrameSlot &slot);
+ 
+     lgp::framework::DeviceResources *deviceResources_{};
+     gpu::MeshShaderCapabilities capabilities_{};

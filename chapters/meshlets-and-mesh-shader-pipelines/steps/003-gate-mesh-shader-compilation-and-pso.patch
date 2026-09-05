@@ -1,0 +1,269 @@
+diff --git a/chapters/meshlets-and-mesh-shader-pipelines/Starter/MeshletLab.hlsl b/chapters/meshlets-and-mesh-shader-pipelines/Starter/MeshletLab.hlsl
+index b722a84..7d9cb71 100644
+--- a/chapters/meshlets-and-mesh-shader-pipelines/Starter/MeshletLab.hlsl
++++ b/chapters/meshlets-and-mesh-shader-pipelines/Starter/MeshletLab.hlsl
+@@ -36,3 +36,90 @@ struct MeshletPayload
+ 
+ groupshared MeshletPayload s_payload;
+ groupshared uint s_visibleCount;
++
++// Conservative clip-space bounds test: keep any meshlet whose vertex extent could
++// touch the view volume. It never rejects a meshlet that might be visible.
++bool MeshletPotentiallyVisible(MeshletDescriptor meshlet)
++{
++    float3 minimum = float3(1e30, 1e30, 1e30);
++    float3 maximum = float3(-1e30, -1e30, -1e30);
++    uint vertexCount = min(meshlet.vertexCount, CH22_MAX_MESHLET_VERTICES);
++    for (uint i = 0; i < vertexCount; ++i)
++    {
++        uint global = gMeshletVertices[meshlet.vertexOffset + i];
++        float3 position = gPositions[global].xyz;
++        minimum = min(minimum, position);
++        maximum = max(maximum, position);
++    }
++    bool outside = maximum.x < -1.0 || minimum.x > 1.0 || maximum.y < -1.0 || minimum.y > 1.0 ||
++                   maximum.z < 0.0 || minimum.z > 1.0;
++    return !outside;
++}
++
++[numthreads(CH22_AS_GROUP_SIZE, 1, 1)]
++void MeshletAS(uint threadId : SV_DispatchThreadID)
++{
++    if (threadId == 0)
++    {
++        s_visibleCount = 0;
++    }
++    GroupMemoryBarrierWithGroupSync();
++
++    bool visible = false;
++    if (threadId < gMeshletCount)
++    {
++        visible = MeshletPotentiallyVisible(gMeshlets[threadId]);
++    }
++    if (visible)
++    {
++        uint slot;
++        InterlockedAdd(s_visibleCount, 1u, slot);
++        if (slot < CH22_MAX_MESHLETS)
++        {
++            s_payload.meshletIndices[slot] = threadId;
++        }
++    }
++    GroupMemoryBarrierWithGroupSync();
++
++    if (threadId == 0)
++    {
++        gStats.InterlockedAdd(0, s_visibleCount);
++    }
++    DispatchMesh(s_visibleCount, 1, 1, s_payload);
++}
++
++[outputtopology("triangle")]
++[numthreads(CH22_MS_GROUP_SIZE, 1, 1)]
++void MeshletMS(uint groupId : SV_GroupID, uint threadId : SV_GroupThreadID, in payload MeshletPayload payload,
++               out vertices SceneVertexOutput outVertices[CH22_MAX_MESHLET_VERTICES],
++               out indices uint3 outTriangles[CH22_MAX_MESHLET_PRIMITIVES])
++{
++    uint meshletIndex = payload.meshletIndices[min(groupId, CH22_MAX_MESHLETS - 1u)];
++    MeshletDescriptor meshlet = gMeshlets[meshletIndex];
++    uint vertexCount = min(meshlet.vertexCount, CH22_MAX_MESHLET_VERTICES);
++    uint primitiveCount = min(meshlet.primitiveCount, CH22_MAX_MESHLET_PRIMITIVES);
++    SetMeshOutputCounts(vertexCount, primitiveCount);
++
++    if (threadId < vertexCount)
++    {
++        uint global = gMeshletVertices[meshlet.vertexOffset + threadId];
++        SceneVertexOutput output;
++        output.position = float4(gPositions[global].xyz, 1.0);
++        output.meshletId = meshletIndex;
++        outVertices[threadId] = output;
++    }
++    if (threadId < primitiveCount)
++    {
++        uint packed = gMeshletPrimitives[meshlet.primitiveOffset + threadId];
++        uint safeVertexCount = max(vertexCount, 1u);
++        uint a = min(packed & 0x3ffu, safeVertexCount - 1u);
++        uint b = min((packed >> 10u) & 0x3ffu, safeVertexCount - 1u);
++        uint c = min((packed >> 20u) & 0x3ffu, safeVertexCount - 1u);
++        outTriangles[threadId] = uint3(a, b, c);
++    }
++    if (threadId == 0)
++    {
++        gStats.InterlockedAdd(4, vertexCount);
++        gStats.InterlockedAdd(8, primitiveCount);
++    }
++}
+diff --git a/chapters/meshlets-and-mesh-shader-pipelines/Starter/Renderer.cpp b/chapters/meshlets-and-mesh-shader-pipelines/Starter/Renderer.cpp
+index 11b6253..a3a5a06 100644
+--- a/chapters/meshlets-and-mesh-shader-pipelines/Starter/Renderer.cpp
++++ b/chapters/meshlets-and-mesh-shader-pipelines/Starter/Renderer.cpp
+@@ -17,6 +17,36 @@ inline constexpr UINT kClassicVerticesDescriptor = 0U;
+ inline constexpr UINT kMeshSrvTableBase = 1U;
+ inline constexpr UINT kStatsUavDescriptor = 5U;
+ 
++// Each pipeline-state subobject must begin on a pointer-sized boundary, so the
++// alignment specifier is intentional. MSVC's C4324 padding note is not actionable.
++#ifdef _MSC_VER
++#pragma warning(push)
++#pragma warning(disable : 4324)
++#endif
++template <typename Payload, D3D12_PIPELINE_STATE_SUBOBJECT_TYPE Type> struct alignas(void *) StreamSubobject final
++{
++    D3D12_PIPELINE_STATE_SUBOBJECT_TYPE type{Type};
++    Payload payload{};
++};
++
++struct MeshPipelineStream final
++{
++    StreamSubobject<ID3D12RootSignature *, D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_ROOT_SIGNATURE> rootSignature;
++    StreamSubobject<D3D12_SHADER_BYTECODE, D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_AS> amplification;
++    StreamSubobject<D3D12_SHADER_BYTECODE, D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_MS> mesh;
++    StreamSubobject<D3D12_SHADER_BYTECODE, D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PS> pixel;
++    StreamSubobject<D3D12_RASTERIZER_DESC, D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RASTERIZER> rasterizer;
++    StreamSubobject<D3D12_BLEND_DESC, D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_BLEND> blend;
++    StreamSubobject<D3D12_DEPTH_STENCIL_DESC, D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_DEPTH_STENCIL> depthStencil;
++    StreamSubobject<D3D12_PRIMITIVE_TOPOLOGY_TYPE, D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_PRIMITIVE_TOPOLOGY> topology;
++    StreamSubobject<D3D12_RT_FORMAT_ARRAY, D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_RENDER_TARGET_FORMATS> renderTargets;
++    StreamSubobject<DXGI_SAMPLE_DESC, D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_SAMPLE_DESC> sampleDesc;
++    StreamSubobject<UINT, D3D12_PIPELINE_STATE_SUBOBJECT_TYPE_SAMPLE_MASK> sampleMask;
++};
++#ifdef _MSC_VER
++#pragma warning(pop)
++#endif
++
+ [[nodiscard]] std::filesystem::path ShaderPath()
+ {
+     return std::filesystem::path{__FILE__}.parent_path() / "MeshletLab.hlsl";
+@@ -117,6 +147,17 @@ lgp::framework::Status Renderer::CreateShaders()
+     {
+         return status;
+     }
++    if (capabilities_.supported)
++    {
++        if (auto status = gpu::CompileShader(compiler, options, L"MeshletAS", L"as_6_5", amplificationShader_); !status)
++        {
++            return status;
++        }
++        if (auto status = gpu::CompileShader(compiler, options, L"MeshletMS", L"ms_6_5", meshShader_); !status)
++        {
++            return status;
++        }
++    }
+     return {};
+ }
+ 
+@@ -165,6 +206,65 @@ lgp::framework::Status Renderer::CreateClassicPipeline()
+     return {};
+ }
+ 
++lgp::framework::Status Renderer::CreateMeshPipeline()
++{
++    D3D12_DESCRIPTOR_RANGE srvRange{};
++    srvRange.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
++    srvRange.NumDescriptors = 4U;
++    srvRange.BaseShaderRegister = 1U;
++    D3D12_DESCRIPTOR_RANGE uavRange{};
++    uavRange.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_UAV;
++    uavRange.NumDescriptors = 1U;
++    uavRange.BaseShaderRegister = 0U;
++    D3D12_ROOT_PARAMETER parameters[3]{};
++    parameters[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
++    parameters[0].Constants.ShaderRegister = 0U;
++    parameters[0].Constants.Num32BitValues = 1U;
++    parameters[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
++    parameters[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
++    parameters[1].DescriptorTable.NumDescriptorRanges = 1U;
++    parameters[1].DescriptorTable.pDescriptorRanges = &srvRange;
++    parameters[1].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
++    parameters[2].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
++    parameters[2].DescriptorTable.NumDescriptorRanges = 1U;
++    parameters[2].DescriptorTable.pDescriptorRanges = &uavRange;
++    parameters[2].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
++    D3D12_ROOT_SIGNATURE_DESC description{};
++    description.NumParameters = static_cast<UINT>(std::size(parameters));
++    description.pParameters = parameters;
++    description.Flags = D3D12_ROOT_SIGNATURE_FLAG_NONE;
++    if (auto status = SerializeAndCreate(*deviceResources_->device(), description, meshRootSignature_); !status)
++    {
++        return status;
++    }
++
++    MeshPipelineStream stream{};
++    stream.rootSignature.payload = meshRootSignature_.Get();
++    stream.amplification.payload = amplificationShader_.Bytecode();
++    stream.mesh.payload = meshShader_.Bytecode();
++    stream.pixel.payload = pixelShader_.Bytecode();
++    stream.rasterizer.payload = SceneRasterizer();
++    stream.blend.payload = SceneBlend();
++    stream.depthStencil.payload = SceneDepthStencil();
++    stream.topology.payload = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
++    stream.renderTargets.payload.NumRenderTargets = 1U;
++    stream.renderTargets.payload.RTFormats[0] = deviceResources_->back_buffer_format();
++    stream.sampleDesc.payload.Count = 1U;
++    stream.sampleMask.payload = UINT_MAX;
++
++    D3D12_PIPELINE_STATE_STREAM_DESC streamDescription{};
++    streamDescription.SizeInBytes = sizeof(stream);
++    streamDescription.pPipelineStateSubobjectStream = &stream;
++    HRESULT const result = deviceResources_->device()->CreatePipelineState(
++        &streamDescription, IID_PPV_ARGS(meshPipeline_.ReleaseAndGetAddressOf()));
++    if (FAILED(result))
++    {
++        return std::unexpected(lgp::framework::MakeHResultError("ID3D12Device::CreatePipelineState", result,
++                                                                "Failed to create the Chapter 22 mesh pipeline."));
++    }
++    return {};
++}
++
+ lgp::framework::Status Renderer::CreateFrameSlots()
+ {
+     ID3D12Device10 &device = *deviceResources_->device();
+@@ -283,6 +383,13 @@ lgp::framework::Status Renderer::Initialize(lgp::framework::ApplicationInitConte
+     {
+         return status;
+     }
++    if (capabilities_.supported)
++    {
++        if (auto status = CreateMeshPipeline(); !status)
++        {
++            return status;
++        }
++    }
+     return CreateFrameSlots();
+ }
+ 
+@@ -391,7 +498,9 @@ void Renderer::Shutdown(lgp::framework::DeviceResources &deviceResources) noexce
+         }
+     }
+     frameSlots_.clear();
++    meshPipeline_.Reset();
+     classicPipeline_.Reset();
++    meshRootSignature_.Reset();
+     classicRootSignature_.Reset();
+     deviceResources_ = nullptr;
+ }
+diff --git a/chapters/meshlets-and-mesh-shader-pipelines/Starter/Renderer.hpp b/chapters/meshlets-and-mesh-shader-pipelines/Starter/Renderer.hpp
+index e4012b3..385682a 100644
+--- a/chapters/meshlets-and-mesh-shader-pipelines/Starter/Renderer.hpp
++++ b/chapters/meshlets-and-mesh-shader-pipelines/Starter/Renderer.hpp
+@@ -52,6 +52,7 @@ class Renderer final : public lgp::framework::IChapterRenderer
+     [[nodiscard]] gpu::ExecutedPath ResolvePath() const noexcept;
+     [[nodiscard]] lgp::framework::Status CreateShaders();
+     [[nodiscard]] lgp::framework::Status CreateClassicPipeline();
++    [[nodiscard]] lgp::framework::Status CreateMeshPipeline();
+     [[nodiscard]] lgp::framework::Status CreateFrameSlots();
+     void RecordClassic(lgp::framework::FrameContext const &frameContext, FrameSlot &slot);
+ 
+@@ -59,8 +60,12 @@ class Renderer final : public lgp::framework::IChapterRenderer
+     gpu::MeshShaderCapabilities capabilities_{};
+     lgp::framework::CompiledShader vertexShader_{};
+     lgp::framework::CompiledShader pixelShader_{};
++    lgp::framework::CompiledShader amplificationShader_{};
++    lgp::framework::CompiledShader meshShader_{};
+     Microsoft::WRL::ComPtr<ID3D12RootSignature> classicRootSignature_{};
++    Microsoft::WRL::ComPtr<ID3D12RootSignature> meshRootSignature_{};
+     Microsoft::WRL::ComPtr<ID3D12PipelineState> classicPipeline_{};
++    Microsoft::WRL::ComPtr<ID3D12PipelineState> meshPipeline_{};
+     std::vector<FrameSlot> frameSlots_{};
+     gpu::GpuScene scene_{};
+     std::optional<HeadlessTestConfiguration> headlessConfiguration_{};

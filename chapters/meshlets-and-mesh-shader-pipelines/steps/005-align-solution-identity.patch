@@ -1,0 +1,64 @@
+diff --git a/chapters/meshlets-and-mesh-shader-pipelines/Starter/Main.cpp b/chapters/meshlets-and-mesh-shader-pipelines/Starter/Main.cpp
+index 4477284..3a48773 100644
+--- a/chapters/meshlets-and-mesh-shader-pipelines/Starter/Main.cpp
++++ b/chapters/meshlets-and-mesh-shader-pipelines/Starter/Main.cpp
+@@ -4,10 +4,10 @@
+ 
+ int wmain(int argc, wchar_t **argv)
+ {
+-    ch22::meshlets::starter::Renderer renderer{};
++    ch22::meshlets::solution::Renderer renderer{};
+ 
+     lgp::framework::ApplicationConfiguration configuration{};
+-    configuration.title = L"Ch22 Meshlets Starter";
++    configuration.title = L"Ch22 Meshlets Solution";
+     configuration.width = 1600U;
+     configuration.height = 900U;
+     configuration.enableDebugLayer = false;
+diff --git a/chapters/meshlets-and-mesh-shader-pipelines/Starter/Renderer.cpp b/chapters/meshlets-and-mesh-shader-pipelines/Starter/Renderer.cpp
+index 2f94a72..9a86cb2 100644
+--- a/chapters/meshlets-and-mesh-shader-pipelines/Starter/Renderer.cpp
++++ b/chapters/meshlets-and-mesh-shader-pipelines/Starter/Renderer.cpp
+@@ -5,7 +5,7 @@
+ #include <string>
+ #include <vector>
+ 
+-namespace ch22::meshlets::starter
++namespace ch22::meshlets::solution
+ {
+ namespace
+ {
+@@ -302,7 +302,7 @@ lgp::framework::Status Renderer::CreateFrameSlots()
+             !meshletPrimitives || !stats || !statsZero || !statsReadback || !descriptorAllocation)
+         {
+             return std::unexpected(
+-                lgp::framework::MakeError("CreateFrameSlots", "Failed to allocate Chapter 22 Starter resources."));
++                lgp::framework::MakeError("CreateFrameSlots", "Failed to allocate Chapter 22 Solution resources."));
+         }
+         slot.classicVertices = std::move(*classicVertices);
+         slot.classicIndices = std::move(*classicIndices);
+@@ -592,4 +592,4 @@ gpu::MeshShaderCapabilities Renderer::Capabilities() const noexcept
+     return capabilities_;
+ }
+ 
+-} // namespace ch22::meshlets::starter
++} // namespace ch22::meshlets::solution
+diff --git a/chapters/meshlets-and-mesh-shader-pipelines/Starter/Renderer.hpp b/chapters/meshlets-and-mesh-shader-pipelines/Starter/Renderer.hpp
+index 4cb30c8..16b3a72 100644
+--- a/chapters/meshlets-and-mesh-shader-pipelines/Starter/Renderer.hpp
++++ b/chapters/meshlets-and-mesh-shader-pipelines/Starter/Renderer.hpp
+@@ -12,7 +12,7 @@
+ #include <optional>
+ #include <vector>
+ 
+-namespace ch22::meshlets::starter
++namespace ch22::meshlets::solution
+ {
+ 
+ using HeadlessTestConfiguration = gpu::LabConfiguration;
+@@ -75,4 +75,4 @@ class Renderer final : public lgp::framework::IChapterRenderer
+     bool headless_{};
+ };
+ 
+-} // namespace ch22::meshlets::starter
++} // namespace ch22::meshlets::solution

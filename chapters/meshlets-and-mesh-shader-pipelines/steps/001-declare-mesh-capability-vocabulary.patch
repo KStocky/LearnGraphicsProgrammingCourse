@@ -1,0 +1,112 @@
+diff --git a/chapters/meshlets-and-mesh-shader-pipelines/Starter/Renderer.cpp b/chapters/meshlets-and-mesh-shader-pipelines/Starter/Renderer.cpp
+index 3b47a81..d3a14bd 100644
+--- a/chapters/meshlets-and-mesh-shader-pipelines/Starter/Renderer.cpp
++++ b/chapters/meshlets-and-mesh-shader-pipelines/Starter/Renderer.cpp
+@@ -71,6 +71,20 @@ using Microsoft::WRL::ComPtr;
+ 
+ } // namespace
+ 
++gpu::LabConfiguration Renderer::ActiveConfiguration() const noexcept
++{
++    return headless_ && headlessConfiguration_.has_value() ? *headlessConfiguration_ : gpu::LabConfiguration{};
++}
++
++gpu::ExecutedPath Renderer::ResolvePath() const noexcept
++{
++    if (ActiveConfiguration().request != gpu::MeshPathRequest::Mesh)
++    {
++        return gpu::ExecutedPath::Classic;
++    }
++    return capabilities_.supported ? gpu::ExecutedPath::MeshShader : gpu::ExecutedPath::MeshUnsupported;
++}
++
+ lgp::framework::Status Renderer::CreateDeviceObjects()
+ {
+     auto scene = gpu::BuildGpuScene();
+@@ -169,6 +183,8 @@ lgp::framework::Status Renderer::CreateDeviceObjects()
+ lgp::framework::Status Renderer::Initialize(lgp::framework::ApplicationInitContext const &context)
+ {
+     deviceResources_ = &context.deviceResources;
++    headless_ = context.commandLine.headless;
++    capabilities_ = gpu::QueryMeshShaderCapabilities(*deviceResources_->device());
+     return CreateDeviceObjects();
+ }
+ 
+@@ -228,6 +244,12 @@ lgp::framework::Status Renderer::Render(lgp::framework::FrameContext const &fram
+     barriers = {gpu::MakeTextureBarrier(*frameContext.renderTarget, gpu::RenderTargetState(),
+                                         gpu::FrameEndState(frameContext))};
+     gpu::SubmitTextureBarriers(commandList, barriers);
++
++    lastEvidence_ = {};
++    lastEvidence_.executedPath = gpu::ExecutedPath::Classic;
++    lastEvidence_.capabilities = capabilities_;
++    lastEvidence_.meshletCount = scene_.meshletCount;
++    lastFrameSlot_ = frameContext.frameSlot;
+     return {};
+ }
+ 
+@@ -248,7 +270,7 @@ void Renderer::Shutdown(lgp::framework::DeviceResources &deviceResources) noexce
+ 
+ void Renderer::ConfigureHeadlessTest(HeadlessTestConfiguration const &configuration) noexcept
+ {
+-    (void)configuration;
++    headlessConfiguration_ = configuration;
+ }
+ 
+ gpu::GpuScene const &Renderer::LastScene() const noexcept
+@@ -256,4 +278,9 @@ gpu::GpuScene const &Renderer::LastScene() const noexcept
+     return scene_;
+ }
+ 
++gpu::MeshShaderCapabilities Renderer::Capabilities() const noexcept
++{
++    return capabilities_;
++}
++
+ } // namespace ch22::meshlets::starter
+diff --git a/chapters/meshlets-and-mesh-shader-pipelines/Starter/Renderer.hpp b/chapters/meshlets-and-mesh-shader-pipelines/Starter/Renderer.hpp
+index 3529473..540309c 100644
+--- a/chapters/meshlets-and-mesh-shader-pipelines/Starter/Renderer.hpp
++++ b/chapters/meshlets-and-mesh-shader-pipelines/Starter/Renderer.hpp
+@@ -8,6 +8,8 @@
+ 
+ #include <wrl/client.h>
+ 
++#include <expected>
++#include <optional>
+ #include <vector>
+ 
+ namespace ch22::meshlets::starter
+@@ -26,7 +28,9 @@ class Renderer final : public lgp::framework::IChapterRenderer
+     void Shutdown(lgp::framework::DeviceResources &deviceResources) noexcept override;
+ 
+     void ConfigureHeadlessTest(HeadlessTestConfiguration const &configuration) noexcept;
++    [[nodiscard]] std::expected<gpu::MeshEvidence, lgp::framework::Error> ReadBackEvidence();
+     [[nodiscard]] gpu::GpuScene const &LastScene() const noexcept;
++    [[nodiscard]] gpu::MeshShaderCapabilities Capabilities() const noexcept;
+ 
+   private:
+     struct FrameSlot final
+@@ -36,15 +40,22 @@ class Renderer final : public lgp::framework::IChapterRenderer
+         lgp::framework::DescriptorAllocation descriptor{};
+     };
+ 
++    [[nodiscard]] gpu::LabConfiguration ActiveConfiguration() const noexcept;
++    [[nodiscard]] gpu::ExecutedPath ResolvePath() const noexcept;
+     [[nodiscard]] lgp::framework::Status CreateDeviceObjects();
+ 
+     lgp::framework::DeviceResources *deviceResources_{};
++    gpu::MeshShaderCapabilities capabilities_{};
+     lgp::framework::CompiledShader vertexShader_{};
+     lgp::framework::CompiledShader pixelShader_{};
+     Microsoft::WRL::ComPtr<ID3D12RootSignature> rootSignature_{};
+     Microsoft::WRL::ComPtr<ID3D12PipelineState> pipeline_{};
+     std::vector<FrameSlot> frameSlots_{};
+     gpu::GpuScene scene_{};
++    std::optional<HeadlessTestConfiguration> headlessConfiguration_{};
++    gpu::MeshEvidence lastEvidence_{};
++    UINT lastFrameSlot_{};
++    bool headless_{};
+ };
+ 
+ } // namespace ch22::meshlets::starter
