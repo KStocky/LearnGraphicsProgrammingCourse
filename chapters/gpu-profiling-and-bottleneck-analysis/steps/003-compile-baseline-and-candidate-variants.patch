@@ -1,0 +1,260 @@
+diff --git a/chapters/gpu-profiling-and-bottleneck-analysis/Starter/ProfilingLab.hlsl b/chapters/gpu-profiling-and-bottleneck-analysis/Starter/ProfilingLab.hlsl
+index 2b5e182..b1d5256 100644
+--- a/chapters/gpu-profiling-and-bottleneck-analysis/Starter/ProfilingLab.hlsl
++++ b/chapters/gpu-profiling-and-bottleneck-analysis/Starter/ProfilingLab.hlsl
+@@ -1,17 +1,32 @@
+ #include "ProfilingLab.hlsli"
+ 
+-// Starter: the lab renders a single correct variant. Wave parameters arrive through a constant buffer that is
+-// broadcast to every pixel invocation.
++// Solution: two equal-output variants. The ONLY difference is how a wave is fetched.
++//
++//   * Baseline reads wave parameters from a constant buffer (broadcast).
++//   * Candidate reads the same bytes from a structured buffer (per-lane load).
++//
++// Both instantiate the shared field macro, so the accumulated field - and therefore the rendered output - is
++// byte-for-byte identical. The isolated fetch difference is what a controlled A/B timing experiment measures.
++
+ cbuffer WaveConstants : register(b1)
+ {
+-    WaveParam gWaves[LGP_MAX_WAVES];
++    WaveParam gWavesConstant[LGP_MAX_WAVES];
+ };
+ 
+-#define FETCH_BASELINE(i) gWaves[(i)]
++StructuredBuffer<WaveParam> gWavesStructured : register(t0);
++
++#define FETCH_BASELINE(i) gWavesConstant[(i)]
++#define FETCH_CANDIDATE(i) gWavesStructured[(i)]
+ 
+ LGP_DEFINE_PROFILING_FIELD(ComputeBaselineField, FETCH_BASELINE)
++LGP_DEFINE_PROFILING_FIELD(ComputeCandidateField, FETCH_CANDIDATE)
+ 
+-float4 ProfilingPS(FullScreenVertex input) : SV_Target0
++float4 BaselinePS(FullScreenVertex input) : SV_Target0
+ {
+     return FieldToColor(ComputeBaselineField(ScreenUv(input.position.xy)));
+ }
++
++float4 CandidatePS(FullScreenVertex input) : SV_Target0
++{
++    return FieldToColor(ComputeCandidateField(ScreenUv(input.position.xy)));
++}
+diff --git a/chapters/gpu-profiling-and-bottleneck-analysis/Starter/Renderer.cpp b/chapters/gpu-profiling-and-bottleneck-analysis/Starter/Renderer.cpp
+index 8e08079..7efa1eb 100644
+--- a/chapters/gpu-profiling-and-bottleneck-analysis/Starter/Renderer.cpp
++++ b/chapters/gpu-profiling-and-bottleneck-analysis/Starter/Renderer.cpp
+@@ -39,13 +39,54 @@ inline constexpr std::uint32_t kStarterWorkloadEnd = 1U;
+     return std::chrono::duration<double, std::milli>(end - begin).count();
+ }
+ 
++[[nodiscard]] lgp::framework::Status CreateGraphicsPipeline(ID3D12Device10 &device, ID3D12RootSignature &rootSignature,
++                                                            lgp::framework::CompiledShader const &vertexShader,
++                                                            lgp::framework::CompiledShader const &pixelShader,
++                                                            DXGI_FORMAT renderTargetFormat,
++                                                            ComPtr<ID3D12PipelineState> &pipeline)
++{
++    D3D12_BLEND_DESC blend{};
++    blend.RenderTarget[0].RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
++    D3D12_RASTERIZER_DESC rasterizer{};
++    rasterizer.FillMode = D3D12_FILL_MODE_SOLID;
++    rasterizer.CullMode = D3D12_CULL_MODE_NONE;
++    rasterizer.DepthClipEnable = TRUE;
++    D3D12_DEPTH_STENCIL_DESC depth{};
++    depth.DepthEnable = FALSE;
++    depth.DepthWriteMask = D3D12_DEPTH_WRITE_MASK_ZERO;
++    depth.DepthFunc = D3D12_COMPARISON_FUNC_ALWAYS;
++    D3D12_GRAPHICS_PIPELINE_STATE_DESC description{};
++    description.pRootSignature = &rootSignature;
++    description.VS = vertexShader.Bytecode();
++    description.PS = pixelShader.Bytecode();
++    description.BlendState = blend;
++    description.SampleMask = UINT_MAX;
++    description.RasterizerState = rasterizer;
++    description.DepthStencilState = depth;
++    description.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
++    description.NumRenderTargets = 1U;
++    description.RTVFormats[0] = renderTargetFormat;
++    description.SampleDesc.Count = 1U;
++    HRESULT const result =
++        device.CreateGraphicsPipelineState(&description, IID_PPV_ARGS(pipeline.ReleaseAndGetAddressOf()));
++    if (FAILED(result))
++    {
++        return std::unexpected(lgp::framework::MakeHResultError("ID3D12Device::CreateGraphicsPipelineState", result,
++                                                                "Failed to create a Chapter 19 starter pipeline."));
++    }
++    return {};
++}
++
+ } // namespace
+ 
+ gpu::LabConfiguration Renderer::ActiveConfiguration() const noexcept
+ {
+     gpu::LabConfiguration configuration =
+         headless_ && headlessConfiguration_.has_value() ? *headlessConfiguration_ : gpu::LabConfiguration{};
+-    configuration.variant = gpu::LabVariant::Baseline;
++    if (!headless_)
++    {
++        configuration.variant = interactiveVariant_;
++    }
+     configuration.waveCount = gpu::NormalizeWaveCount(configuration.waveCount);
+     configuration.iterations = std::max(configuration.iterations, 1U);
+     return configuration;
+@@ -67,7 +108,11 @@ lgp::framework::Status Renderer::CreateShaders()
+     {
+         return status;
+     }
+-    return gpu::CompileShader(compiler, options, L"ProfilingPS", L"ps_6_0", pixelShader_);
++    if (auto status = gpu::CompileShader(compiler, options, L"BaselinePS", L"ps_6_0", baselinePixelShader_); !status)
++    {
++        return status;
++    }
++    return gpu::CompileShader(compiler, options, L"CandidatePS", L"ps_6_0", candidatePixelShader_);
+ }
+ 
+ lgp::framework::Status Renderer::CreateRootSignature()
+@@ -118,38 +163,17 @@ lgp::framework::Status Renderer::CreateRootSignature()
+     return {};
+ }
+ 
+-lgp::framework::Status Renderer::CreatePipeline()
++lgp::framework::Status Renderer::CreatePipelines()
+ {
+-    D3D12_BLEND_DESC blend{};
+-    blend.RenderTarget[0].RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
+-    D3D12_RASTERIZER_DESC rasterizer{};
+-    rasterizer.FillMode = D3D12_FILL_MODE_SOLID;
+-    rasterizer.CullMode = D3D12_CULL_MODE_NONE;
+-    rasterizer.DepthClipEnable = TRUE;
+-    D3D12_DEPTH_STENCIL_DESC depth{};
+-    depth.DepthEnable = FALSE;
+-    depth.DepthWriteMask = D3D12_DEPTH_WRITE_MASK_ZERO;
+-    depth.DepthFunc = D3D12_COMPARISON_FUNC_ALWAYS;
+-    D3D12_GRAPHICS_PIPELINE_STATE_DESC description{};
+-    description.pRootSignature = rootSignature_.Get();
+-    description.VS = vertexShader_.Bytecode();
+-    description.PS = pixelShader_.Bytecode();
+-    description.BlendState = blend;
+-    description.SampleMask = UINT_MAX;
+-    description.RasterizerState = rasterizer;
+-    description.DepthStencilState = depth;
+-    description.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+-    description.NumRenderTargets = 1U;
+-    description.RTVFormats[0] = deviceResources_->back_buffer_format();
+-    description.SampleDesc.Count = 1U;
+-    HRESULT const result = deviceResources_->device()->CreateGraphicsPipelineState(
+-        &description, IID_PPV_ARGS(pipeline_.ReleaseAndGetAddressOf()));
+-    if (FAILED(result))
++    if (auto status =
++            CreateGraphicsPipeline(*deviceResources_->device(), *rootSignature_.Get(), vertexShader_,
++                                   baselinePixelShader_, deviceResources_->back_buffer_format(), baselinePipeline_);
++        !status)
+     {
+-        return std::unexpected(lgp::framework::MakeHResultError("ID3D12Device::CreateGraphicsPipelineState", result,
+-                                                                "Failed to create the Chapter 19 starter pipeline."));
++        return status;
+     }
+-    return {};
++    return CreateGraphicsPipeline(*deviceResources_->device(), *rootSignature_.Get(), vertexShader_,
++                                  candidatePixelShader_, deviceResources_->back_buffer_format(), candidatePipeline_);
+ }
+ 
+ lgp::framework::Status Renderer::CreateResources()
+@@ -220,7 +244,7 @@ lgp::framework::Status Renderer::Initialize(lgp::framework::ApplicationInitConte
+     {
+         return status;
+     }
+-    if (auto status = CreatePipeline(); !status)
++    if (auto status = CreatePipelines(); !status)
+     {
+         return status;
+     }
+@@ -237,7 +261,17 @@ lgp::framework::Status Renderer::OnResize(lgp::framework::DeviceResources &devic
+ 
+ lgp::framework::Status Renderer::Update(lgp::framework::UpdateContext const &context)
+ {
+-    (void)context;
++    if (!headless_)
++    {
++        if (context.input.WasKeyPressed('1'))
++        {
++            interactiveVariant_ = gpu::LabVariant::Baseline;
++        }
++        if (context.input.WasKeyPressed('2'))
++        {
++            interactiveVariant_ = gpu::LabVariant::Candidate;
++        }
++    }
+     if (waveUploadPending_)
+     {
+         if (auto status = UploadWaves(); !status)
+@@ -256,7 +290,8 @@ lgp::framework::Status Renderer::Render(lgp::framework::FrameContext const &fram
+     ID3D12DescriptorHeap *heaps[]{frameContext.shaderVisibleCbvSrvUavHeap};
+     commandList.SetDescriptorHeaps(1U, heaps);
+     UINT const baseQuery = frameContext.frameSlot * kStarterTimestampsPerFrame;
+-
++    bool const useCandidate = configuration.variant == gpu::LabVariant::Candidate;
++    ID3D12PipelineState *const pipeline = useCandidate ? candidatePipeline_.Get() : baselinePipeline_.Get();
+     gpu::RenderConstants const constants{gpu::kRenderWidth, gpu::kRenderHeight, configuration.waveCount,
+                                          configuration.iterations};
+ 
+@@ -282,14 +317,15 @@ lgp::framework::Status Renderer::Render(lgp::framework::FrameContext const &fram
+         commandList.SetGraphicsRoot32BitConstants(0U, sizeof(constants) / sizeof(std::uint32_t), &constants, 0U);
+         commandList.SetGraphicsRootConstantBufferView(1U, wavesBuffer_.Get()->GetGPUVirtualAddress());
+         commandList.SetGraphicsRootDescriptorTable(2U, wavesDescriptor_.GpuHandle(0U));
+-        commandList.SetPipelineState(pipeline_.Get());
++        commandList.SetPipelineState(pipeline);
+ 
+         {
+             lgp::framework::PixEventScope const controlScope{commandList, lgp::framework::PixColor(120U, 120U, 120U),
+                                                              L"Controlled Region"};
+             {
+-                lgp::framework::PixEventScope const workloadScope{commandList, lgp::framework::PixColor(200U, 160U, 40U),
+-                                                                  L"Baseline Workload"};
++                lgp::framework::PixEventScope const workloadScope{
++                    commandList, lgp::framework::PixColor(200U, 160U, 40U),
++                    useCandidate ? L"Candidate Workload" : L"Baseline Workload"};
+                 commandList.EndQuery(timestampHeap_.Get(), D3D12_QUERY_TYPE_TIMESTAMP,
+                                      baseQuery + kStarterWorkloadBegin);
+                 commandList.DrawInstanced(3U, 1U, 0U, 0U);
+@@ -334,7 +370,8 @@ void Renderer::Shutdown(lgp::framework::DeviceResources &deviceResources) noexce
+     frameSlots_.clear();
+     wavesBuffer_ = gpu::BufferResource{};
+     timestampHeap_.Reset();
+-    pipeline_.Reset();
++    candidatePipeline_.Reset();
++    baselinePipeline_.Reset();
+     rootSignature_.Reset();
+     deviceResources_ = nullptr;
+ }
+diff --git a/chapters/gpu-profiling-and-bottleneck-analysis/Starter/Renderer.hpp b/chapters/gpu-profiling-and-bottleneck-analysis/Starter/Renderer.hpp
+index cd89ac4..2ce00c9 100644
+--- a/chapters/gpu-profiling-and-bottleneck-analysis/Starter/Renderer.hpp
++++ b/chapters/gpu-profiling-and-bottleneck-analysis/Starter/Renderer.hpp
+@@ -57,20 +57,23 @@ class Renderer final : public lgp::framework::IChapterRenderer
+ 
+     [[nodiscard]] lgp::framework::Status CreateShaders();
+     [[nodiscard]] lgp::framework::Status CreateRootSignature();
+-    [[nodiscard]] lgp::framework::Status CreatePipeline();
++    [[nodiscard]] lgp::framework::Status CreatePipelines();
+     [[nodiscard]] lgp::framework::Status CreateResources();
+     [[nodiscard]] lgp::framework::Status UploadWaves();
+ 
+     lgp::framework::DeviceResources *deviceResources_{};
+     lgp::framework::CompiledShader vertexShader_{};
+-    lgp::framework::CompiledShader pixelShader_{};
++    lgp::framework::CompiledShader baselinePixelShader_{};
++    lgp::framework::CompiledShader candidatePixelShader_{};
+     Microsoft::WRL::ComPtr<ID3D12RootSignature> rootSignature_{};
+-    Microsoft::WRL::ComPtr<ID3D12PipelineState> pipeline_{};
++    Microsoft::WRL::ComPtr<ID3D12PipelineState> baselinePipeline_{};
++    Microsoft::WRL::ComPtr<ID3D12PipelineState> candidatePipeline_{};
+     Microsoft::WRL::ComPtr<ID3D12QueryHeap> timestampHeap_{};
+     gpu::BufferResource wavesBuffer_{};
+     lgp::framework::DescriptorAllocation wavesDescriptor_{};
+     std::vector<FrameSlot> frameSlots_{};
+     std::optional<HeadlessTestConfiguration> headlessConfiguration_{};
++    gpu::LabVariant interactiveVariant_{gpu::LabVariant::Baseline};
+     CoarseEvidence pendingEvidence_{};
+     UINT lastFrameSlot_{};
+     bool pendingEvidenceValid_{false};

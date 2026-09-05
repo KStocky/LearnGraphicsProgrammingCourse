@@ -1,0 +1,273 @@
+diff --git a/chapters/gpu-profiling-and-bottleneck-analysis/Starter/Renderer.cpp b/chapters/gpu-profiling-and-bottleneck-analysis/Starter/Renderer.cpp
+index 7efa1eb..f8c5fb7 100644
+--- a/chapters/gpu-profiling-and-bottleneck-analysis/Starter/Renderer.cpp
++++ b/chapters/gpu-profiling-and-bottleneck-analysis/Starter/Renderer.cpp
+@@ -18,10 +18,6 @@ using Microsoft::WRL::ComPtr;
+ 
+ inline constexpr UINT kWavesSrvDescriptorCount = 1U;
+ 
+-inline constexpr std::uint32_t kStarterTimestampsPerFrame = 2U;
+-inline constexpr std::uint32_t kStarterWorkloadBegin = 0U;
+-inline constexpr std::uint32_t kStarterWorkloadEnd = 1U;
+-
+ [[nodiscard]] std::filesystem::path ShaderPath()
+ {
+     return std::filesystem::path{__FILE__}.parent_path() / "ProfilingLab.hlsl";
+@@ -92,6 +88,16 @@ gpu::LabConfiguration Renderer::ActiveConfiguration() const noexcept
+     return configuration;
+ }
+ 
++gpu::GpuClockCalibration const &Renderer::LastCalibration() const noexcept
++{
++    return lastCalibration_;
++}
++
++bool Renderer::TimestampsSupported() const noexcept
++{
++    return lastCalibration_.timestampsSupported;
++}
++
+ lgp::framework::Status Renderer::CreateShaders()
+ {
+     auto compilerResult = lgp::framework::ShaderCompiler::Create();
+@@ -179,7 +185,7 @@ lgp::framework::Status Renderer::CreatePipelines()
+ lgp::framework::Status Renderer::CreateResources()
+ {
+     UINT const frameSlotCount = deviceResources_->back_buffer_count();
+-    auto heap = gpu::CreateTimestampHeap(*deviceResources_->device(), frameSlotCount * kStarterTimestampsPerFrame,
++    auto heap = gpu::CreateTimestampHeap(*deviceResources_->device(), frameSlotCount * gpu::kTimestampsPerFrame,
+                                          L"Ch19 Starter Timestamps");
+     if (!heap)
+     {
+@@ -213,9 +219,9 @@ lgp::framework::Status Renderer::CreateResources()
+     frameSlots_.resize(frameSlotCount);
+     for (FrameSlot &slot : frameSlots_)
+     {
+-        auto readback = gpu::CreateBuffer(*deviceResources_->device(),
+-                                          kStarterTimestampsPerFrame * sizeof(std::uint64_t), D3D12_HEAP_TYPE_READBACK,
+-                                          D3D12_RESOURCE_FLAG_NONE, L"Ch19 Starter Timestamp Readback", true);
++        auto readback = gpu::CreateBuffer(*deviceResources_->device(), gpu::kTimestampsPerFrame * sizeof(std::uint64_t),
++                                          D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_FLAG_NONE,
++                                          L"Ch19 Starter Timestamp Readback", true);
+         if (!readback)
+         {
+             return std::unexpected(std::move(readback.error()));
+@@ -285,23 +291,31 @@ lgp::framework::Status Renderer::Update(lgp::framework::UpdateContext const &con
+ 
+ lgp::framework::Status Renderer::Render(lgp::framework::FrameContext const &frameContext)
+ {
++    // Capture the CPU command-recording start here, at the top of Render (BeginFrame has already returned), so
++    // the measured duration reflects command recording only. It intentionally excludes the framework's
++    // BeginFrame fence wait and the later EndFrame execute/signal cost, which this renderer cannot time from
++    // inside Render.
++    auto const recordingStart = std::chrono::steady_clock::now();
+     gpu::LabConfiguration const configuration = ActiveConfiguration();
+     ID3D12GraphicsCommandList7 &commandList = *frameContext.commandList;
+     ID3D12DescriptorHeap *heaps[]{frameContext.shaderVisibleCbvSrvUavHeap};
+     commandList.SetDescriptorHeaps(1U, heaps);
+-    UINT const baseQuery = frameContext.frameSlot * kStarterTimestampsPerFrame;
++
++    // Calibration is sampled once per frame, close to submission, so the raw ticks resolved this frame align to
++    // a nearby GPU/QPC anchor. One calibration per captured frame is an alignment aid for teaching, not a claim
++    // of nanosecond truth.
++    lastCalibration_ = gpu::CaptureQueueCalibration(*deviceResources_->graphics_queue());
++
++    UINT const baseQuery = frameContext.frameSlot * gpu::kTimestampsPerFrame;
+     bool const useCandidate = configuration.variant == gpu::LabVariant::Candidate;
+     ID3D12PipelineState *const pipeline = useCandidate ? candidatePipeline_.Get() : baselinePipeline_.Get();
+     gpu::RenderConstants const constants{gpu::kRenderWidth, gpu::kRenderHeight, configuration.waveCount,
+                                          configuration.iterations};
+ 
+-    auto const cpuBegin = std::chrono::steady_clock::now();
+     {
+-        // Coarse frame-scope PIX marker. Nothing that can fail early runs inside the scope, so the begin/end
+-        // pairing is guaranteed even though this starter does not use RAII around the inner workload marker
+-        // beyond the framework's scoped helper.
+         lgp::framework::PixEventScope const frameScope{commandList, lgp::framework::PixColor(64U, 128U, 200U),
+                                                        L"Ch19 Profiling Frame"};
++        commandList.EndQuery(timestampHeap_.Get(), D3D12_QUERY_TYPE_TIMESTAMP, baseQuery + gpu::kQueryFrameBegin);
+ 
+         std::vector<D3D12_TEXTURE_BARRIER> textureBarriers{gpu::MakeTextureBarrier(
+             *frameContext.renderTarget, gpu::FrameStartState(frameContext), gpu::RenderTargetState())};
+@@ -327,17 +341,20 @@ lgp::framework::Status Renderer::Render(lgp::framework::FrameContext const &fram
+                     commandList, lgp::framework::PixColor(200U, 160U, 40U),
+                     useCandidate ? L"Candidate Workload" : L"Baseline Workload"};
+                 commandList.EndQuery(timestampHeap_.Get(), D3D12_QUERY_TYPE_TIMESTAMP,
+-                                     baseQuery + kStarterWorkloadBegin);
++                                     baseQuery + gpu::kQueryWorkloadBegin);
+                 commandList.DrawInstanced(3U, 1U, 0U, 0U);
+-                commandList.EndQuery(timestampHeap_.Get(), D3D12_QUERY_TYPE_TIMESTAMP, baseQuery + kStarterWorkloadEnd);
++                commandList.EndQuery(timestampHeap_.Get(), D3D12_QUERY_TYPE_TIMESTAMP,
++                                     baseQuery + gpu::kQueryWorkloadEnd);
+             }
+         }
+ 
++        commandList.EndQuery(timestampHeap_.Get(), D3D12_QUERY_TYPE_TIMESTAMP, baseQuery + gpu::kQueryFrameEnd);
++
+         {
+             lgp::framework::PixEventScope const resolveScope{commandList, lgp::framework::PixColor(40U, 200U, 120U),
+                                                              L"Timestamp Resolve"};
+-            commandList.ResolveQueryData(timestampHeap_.Get(), D3D12_QUERY_TYPE_TIMESTAMP,
+-                                         baseQuery + kStarterWorkloadBegin, kStarterTimestampsPerFrame,
++            commandList.ResolveQueryData(timestampHeap_.Get(), D3D12_QUERY_TYPE_TIMESTAMP, baseQuery,
++                                         gpu::kTimestampsPerFrame,
+                                          frameSlots_.at(frameContext.frameSlot).timestampReadback.Get(), 0U);
+         }
+ 
+@@ -345,18 +362,13 @@ lgp::framework::Status Renderer::Render(lgp::framework::FrameContext const &fram
+             *frameContext.renderTarget, gpu::RenderTargetState(), gpu::FrameEndState(frameContext))};
+         gpu::SubmitTextureBarriers(commandList, endBarriers);
+     }
+-    auto const cpuEnd = std::chrono::steady_clock::now();
+-
+-    std::uint64_t frequency{};
+-    bool const frequencySupported =
+-        SUCCEEDED(deviceResources_->graphics_queue()->GetTimestampFrequency(&frequency)) && frequency != 0U;
+-
+-    pendingEvidence_ = {};
+-    pendingEvidence_.cpuRecordingMilliseconds = MillisecondsBetween(cpuBegin, cpuEnd);
+-    pendingEvidence_.gpuTimestampFrequencyHz = frequency;
+-    pendingEvidence_.timestampsSupported = frequencySupported;
+-    lastFrameSlot_ = frameContext.frameSlot;
+-    pendingEvidenceValid_ = true;
++    auto const recordingEnd = std::chrono::steady_clock::now();
++
++    pendingFrame_ = {};
++    pendingFrame_.calibration = lastCalibration_;
++    pendingFrame_.cpuRecordingMilliseconds = MillisecondsBetween(recordingStart, recordingEnd);
++    pendingFrame_.frameSlot = frameContext.frameSlot;
++    pendingFrame_.valid = true;
+     return {};
+ }
+ 
+@@ -382,33 +394,41 @@ void Renderer::ConfigureExperiment(HeadlessTestConfiguration const &configuratio
+     waveUploadPending_ = true;
+ }
+ 
+-std::expected<CoarseEvidence, lgp::framework::Error> Renderer::ReadCoarseEvidence()
++std::expected<MeasurementSample, lgp::framework::Error> Renderer::ReadPendingSample()
+ {
+-    if (!pendingEvidenceValid_)
++    if (!pendingFrame_.valid)
+     {
+         return std::unexpected(
+-            lgp::framework::MakeError("ReadCoarseEvidence", "No Chapter 19 starter frame is pending readback."));
++            lgp::framework::MakeError("ReadPendingSample", "No Chapter 19 measured frame is pending readback."));
+     }
+     if (auto status = deviceResources_->WaitForGpuIdle(); !status)
+     {
+         return std::unexpected(std::move(status.error()));
+     }
+-    // Consume exactly once: copy the pending metadata and invalidate the pending flag before interpreting the
+-    // readback, so a second read without an intervening frame fails closed above.
+-    CoarseEvidence evidence = pendingEvidence_;
+-    UINT const frameSlot = lastFrameSlot_;
+-    pendingEvidenceValid_ = false;
++    // Consume the pending evidence exactly once: copy its metadata locally and invalidate the pending flag
++    // before interpreting the readback, so a second read without an intervening frame fails closed above rather
++    // than returning a stale sample.
++    PendingFrame const pending = pendingFrame_;
++    pendingFrame_.valid = false;
++
++    if (!pending.calibration.valid)
++    {
++        return std::unexpected(lgp::framework::MakeError(
++            "ReadPendingSample",
++            "GPU timestamp calibration is unsupported on this device; refusing to fabricate timing samples."));
++    }
+ 
+-    FrameSlot const &slot = frameSlots_.at(frameSlot);
++    FrameSlot const &slot = frameSlots_.at(pending.frameSlot);
+     auto const *timestamps = reinterpret_cast<std::uint64_t const *>(slot.timestampReadback.mapped_data());
+     if (timestamps == nullptr)
+     {
+         return std::unexpected(
+-            lgp::framework::MakeError("ReadCoarseEvidence", "Chapter 19 starter timestamp readback is not mapped."));
++            lgp::framework::MakeError("ReadPendingSample", "Chapter 19 timestamp readback is not mapped."));
+     }
+-    evidence.rawWorkloadBeginTick = timestamps[kStarterWorkloadBegin];
+-    evidence.rawWorkloadEndTick = timestamps[kStarterWorkloadEnd];
+-    return evidence;
++    std::uint64_t const rawWorkloadBegin = timestamps[gpu::kQueryWorkloadBegin];
++    std::uint64_t const rawWorkloadEnd = timestamps[gpu::kQueryWorkloadEnd];
++    return gpu::BuildMeasurementSample(rawWorkloadBegin, rawWorkloadEnd, pending.calibration,
++                                       pending.cpuRecordingMilliseconds);
+ }
+ 
+ } // namespace ch19::gpu_profiling::starter
+diff --git a/chapters/gpu-profiling-and-bottleneck-analysis/Starter/Renderer.hpp b/chapters/gpu-profiling-and-bottleneck-analysis/Starter/Renderer.hpp
+index 2ce00c9..0347b25 100644
+--- a/chapters/gpu-profiling-and-bottleneck-analysis/Starter/Renderer.hpp
++++ b/chapters/gpu-profiling-and-bottleneck-analysis/Starter/Renderer.hpp
+@@ -18,21 +18,6 @@ namespace ch19::gpu_profiling::starter
+ 
+ using HeadlessTestConfiguration = gpu::LabConfiguration;
+ 
+-// Coarse, single-sample evidence. It is deliberately incomplete: one uncalibrated raw timestamp pair and one
+-// CPU command-recording span, with no warm-up, repeats, calibration, fingerprint, or comparison. It exists only
+-// to *motivate* the disciplined Solution, never to draw a conclusion.
+-struct CoarseEvidence final
+-{
+-    // CPU wall-clock time spent recording this frame's command list (command recording only; excludes the
+-    // framework fence wait and the EndFrame execute/signal cost). Same honest meaning as the Solution's
+-    // per-sample cpuRecordingMilliseconds.
+-    double cpuRecordingMilliseconds{};
+-    std::uint64_t rawWorkloadBeginTick{};
+-    std::uint64_t rawWorkloadEndTick{};
+-    std::uint64_t gpuTimestampFrequencyHz{};
+-    bool timestampsSupported{false};
+-};
+-
+ class Renderer final : public lgp::framework::IChapterRenderer
+ {
+   public:
+@@ -43,11 +28,19 @@ class Renderer final : public lgp::framework::IChapterRenderer
+     [[nodiscard]] lgp::framework::Status Render(lgp::framework::FrameContext const &frameContext) override;
+     void Shutdown(lgp::framework::DeviceResources &deviceResources) noexcept override;
+ 
++    // Programmatic profiling API used by the GPU tests, which sequence the baseline and candidate variants into
++    // a controlled A/B experiment. A windowed run selects one stable variant at a time with 1 or 2 so each PIX
++    // capture contains one unambiguous workload rather than automatic in-app alternation.
+     void ConfigureExperiment(HeadlessTestConfiguration const &configuration) noexcept;
+-    // Consumes the coarse evidence recorded for the most recently submitted frame exactly once: a second call
+-    // without an intervening frame fails closed rather than returning a stale, already-consumed reading.
+-    [[nodiscard]] std::expected<CoarseEvidence, lgp::framework::Error> ReadCoarseEvidence();
+     [[nodiscard]] gpu::LabConfiguration ActiveConfiguration() const noexcept;
++    [[nodiscard]] gpu::GpuClockCalibration const &LastCalibration() const noexcept;
++    [[nodiscard]] bool TimestampsSupported() const noexcept;
++
++    // Reads back the timestamps resolved for the most recently submitted frame, calibrates them onto the shared
++    // QPC timeline, and returns one canonical MeasurementSample. Must be called only after the frame's fence has
++    // completed (the harness waits for GPU idle first). Pending evidence is consumed exactly once: a second call
++    // without an intervening frame fails closed rather than returning a stale sample.
++    [[nodiscard]] std::expected<MeasurementSample, lgp::framework::Error> ReadPendingSample();
+ 
+   private:
+     struct FrameSlot final
+@@ -55,6 +48,14 @@ class Renderer final : public lgp::framework::IChapterRenderer
+         gpu::BufferResource timestampReadback{};
+     };
+ 
++    struct PendingFrame final
++    {
++        gpu::GpuClockCalibration calibration{};
++        double cpuRecordingMilliseconds{};
++        UINT frameSlot{};
++        bool valid{false};
++    };
++
+     [[nodiscard]] lgp::framework::Status CreateShaders();
+     [[nodiscard]] lgp::framework::Status CreateRootSignature();
+     [[nodiscard]] lgp::framework::Status CreatePipelines();
+@@ -74,9 +75,8 @@ class Renderer final : public lgp::framework::IChapterRenderer
+     std::vector<FrameSlot> frameSlots_{};
+     std::optional<HeadlessTestConfiguration> headlessConfiguration_{};
+     gpu::LabVariant interactiveVariant_{gpu::LabVariant::Baseline};
+-    CoarseEvidence pendingEvidence_{};
+-    UINT lastFrameSlot_{};
+-    bool pendingEvidenceValid_{false};
++    PendingFrame pendingFrame_{};
++    gpu::GpuClockCalibration lastCalibration_{};
+     bool headless_{};
+     bool waveUploadPending_{true};
+ };

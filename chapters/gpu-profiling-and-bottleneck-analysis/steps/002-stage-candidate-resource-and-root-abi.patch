@@ -1,0 +1,110 @@
+diff --git a/chapters/gpu-profiling-and-bottleneck-analysis/Starter/Renderer.cpp b/chapters/gpu-profiling-and-bottleneck-analysis/Starter/Renderer.cpp
+index 0e20ba8..8e08079 100644
+--- a/chapters/gpu-profiling-and-bottleneck-analysis/Starter/Renderer.cpp
++++ b/chapters/gpu-profiling-and-bottleneck-analysis/Starter/Renderer.cpp
+@@ -16,6 +16,8 @@ namespace
+ 
+ using Microsoft::WRL::ComPtr;
+ 
++inline constexpr UINT kWavesSrvDescriptorCount = 1U;
++
+ inline constexpr std::uint32_t kStarterTimestampsPerFrame = 2U;
+ inline constexpr std::uint32_t kStarterWorkloadBegin = 0U;
+ inline constexpr std::uint32_t kStarterWorkloadEnd = 1U;
+@@ -70,7 +72,12 @@ lgp::framework::Status Renderer::CreateShaders()
+ 
+ lgp::framework::Status Renderer::CreateRootSignature()
+ {
+-    D3D12_ROOT_PARAMETER parameters[2]{};
++    D3D12_DESCRIPTOR_RANGE srvRange{};
++    srvRange.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
++    srvRange.NumDescriptors = 1U;
++    srvRange.BaseShaderRegister = 0U;
++
++    D3D12_ROOT_PARAMETER parameters[3]{};
+     parameters[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+     parameters[0].Constants.ShaderRegister = 0U;
+     parameters[0].Constants.Num32BitValues = sizeof(gpu::RenderConstants) / sizeof(std::uint32_t);
+@@ -78,6 +85,10 @@ lgp::framework::Status Renderer::CreateRootSignature()
+     parameters[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_CBV;
+     parameters[1].Descriptor.ShaderRegister = 1U;
+     parameters[1].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
++    parameters[2].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
++    parameters[2].DescriptorTable.NumDescriptorRanges = 1U;
++    parameters[2].DescriptorTable.pDescriptorRanges = &srvRange;
++    parameters[2].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+ 
+     D3D12_ROOT_SIGNATURE_DESC description{};
+     description.NumParameters = static_cast<UINT>(std::size(parameters));
+@@ -160,6 +171,21 @@ lgp::framework::Status Renderer::CreateResources()
+     }
+     wavesBuffer_ = std::move(*waves);
+ 
++    auto descriptor = deviceResources_->shader_visible_cbv_srv_uav_heap().Allocate(kWavesSrvDescriptorCount);
++    if (!descriptor)
++    {
++        return std::unexpected(
++            lgp::framework::MakeError("CreateResources", "Failed to allocate the Chapter 19 waves descriptor."));
++    }
++    wavesDescriptor_ = *descriptor;
++
++    D3D12_SHADER_RESOURCE_VIEW_DESC srv{};
++    srv.ViewDimension = D3D12_SRV_DIMENSION_BUFFER;
++    srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
++    srv.Buffer.NumElements = gpu::kMaximumWaveCount;
++    srv.Buffer.StructureByteStride = sizeof(gpu::WaveParam);
++    deviceResources_->device()->CreateShaderResourceView(wavesBuffer_.Get(), &srv, wavesDescriptor_.CpuHandle(0U));
++
+     frameSlots_.resize(frameSlotCount);
+     for (FrameSlot &slot : frameSlots_)
+     {
+@@ -227,6 +253,8 @@ lgp::framework::Status Renderer::Render(lgp::framework::FrameContext const &fram
+ {
+     gpu::LabConfiguration const configuration = ActiveConfiguration();
+     ID3D12GraphicsCommandList7 &commandList = *frameContext.commandList;
++    ID3D12DescriptorHeap *heaps[]{frameContext.shaderVisibleCbvSrvUavHeap};
++    commandList.SetDescriptorHeaps(1U, heaps);
+     UINT const baseQuery = frameContext.frameSlot * kStarterTimestampsPerFrame;
+ 
+     gpu::RenderConstants const constants{gpu::kRenderWidth, gpu::kRenderHeight, configuration.waveCount,
+@@ -253,6 +281,7 @@ lgp::framework::Status Renderer::Render(lgp::framework::FrameContext const &fram
+         commandList.SetGraphicsRootSignature(rootSignature_.Get());
+         commandList.SetGraphicsRoot32BitConstants(0U, sizeof(constants) / sizeof(std::uint32_t), &constants, 0U);
+         commandList.SetGraphicsRootConstantBufferView(1U, wavesBuffer_.Get()->GetGPUVirtualAddress());
++        commandList.SetGraphicsRootDescriptorTable(2U, wavesDescriptor_.GpuHandle(0U));
+         commandList.SetPipelineState(pipeline_.Get());
+ 
+         {
+@@ -297,7 +326,11 @@ lgp::framework::Status Renderer::Render(lgp::framework::FrameContext const &fram
+ 
+ void Renderer::Shutdown(lgp::framework::DeviceResources &deviceResources) noexcept
+ {
+-    (void)deviceResources;
++    if (wavesDescriptor_)
++    {
++        deviceResources.shader_visible_cbv_srv_uav_heap().Free(wavesDescriptor_);
++        wavesDescriptor_ = {};
++    }
+     frameSlots_.clear();
+     wavesBuffer_ = gpu::BufferResource{};
+     timestampHeap_.Reset();
+diff --git a/chapters/gpu-profiling-and-bottleneck-analysis/Starter/Renderer.hpp b/chapters/gpu-profiling-and-bottleneck-analysis/Starter/Renderer.hpp
+index 92a01d2..cd89ac4 100644
+--- a/chapters/gpu-profiling-and-bottleneck-analysis/Starter/Renderer.hpp
++++ b/chapters/gpu-profiling-and-bottleneck-analysis/Starter/Renderer.hpp
+@@ -3,6 +3,7 @@
+ #include "../Common/GpuLabSupport.hpp"
+ 
+ #include <lgp/framework/application.hpp>
++#include <lgp/framework/descriptors.hpp>
+ #include <lgp/framework/shader_compiler.hpp>
+ 
+ #include <wrl/client.h>
+@@ -67,6 +68,7 @@ class Renderer final : public lgp::framework::IChapterRenderer
+     Microsoft::WRL::ComPtr<ID3D12PipelineState> pipeline_{};
+     Microsoft::WRL::ComPtr<ID3D12QueryHeap> timestampHeap_{};
+     gpu::BufferResource wavesBuffer_{};
++    lgp::framework::DescriptorAllocation wavesDescriptor_{};
+     std::vector<FrameSlot> frameSlots_{};
+     std::optional<HeadlessTestConfiguration> headlessConfiguration_{};
+     CoarseEvidence pendingEvidence_{};

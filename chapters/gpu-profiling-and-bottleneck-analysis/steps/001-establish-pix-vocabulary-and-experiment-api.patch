@@ -1,0 +1,60 @@
+diff --git a/chapters/gpu-profiling-and-bottleneck-analysis/Starter/Renderer.cpp b/chapters/gpu-profiling-and-bottleneck-analysis/Starter/Renderer.cpp
+index c98f949..0e20ba8 100644
+--- a/chapters/gpu-profiling-and-bottleneck-analysis/Starter/Renderer.cpp
++++ b/chapters/gpu-profiling-and-bottleneck-analysis/Starter/Renderer.cpp
+@@ -256,16 +256,25 @@ lgp::framework::Status Renderer::Render(lgp::framework::FrameContext const &fram
+         commandList.SetPipelineState(pipeline_.Get());
+ 
+         {
+-            lgp::framework::PixEventScope const workloadScope{commandList, lgp::framework::PixColor(200U, 160U, 40U),
+-                                                              L"Baseline Workload"};
+-            commandList.EndQuery(timestampHeap_.Get(), D3D12_QUERY_TYPE_TIMESTAMP, baseQuery + kStarterWorkloadBegin);
+-            commandList.DrawInstanced(3U, 1U, 0U, 0U);
+-            commandList.EndQuery(timestampHeap_.Get(), D3D12_QUERY_TYPE_TIMESTAMP, baseQuery + kStarterWorkloadEnd);
++            lgp::framework::PixEventScope const controlScope{commandList, lgp::framework::PixColor(120U, 120U, 120U),
++                                                             L"Controlled Region"};
++            {
++                lgp::framework::PixEventScope const workloadScope{commandList, lgp::framework::PixColor(200U, 160U, 40U),
++                                                                  L"Baseline Workload"};
++                commandList.EndQuery(timestampHeap_.Get(), D3D12_QUERY_TYPE_TIMESTAMP,
++                                     baseQuery + kStarterWorkloadBegin);
++                commandList.DrawInstanced(3U, 1U, 0U, 0U);
++                commandList.EndQuery(timestampHeap_.Get(), D3D12_QUERY_TYPE_TIMESTAMP, baseQuery + kStarterWorkloadEnd);
++            }
+         }
+ 
+-        commandList.ResolveQueryData(timestampHeap_.Get(), D3D12_QUERY_TYPE_TIMESTAMP,
+-                                     baseQuery + kStarterWorkloadBegin, kStarterTimestampsPerFrame,
+-                                     frameSlots_.at(frameContext.frameSlot).timestampReadback.Get(), 0U);
++        {
++            lgp::framework::PixEventScope const resolveScope{commandList, lgp::framework::PixColor(40U, 200U, 120U),
++                                                             L"Timestamp Resolve"};
++            commandList.ResolveQueryData(timestampHeap_.Get(), D3D12_QUERY_TYPE_TIMESTAMP,
++                                         baseQuery + kStarterWorkloadBegin, kStarterTimestampsPerFrame,
++                                         frameSlots_.at(frameContext.frameSlot).timestampReadback.Get(), 0U);
++        }
+ 
+         std::vector<D3D12_TEXTURE_BARRIER> endBarriers{gpu::MakeTextureBarrier(
+             *frameContext.renderTarget, gpu::RenderTargetState(), gpu::FrameEndState(frameContext))};
+@@ -297,7 +306,7 @@ void Renderer::Shutdown(lgp::framework::DeviceResources &deviceResources) noexce
+     deviceResources_ = nullptr;
+ }
+ 
+-void Renderer::ConfigureHeadlessTest(HeadlessTestConfiguration const &configuration) noexcept
++void Renderer::ConfigureExperiment(HeadlessTestConfiguration const &configuration) noexcept
+ {
+     headlessConfiguration_ = configuration;
+     waveUploadPending_ = true;
+diff --git a/chapters/gpu-profiling-and-bottleneck-analysis/Starter/Renderer.hpp b/chapters/gpu-profiling-and-bottleneck-analysis/Starter/Renderer.hpp
+index 56ed047..92a01d2 100644
+--- a/chapters/gpu-profiling-and-bottleneck-analysis/Starter/Renderer.hpp
++++ b/chapters/gpu-profiling-and-bottleneck-analysis/Starter/Renderer.hpp
+@@ -42,7 +42,7 @@ class Renderer final : public lgp::framework::IChapterRenderer
+     [[nodiscard]] lgp::framework::Status Render(lgp::framework::FrameContext const &frameContext) override;
+     void Shutdown(lgp::framework::DeviceResources &deviceResources) noexcept override;
+ 
+-    void ConfigureHeadlessTest(HeadlessTestConfiguration const &configuration) noexcept;
++    void ConfigureExperiment(HeadlessTestConfiguration const &configuration) noexcept;
+     // Consumes the coarse evidence recorded for the most recently submitted frame exactly once: a second call
+     // without an intervening frame fails closed rather than returning a stale, already-consumed reading.
+     [[nodiscard]] std::expected<CoarseEvidence, lgp::framework::Error> ReadCoarseEvidence();

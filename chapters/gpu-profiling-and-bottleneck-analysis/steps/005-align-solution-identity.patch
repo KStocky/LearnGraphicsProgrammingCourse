@@ -1,0 +1,105 @@
+diff --git a/chapters/gpu-profiling-and-bottleneck-analysis/Starter/Main.cpp b/chapters/gpu-profiling-and-bottleneck-analysis/Starter/Main.cpp
+index 076f073..c634c57 100644
+--- a/chapters/gpu-profiling-and-bottleneck-analysis/Starter/Main.cpp
++++ b/chapters/gpu-profiling-and-bottleneck-analysis/Starter/Main.cpp
+@@ -2,12 +2,15 @@
+ 
+ #include <cstdio>
+ 
++// The windowed Solution renders one stable instrumented variant at a time: 1 selects the constant-buffer
++// baseline and 2 selects the structured-buffer candidate. The program never alternates automatically, so each
++// PIX capture has one unambiguous workload. Headless validation drives the same variants programmatically.
+ int wmain(int argc, wchar_t **argv)
+ {
+-    ch19::gpu_profiling::starter::Renderer renderer{};
++    ch19::gpu_profiling::solution::Renderer renderer{};
+ 
+     lgp::framework::ApplicationConfiguration configuration{};
+-    configuration.title = L"Ch19 GPU Profiling Starter";
++    configuration.title = L"Ch19 GPU Profiling Solution";
+     configuration.width = 1280U;
+     configuration.height = 720U;
+     configuration.enableDebugLayer = false;
+diff --git a/chapters/gpu-profiling-and-bottleneck-analysis/Starter/Renderer.cpp b/chapters/gpu-profiling-and-bottleneck-analysis/Starter/Renderer.cpp
+index f8c5fb7..41738e2 100644
+--- a/chapters/gpu-profiling-and-bottleneck-analysis/Starter/Renderer.cpp
++++ b/chapters/gpu-profiling-and-bottleneck-analysis/Starter/Renderer.cpp
+@@ -9,7 +9,7 @@
+ #include <filesystem>
+ #include <string>
+ 
+-namespace ch19::gpu_profiling::starter
++namespace ch19::gpu_profiling::solution
+ {
+ namespace
+ {
+@@ -68,7 +68,7 @@ inline constexpr UINT kWavesSrvDescriptorCount = 1U;
+     if (FAILED(result))
+     {
+         return std::unexpected(lgp::framework::MakeHResultError("ID3D12Device::CreateGraphicsPipelineState", result,
+-                                                                "Failed to create a Chapter 19 starter pipeline."));
++                                                                "Failed to create a Chapter 19 solution pipeline."));
+     }
+     return {};
+ }
+@@ -164,7 +164,7 @@ lgp::framework::Status Renderer::CreateRootSignature()
+     if (FAILED(create))
+     {
+         return std::unexpected(lgp::framework::MakeHResultError(
+-            "ID3D12Device::CreateRootSignature", create, "Failed to create the Chapter 19 starter root signature."));
++            "ID3D12Device::CreateRootSignature", create, "Failed to create the Chapter 19 solution root signature."));
+     }
+     return {};
+ }
+@@ -186,7 +186,7 @@ lgp::framework::Status Renderer::CreateResources()
+ {
+     UINT const frameSlotCount = deviceResources_->back_buffer_count();
+     auto heap = gpu::CreateTimestampHeap(*deviceResources_->device(), frameSlotCount * gpu::kTimestampsPerFrame,
+-                                         L"Ch19 Starter Timestamps");
++                                         L"Ch19 Solution Timestamps");
+     if (!heap)
+     {
+         return std::unexpected(std::move(heap.error()));
+@@ -194,7 +194,7 @@ lgp::framework::Status Renderer::CreateResources()
+     timestampHeap_ = std::move(*heap);
+ 
+     auto waves = gpu::CreateBuffer(*deviceResources_->device(), gpu::kMaximumWaveCount * sizeof(gpu::WaveParam),
+-                                   D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_FLAG_NONE, L"Ch19 Starter Waves", true);
++                                   D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_FLAG_NONE, L"Ch19 Solution Waves", true);
+     if (!waves)
+     {
+         return std::unexpected(std::move(waves.error()));
+@@ -221,7 +221,7 @@ lgp::framework::Status Renderer::CreateResources()
+     {
+         auto readback = gpu::CreateBuffer(*deviceResources_->device(), gpu::kTimestampsPerFrame * sizeof(std::uint64_t),
+                                           D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_FLAG_NONE,
+-                                          L"Ch19 Starter Timestamp Readback", true);
++                                          L"Ch19 Solution Timestamp Readback", true);
+         if (!readback)
+         {
+             return std::unexpected(std::move(readback.error()));
+@@ -431,4 +431,4 @@ std::expected<MeasurementSample, lgp::framework::Error> Renderer::ReadPendingSam
+                                        pending.cpuRecordingMilliseconds);
+ }
+ 
+-} // namespace ch19::gpu_profiling::starter
++} // namespace ch19::gpu_profiling::solution
+diff --git a/chapters/gpu-profiling-and-bottleneck-analysis/Starter/Renderer.hpp b/chapters/gpu-profiling-and-bottleneck-analysis/Starter/Renderer.hpp
+index 0347b25..85efef0 100644
+--- a/chapters/gpu-profiling-and-bottleneck-analysis/Starter/Renderer.hpp
++++ b/chapters/gpu-profiling-and-bottleneck-analysis/Starter/Renderer.hpp
+@@ -13,7 +13,7 @@
+ #include <optional>
+ #include <vector>
+ 
+-namespace ch19::gpu_profiling::starter
++namespace ch19::gpu_profiling::solution
+ {
+ 
+ using HeadlessTestConfiguration = gpu::LabConfiguration;
+@@ -81,4 +81,4 @@ class Renderer final : public lgp::framework::IChapterRenderer
+     bool waveUploadPending_{true};
+ };
+ 
+-} // namespace ch19::gpu_profiling::starter
++} // namespace ch19::gpu_profiling::solution

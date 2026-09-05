@@ -1,10 +1,10 @@
 # Learn Graphics Programming
 
-Published learner version: `course-v2026.09.05.4`
+Published learner version: `course-v2026.09.05.5`
 
 This is a complete standalone learner repository. It contains the framework,
 Starter and Solution projects, assets, and cumulative teaching patches for every
-chapter available in `course-v2026.09.05.4`. It does not require a checkout of the private
+chapter available in `course-v2026.09.05.5`. It does not require a checkout of the private
 authoring repository.
 
 ## Requirements
@@ -42,6 +42,7 @@ not included in this learner distribution.
 - [Pass Scheduling and Multi-Queue Execution](chapters/pass-scheduling-and-multi-queue-execution)
 - [GPU Work Distribution and Indirect Execution](chapters/gpu-work-distribution-and-indirect-execution)
 - [Shader Execution, Register Pressure, and Occupancy](chapters/shader-execution-register-pressure-and-occupancy)
+- [GPU Profiling and Bottleneck Analysis](chapters/gpu-profiling-and-bottleneck-analysis)
 - [D3D12 Work Graphs and Dynamic GPU Scheduling](chapters/d3d12-work-graphs-and-dynamic-gpu-scheduling)
 - [GPU-Driven Scene Submission, Culling, and LOD](chapters/gpu-driven-scene-submission-culling-and-lod)
 - [Meshlets and Mesh Shader Pipelines](chapters/meshlets-and-mesh-shader-pipelines)
@@ -52,5 +53,5 @@ not included in this learner distribution.
 - [Monte Carlo Sampling Fundamentals](chapters/monte-carlo-sampling-fundamentals)
 - [Importance Sampling and Multiple Importance Sampling](chapters/importance-sampling-and-multiple-importance-sampling)
 
-The matching course site and tagged source archive use the same `course-v2026.09.05.4`
+The matching course site and tagged source archive use the same `course-v2026.09.05.5`
 identifier. Report learner-facing problems in this repository's Issues page.
