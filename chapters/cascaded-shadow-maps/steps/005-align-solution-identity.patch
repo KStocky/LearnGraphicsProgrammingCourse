@@ -1,0 +1,116 @@
+diff --git a/chapters/cascaded-shadow-maps/Starter/CascadedShadowLab.hlsl b/chapters/cascaded-shadow-maps/Starter/CascadedShadowLab.hlsl
+index f443754..f775648 100644
+--- a/chapters/cascaded-shadow-maps/Starter/CascadedShadowLab.hlsl
++++ b/chapters/cascaded-shadow-maps/Starter/CascadedShadowLab.hlsl
+@@ -1,15 +1,18 @@
+ #include "../Common/CascadedShadowLab.hlsli"
+ 
+-// Chapter 24 Starter shader: a single directional shadow map.
++// Chapter 24 Solution shader: four cascaded shadow maps.
+ //
+-// This is the baseline the cascaded Solution improves on. One orthographic light
+-// view covers the entire camera frustum and writes a single depth texture; the
+-// lighting pass projects each receiver into that one map and does a hardware
+-// comparison lookup. Because one map must span near and far at once, its texels
+-// are coarse - the resolution problem that cascades exist to solve. There is no
+-// cascade selection, no blend band, and no per-cascade bias here; those arrive in
+-// the Solution. gLab.cascadeViewProjection[0] holds the single light matrix and
+-// gLab.cascadeTexelBiasScale[0] is 1.
++// The four depth-only passes each write one slice of a Texture2DArray. This
++// lighting pass does the work the chapter teaches, all visible here:
++//   * SelectCascade picks the cascade for a receiver from its view depth, using
++//     the split boundaries the CPU contract computed. A blend band at the upper
++//     edge of each cascade cross-fades into the next so the resolution seam is
++//     hidden instead of popping.
++//   * SampleCascadeVisibility projects into the chosen slice, applies the
++//     per-cascade bias (scaled by that cascade's texel world size), and does a
++//     hardware comparison lookup.
++// Compare this with the Starter's single map: the near cascade now has far finer
++// texels than one map spanning the whole frustum could afford.
+ 
+ Texture2DArray<float> gShadowArray : register(t0);
+ SamplerComparisonState gShadowCompare : register(s0);
+diff --git a/chapters/cascaded-shadow-maps/Starter/Main.cpp b/chapters/cascaded-shadow-maps/Starter/Main.cpp
+index 15a41ec..32f6a6a 100644
+--- a/chapters/cascaded-shadow-maps/Starter/Main.cpp
++++ b/chapters/cascaded-shadow-maps/Starter/Main.cpp
+@@ -2,12 +2,24 @@
+ 
+ #include <cstdio>
+ 
++// Ch24 Cascaded Shadow Maps Solution - interactive controls (windowed only;
++// headless runs are deterministic and ignore input):
++//   V  Cycle the view: Shaded -> Cascade color -> Cascade-tinted shaded ->
++//      Shadow factor -> Shaded.
++//   N  Jump to the normal shaded view.       C  Jump to the cascade-color view.
++//   S  Toggle stabilization (texel snapping) on/off. Watch the far cascade edges
++//      shimmer as the camera moves once it is off.
++//   B  Toggle the cascade-transition blend band on/off. Off shows the hard seam
++//      between cascades; on cross-fades it.
++//   H  Toggle shadows on/off.
++// The current view and toggles are printed to stdout whenever they change.
++
+ int wmain(int argc, wchar_t **argv)
+ {
+-    ch24::cascaded_shadows::starter::Renderer renderer{};
++    ch24::cascaded_shadows::solution::Renderer renderer{};
+ 
+     lgp::framework::ApplicationConfiguration configuration{};
+-    configuration.title = L"Ch24 Cascaded Shadow Maps Starter";
++    configuration.title = L"Ch24 Cascaded Shadow Maps Solution";
+     configuration.width = 1280U;
+     configuration.height = 720U;
+ 
+diff --git a/chapters/cascaded-shadow-maps/Starter/Renderer.cpp b/chapters/cascaded-shadow-maps/Starter/Renderer.cpp
+index 5a8a769..63ea2fe 100644
+--- a/chapters/cascaded-shadow-maps/Starter/Renderer.cpp
++++ b/chapters/cascaded-shadow-maps/Starter/Renderer.cpp
+@@ -20,7 +20,7 @@
+ #include <string>
+ #include <utility>
+ 
+-namespace ch24::cascaded_shadows::starter
++namespace ch24::cascaded_shadows::solution
+ {
+ namespace
+ {
+@@ -718,4 +718,4 @@ std::expected<gpu::DepthReadback, lgp::framework::Error> Renderer::ReadBackShado
+                                    {gpu::kShadowResolution, gpu::kShadowResolution}, cascade, gpu::kMaxCascades);
+ }
+ 
+-} // namespace ch24::cascaded_shadows::starter
++} // namespace ch24::cascaded_shadows::solution
+diff --git a/chapters/cascaded-shadow-maps/Starter/Renderer.hpp b/chapters/cascaded-shadow-maps/Starter/Renderer.hpp
+index 01981dc..f419816 100644
+--- a/chapters/cascaded-shadow-maps/Starter/Renderer.hpp
++++ b/chapters/cascaded-shadow-maps/Starter/Renderer.hpp
+@@ -15,15 +15,16 @@
+ #include <expected>
+ #include <vector>
+ 
+-namespace ch24::cascaded_shadows::starter
++namespace ch24::cascaded_shadows::solution
+ {
+ 
+-// Starter: a deterministic single directional shadow-map baseline. It renders a
+-// depth-only pass into one shadow texture whose orthographic light view spans the
+-// whole camera frustum, then a lighting pass that projects each receiver into that
+-// single map with a hardware comparison sampler. This is the meaningful starting
+-// point the cascaded Solution improves on: one map for the entire view means coarse
+-// far-field texels. There is no cascade selection, blending, or per-cascade bias.
++// Solution: a four-cascade directional shadow lab. Each of four depth-only passes
++// writes one slice of a Texture2DArray whose orthographic light view is fit to one
++// slice of the camera frustum; the lighting pass selects a cascade by view depth,
++// cross-fades across an upper-edge blend band, scales the bias per cascade, and
++// does a hardware comparison lookup. The Starter's byte-identical single-map path
++// is recovered by forcing one cascade. Windowed controls only toggle the debug
++// view, stabilization, blending, and shadows; headless runs are deterministic.
+ class Renderer final : public lgp::framework::IChapterRenderer
+ {
+   public:
+@@ -89,4 +90,4 @@ class Renderer final : public lgp::framework::IChapterRenderer
+     bool interactiveShadows_{true};
+ };
+ 
+-} // namespace ch24::cascaded_shadows::starter
++} // namespace ch24::cascaded_shadows::solution

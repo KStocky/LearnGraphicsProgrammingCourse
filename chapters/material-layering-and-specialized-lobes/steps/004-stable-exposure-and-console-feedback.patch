@@ -1,0 +1,110 @@
+diff --git a/chapters/material-layering-and-specialized-lobes/Starter/Renderer.cpp b/chapters/material-layering-and-specialized-lobes/Starter/Renderer.cpp
+index 5c9c896..22d5413 100644
+--- a/chapters/material-layering-and-specialized-lobes/Starter/Renderer.cpp
++++ b/chapters/material-layering-and-specialized-lobes/Starter/Renderer.cpp
+@@ -15,6 +15,7 @@
+ #include <array>
+ #include <cstddef>
+ #include <cstdint>
++#include <cstdio>
+ #include <filesystem>
+ #include <span>
+ #include <string>
+@@ -52,6 +53,40 @@ enum DisplayRootParameter : UINT
+     return std::filesystem::path{__FILE__}.parent_path() / "MaterialLab.hlsl";
+ }
+ 
++[[nodiscard]] char const *PresetName(gpu::ScenePreset preset) noexcept
++{
++    switch (preset)
++    {
++    case gpu::ScenePreset::Baseline:
++        return "Baseline (isotropic)";
++    case gpu::ScenePreset::Anisotropic:
++        return "Anisotropic";
++    case gpu::ScenePreset::Clearcoat:
++        return "Clearcoat";
++    case gpu::ScenePreset::Emissive:
++        return "Emissive";
++    }
++    return "Unknown";
++}
++
++[[nodiscard]] char const *ViewName(gpu::OutputView view) noexcept
++{
++    switch (view)
++    {
++    case gpu::OutputView::Final:
++        return "Final";
++    case gpu::OutputView::Base:
++        return "Base (coat-attenuated)";
++    case gpu::OutputView::Coat:
++        return "Coat reflection";
++    case gpu::OutputView::Emission:
++        return "Emission";
++    case gpu::OutputView::Attenuation:
++        return "Coat transmission";
++    }
++    return "Unknown";
++}
++
+ } // namespace
+ 
+ lgp::framework::Status Renderer::CreateShaders()
+@@ -398,6 +433,7 @@ gpu::LabConfiguration Renderer::ActiveConfiguration() const noexcept
+     }
+     gpu::LabConfiguration configuration = gpu::ConfigurationForPreset(interactivePreset_);
+     configuration.outputView = interactiveView_;
++    configuration.exposure = interactiveExposure_;
+     return configuration;
+ }
+ 
+@@ -472,6 +508,8 @@ lgp::framework::Status Renderer::OnResize(lgp::framework::DeviceResources &, lgp
+ void Renderer::ApplyInteractiveControls(lgp::framework::UpdateContext const &context)
+ {
+     lgp::framework::InputState const &input = context.input;
++    gpu::ScenePreset const previousPreset = interactivePreset_;
++    gpu::OutputView const previousView = interactiveView_;
+ 
+     if (input.WasKeyPressed('1'))
+     {
+@@ -493,6 +531,14 @@ void Renderer::ApplyInteractiveControls(lgp::framework::UpdateContext const &con
+     {
+         interactiveView_ = static_cast<gpu::OutputView>((static_cast<std::uint32_t>(interactiveView_) + 1U) % 5U);
+     }
++    if (input.WasKeyPressed(VK_OEM_4)) // '['
++    {
++        interactiveExposure_ = std::clamp(interactiveExposure_ - 0.25F, -8.0F, 8.0F);
++    }
++    if (input.WasKeyPressed(VK_OEM_6)) // ']'
++    {
++        interactiveExposure_ = std::clamp(interactiveExposure_ + 0.25F, -8.0F, 8.0F);
++    }
+ 
+     if (input.mouse.IsButtonDown(lgp::framework::MouseButton::Right))
+     {
+@@ -500,6 +546,12 @@ void Renderer::ApplyInteractiveControls(lgp::framework::UpdateContext const &con
+         orbitElevation_ = std::clamp(orbitElevation_ - (static_cast<float>(input.mouse.deltaY) * 0.006F), -1.2F, 1.2F);
+     }
+     orbitRadius_ = std::clamp(orbitRadius_ - input.mouse.wheelDelta, 1.8F, 8.0F);
++
++    if (interactivePreset_ != previousPreset || interactiveView_ != previousView)
++    {
++        std::printf("[Ch23] preset=%s  view=%s\n", PresetName(interactivePreset_), ViewName(interactiveView_));
++        std::fflush(stdout);
++    }
+ }
+ 
+ lgp::framework::Status Renderer::Update(lgp::framework::UpdateContext const &context)
+diff --git a/chapters/material-layering-and-specialized-lobes/Starter/Renderer.hpp b/chapters/material-layering-and-specialized-lobes/Starter/Renderer.hpp
+index c28ef93..06aa137 100644
+--- a/chapters/material-layering-and-specialized-lobes/Starter/Renderer.hpp
++++ b/chapters/material-layering-and-specialized-lobes/Starter/Renderer.hpp
+@@ -81,6 +81,7 @@ class Renderer final : public lgp::framework::IChapterRenderer
+ 
+     gpu::ScenePreset interactivePreset_{gpu::ScenePreset::Baseline};
+     gpu::OutputView interactiveView_{gpu::OutputView::Final};
++    float interactiveExposure_{0.0F};
+     float orbitAzimuth_{0.0F};
+     float orbitElevation_{0.25F};
+     float orbitRadius_{3.1F};

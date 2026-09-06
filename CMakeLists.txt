@@ -47,6 +47,8 @@ set(
     gpu-driven-scene-submission-culling-and-lod
     meshlets-and-mesh-shader-pipelines
     motion-vectors-and-reprojection
+    material-layering-and-specialized-lobes
+    cascaded-shadow-maps
     gbuffer-and-deferred-shading
     tiled-forward-plus-and-clustered-lighting
     visibility-buffers-and-material-evaluation
@@ -67,7 +69,7 @@ function(lgp_chapter_is_selected chapter result)
     endif()
 endfunction()
 
-set(LGP_COURSE_VERSION "course-v2026.09.05.5" CACHE STRING "Published course version" FORCE)
+set(LGP_COURSE_VERSION "course-v2026.09.06.1" CACHE STRING "Published course version" FORCE)
 set(CMAKE_CXX_STANDARD 23)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)

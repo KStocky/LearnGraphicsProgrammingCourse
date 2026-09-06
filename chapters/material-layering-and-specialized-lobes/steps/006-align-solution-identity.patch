@@ -1,0 +1,118 @@
+diff --git a/chapters/material-layering-and-specialized-lobes/Starter/Main.cpp b/chapters/material-layering-and-specialized-lobes/Starter/Main.cpp
+index 71c3b29..271b3d4 100644
+--- a/chapters/material-layering-and-specialized-lobes/Starter/Main.cpp
++++ b/chapters/material-layering-and-specialized-lobes/Starter/Main.cpp
+@@ -2,12 +2,26 @@
+ 
+ #include <cstdio>
+ 
++// Ch23 Material Layering Solution - interactive controls (windowed only; headless
++// runs are fully deterministic and ignore input):
++//   1 / 2 / 3 / 4  Select preset: Baseline (isotropic) / Anisotropic / Clearcoat /
++//                  Emissive. Baseline is byte-identical to the Starter.
++//   V              Cycle the diagnostic output view: Final -> Base (coat-attenuated)
++//                  -> Coat reflection -> Emission -> Coat transmission (energy) ->
++//                  Final. In the Final view, Base + Coat + Emission sum to Final.
++//   G              Toggle geometry: material Sphere <-> analytic Probe card. The
++//                  probe card shades one constant surface so anisotropy orientation
++//                  and the CPU parity probes are easy to read.
++//   [ / ]          Decrease / increase display exposure (EV).
++//   Right-drag     Orbit the camera. Mouse wheel dollies in and out.
++// The current preset/view/geometry is also printed to stdout whenever it changes.
++
+ int wmain(int argc, wchar_t **argv)
+ {
+-    ch23::material_layering::starter::Renderer renderer{};
++    ch23::material_layering::solution::Renderer renderer{};
+ 
+     lgp::framework::ApplicationConfiguration configuration{};
+-    configuration.title = L"Ch23 Material Layering Starter";
++    configuration.title = L"Ch23 Material Layering Solution";
+     configuration.width = 1280U;
+     configuration.height = 720U;
+ 
+diff --git a/chapters/material-layering-and-specialized-lobes/Starter/MaterialLab.hlsl b/chapters/material-layering-and-specialized-lobes/Starter/MaterialLab.hlsl
+index 4204a2b..fbe5db8 100644
+--- a/chapters/material-layering-and-specialized-lobes/Starter/MaterialLab.hlsl
++++ b/chapters/material-layering-and-specialized-lobes/Starter/MaterialLab.hlsl
+@@ -1,10 +1,13 @@
+ #include "../Common/MaterialLab.hlsli"
+ 
+-// Starter shader: the isotropic metal/dielectric baseline. SphereVS/BaselinePS
+-// shade one directional light with the shared height-correlated base lobe, and
+-// the fullscreen pass tone maps the linear HDR target to the swap chain. The
+-// Solution's Baseline preset calls the same ShadeBaselineRadiance so the two
+-// produce byte-identical baseline pixels.
++// Solution shader: the inspectable material-lobe lab.
++//   * SphereVS draws the tangent-framed sphere; ProbeVS fills the viewport with an
++//     analytic probe surface whose shading inputs come from the probe constants.
++//   * LightingPS shades the Baseline preset through the same ShadeBaselineRadiance
++//     as the Starter (byte-identical baseline) and every other preset through the
++//     anisotropic layered path that mirrors the CPU contract term for term.
++//   * The Final view is exactly base + coat + emission, so the readback tests can
++//     prove the contribution split sums to the final before display mapping.
+ 
+ SurfaceVertex SphereVS(MeshVertex input)
+ {
+diff --git a/chapters/material-layering-and-specialized-lobes/Starter/Renderer.cpp b/chapters/material-layering-and-specialized-lobes/Starter/Renderer.cpp
+index eb9be6c..bfaf504 100644
+--- a/chapters/material-layering-and-specialized-lobes/Starter/Renderer.cpp
++++ b/chapters/material-layering-and-specialized-lobes/Starter/Renderer.cpp
+@@ -21,7 +21,7 @@
+ #include <string>
+ #include <utility>
+ 
+-namespace ch23::material_layering::starter
++namespace ch23::material_layering::solution
+ {
+ namespace
+ {
+@@ -473,7 +473,7 @@ lgp::framework::Status Renderer::Initialize(lgp::framework::ApplicationInitConte
+     headless_ = context.commandLine.headless;
+ 
+     std::expected<lgp::framework::DescriptorHeap, lgp::framework::Error> dsvHeap = lgp::framework::CreateDescriptorHeap(
+-        *deviceResources_->device(), D3D12_DESCRIPTOR_HEAP_TYPE_DSV, 1U, false, L"Ch23 starter DSV heap");
++        *deviceResources_->device(), D3D12_DESCRIPTOR_HEAP_TYPE_DSV, 1U, false, L"Ch23 solution DSV heap");
+     if (!dsvHeap)
+     {
+         return std::unexpected(std::move(dsvHeap.error()));
+@@ -717,4 +717,4 @@ void Renderer::ConfigureHeadlessTest(HeadlessTestConfiguration const &configurat
+     hasHeadlessConfiguration_ = true;
+ }
+ 
+-} // namespace ch23::material_layering::starter
++} // namespace ch23::material_layering::solution
+diff --git a/chapters/material-layering-and-specialized-lobes/Starter/Renderer.hpp b/chapters/material-layering-and-specialized-lobes/Starter/Renderer.hpp
+index b747670..29307c7 100644
+--- a/chapters/material-layering-and-specialized-lobes/Starter/Renderer.hpp
++++ b/chapters/material-layering-and-specialized-lobes/Starter/Renderer.hpp
+@@ -14,15 +14,16 @@
+ #include <expected>
+ #include <vector>
+ 
+-namespace ch23::material_layering::starter
++namespace ch23::material_layering::solution
+ {
+ 
+-// Starter: a deterministic isotropic metal/dielectric baseline. It renders one
+-// tangent-framed sphere under a single directional light into a linear HDR target
+-// and tone maps it to the swap-chain surface. The shading is the isotropic base
+-// lobe (height-correlated Smith) shared with the Solution's Baseline preset, so
+-// their baseline output is byte identical. There is no clearcoat, emission, or
+-// anisotropy here; those arrive in the Solution.
++// Solution: an inspectable material-lobe lab. It keeps the Starter's byte-identical
++// isotropic baseline (the Baseline preset) and extends it with anisotropy, a
++// dielectric clearcoat, additive emission, and diagnostic contribution views. A
++// probe-card geometry renders an analytic surface for CPU/GPU parity and anisotropy
++// orientation checks. Headless behavior is fully driven by ConfigureHeadlessTest and
++// stays deterministic; windowed keyboard controls only switch preset, view,
++// geometry, and exposure.
+ class Renderer final : public lgp::framework::IChapterRenderer
+ {
+   public:
+@@ -93,4 +94,4 @@ class Renderer final : public lgp::framework::IChapterRenderer
+     float orbitRadius_{3.1F};
+ };
+ 
+-} // namespace ch23::material_layering::starter
++} // namespace ch23::material_layering::solution

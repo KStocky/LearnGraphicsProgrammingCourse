@@ -1,0 +1,135 @@
+diff --git a/chapters/cascaded-shadow-maps/Starter/Renderer.cpp b/chapters/cascaded-shadow-maps/Starter/Renderer.cpp
+index 07f7f30..5a8a769 100644
+--- a/chapters/cascaded-shadow-maps/Starter/Renderer.cpp
++++ b/chapters/cascaded-shadow-maps/Starter/Renderer.cpp
+@@ -14,6 +14,7 @@
+ #include <array>
+ #include <cstddef>
+ #include <cstdint>
++#include <cstdio>
+ #include <filesystem>
+ #include <span>
+ #include <string>
+@@ -61,6 +62,22 @@ enum LightingRootParameter : UINT
+     return layout;
+ }
+ 
++[[nodiscard]] char const *DebugViewName(gpu::DebugView view) noexcept
++{
++    switch (view)
++    {
++    case gpu::DebugView::Shaded:
++        return "Shaded";
++    case gpu::DebugView::CascadeColor:
++        return "Cascade color";
++    case gpu::DebugView::CascadeShaded:
++        return "Cascade-tinted shaded";
++    case gpu::DebugView::ShadowFactor:
++        return "Shadow factor";
++    }
++    return "Unknown";
++}
++
+ } // namespace
+ 
+ lgp::framework::Status Renderer::CreateShaders()
+@@ -427,7 +444,16 @@ lgp::framework::Status Renderer::CreateSizeDependentTargets(lgp::framework::Exte
+ 
+ gpu::LabConfiguration Renderer::ActiveConfiguration() const noexcept
+ {
+-    return hasHeadlessConfiguration_ ? headlessConfiguration_ : gpu::BaselineConfiguration();
++    if (hasHeadlessConfiguration_)
++    {
++        return headlessConfiguration_;
++    }
++    gpu::LabConfiguration configuration = gpu::BaselineConfiguration();
++    configuration.debugView = interactiveDebugView_;
++    configuration.stabilizationEnabled = interactiveStabilization_;
++    configuration.blendEnabled = interactiveBlend_;
++    configuration.shadowsEnabled = interactiveShadows_;
++    return configuration;
+ }
+ 
+ lgp::framework::Status Renderer::Initialize(lgp::framework::ApplicationInitContext const &context)
+@@ -499,8 +525,56 @@ lgp::framework::Status Renderer::OnResize(lgp::framework::DeviceResources &, lgp
+     return CreateSizeDependentTargets(drawableSize);
+ }
+ 
+-lgp::framework::Status Renderer::Update(lgp::framework::UpdateContext const &)
++void Renderer::ApplyInteractiveControls(lgp::framework::UpdateContext const &context)
++{
++    lgp::framework::InputState const &input = context.input;
++    gpu::DebugView const previousView = interactiveDebugView_;
++    bool const previousStabilization = interactiveStabilization_;
++    bool const previousBlend = interactiveBlend_;
++    bool const previousShadows = interactiveShadows_;
++
++    if (input.WasKeyPressed('V'))
++    {
++        interactiveDebugView_ =
++            static_cast<gpu::DebugView>((static_cast<std::uint32_t>(interactiveDebugView_) + 1U) % 4U);
++    }
++    if (input.WasKeyPressed('N'))
++    {
++        interactiveDebugView_ = gpu::DebugView::Shaded;
++    }
++    if (input.WasKeyPressed('C'))
++    {
++        interactiveDebugView_ = gpu::DebugView::CascadeColor;
++    }
++    if (input.WasKeyPressed('S'))
++    {
++        interactiveStabilization_ = !interactiveStabilization_;
++    }
++    if (input.WasKeyPressed('B'))
++    {
++        interactiveBlend_ = !interactiveBlend_;
++    }
++    if (input.WasKeyPressed('H'))
++    {
++        interactiveShadows_ = !interactiveShadows_;
++    }
++
++    if (interactiveDebugView_ != previousView || interactiveStabilization_ != previousStabilization ||
++        interactiveBlend_ != previousBlend || interactiveShadows_ != previousShadows)
++    {
++        std::printf("[Ch24] view=%s  stabilization=%s  blend=%s  shadows=%s\n", DebugViewName(interactiveDebugView_),
++                    interactiveStabilization_ ? "on" : "off", interactiveBlend_ ? "on" : "off",
++                    interactiveShadows_ ? "on" : "off");
++        std::fflush(stdout);
++    }
++}
++
++lgp::framework::Status Renderer::Update(lgp::framework::UpdateContext const &context)
+ {
++    if (!headless_)
++    {
++        ApplyInteractiveControls(context);
++    }
+     return {};
+ }
+ 
+diff --git a/chapters/cascaded-shadow-maps/Starter/Renderer.hpp b/chapters/cascaded-shadow-maps/Starter/Renderer.hpp
+index 09abc1a..01981dc 100644
+--- a/chapters/cascaded-shadow-maps/Starter/Renderer.hpp
++++ b/chapters/cascaded-shadow-maps/Starter/Renderer.hpp
+@@ -48,6 +48,7 @@ class Renderer final : public lgp::framework::IChapterRenderer
+     [[nodiscard]] lgp::framework::Status CreateConstantBuffers();
+     [[nodiscard]] lgp::framework::Status CreateShadowArray();
+     [[nodiscard]] lgp::framework::Status CreateSizeDependentTargets(lgp::framework::Extent2D size);
++    void ApplyInteractiveControls(lgp::framework::UpdateContext const &context);
+ 
+     lgp::framework::DeviceResources *deviceResources_{};
+     bool headless_{};
+@@ -81,6 +82,11 @@ class Renderer final : public lgp::framework::IChapterRenderer
+ 
+     gpu::LabConfiguration headlessConfiguration_{gpu::BaselineConfiguration()};
+     bool hasHeadlessConfiguration_{};
++
++    gpu::DebugView interactiveDebugView_{gpu::DebugView::Shaded};
++    bool interactiveStabilization_{true};
++    bool interactiveBlend_{true};
++    bool interactiveShadows_{true};
+ };
+ 
+ } // namespace ch24::cascaded_shadows::starter

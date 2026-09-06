@@ -1,0 +1,42 @@
+diff --git a/chapters/material-layering-and-specialized-lobes/Starter/MaterialLab.hlsl b/chapters/material-layering-and-specialized-lobes/Starter/MaterialLab.hlsl
+index b1fec9f..88cfc36 100644
+--- a/chapters/material-layering-and-specialized-lobes/Starter/MaterialLab.hlsl
++++ b/chapters/material-layering-and-specialized-lobes/Starter/MaterialLab.hlsl
+@@ -24,16 +24,14 @@ float4 LightingPS(SurfaceVertex input) : SV_Target
+         return float4(baseline, 1.0f);
+     }
+ 
+-    // Non-baseline presets shade the anisotropic base lobe directly in tangent
+-    // space. Clearcoat and emission are layered on in later steps.
++    // Non-baseline presets shade the layered material: the anisotropic base lobe
++    // plus one dielectric clearcoat reflection with two macro-surface transmissions
++    // attenuating the base. Emission is layered on in a later step.
+     ShadingBasis basis = MakeShadingBasis(normal, tangentHint);
+-    float3 localView = ToTangentSpace(basis, viewDirection);
+-    float3 localLight = ToTangentSpace(basis, lightDirection);
+-    float nDotL = saturate(localLight.z);
+-    float2 alpha = MapAnisotropicRoughness(gLab.perceptualRoughness, gLab.anisotropy);
+-    float3 brdf = EvaluateBaseLobe(localView, localLight, alpha, gLab.baseColor, gLab.baseDielectricF0, gLab.metallic);
++    LayeredResponse response = EvaluateLayered(basis, viewDirection, lightDirection);
++    float nDotL = saturate(dot(basis.normal, lightDirection));
+     float3 irradiance = gLab.lightColor * gLab.lightIntensity * nDotL;
+-    return float4(brdf * irradiance, 1.0f);
++    return float4(response.reflectedBrdf * irradiance, 1.0f);
+ }
+ 
+ FullscreenVertex FullscreenVS(uint vertexId : SV_VertexID)
+diff --git a/chapters/material-layering-and-specialized-lobes/Starter/Renderer.cpp b/chapters/material-layering-and-specialized-lobes/Starter/Renderer.cpp
+index f1a9788..3b54e9a 100644
+--- a/chapters/material-layering-and-specialized-lobes/Starter/Renderer.cpp
++++ b/chapters/material-layering-and-specialized-lobes/Starter/Renderer.cpp
+@@ -479,6 +479,10 @@ void Renderer::ApplyInteractiveControls(lgp::framework::UpdateContext const &con
+     {
+         interactivePreset_ = gpu::ScenePreset::Anisotropic;
+     }
++    if (input.WasKeyPressed('3'))
++    {
++        interactivePreset_ = gpu::ScenePreset::Clearcoat;
++    }
+ 
+     if (input.mouse.IsButtonDown(lgp::framework::MouseButton::Right))
+     {

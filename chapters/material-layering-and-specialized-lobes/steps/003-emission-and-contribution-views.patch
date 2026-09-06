@@ -1,0 +1,76 @@
+diff --git a/chapters/material-layering-and-specialized-lobes/Starter/MaterialLab.hlsl b/chapters/material-layering-and-specialized-lobes/Starter/MaterialLab.hlsl
+index 88cfc36..beb93bc 100644
+--- a/chapters/material-layering-and-specialized-lobes/Starter/MaterialLab.hlsl
++++ b/chapters/material-layering-and-specialized-lobes/Starter/MaterialLab.hlsl
+@@ -21,17 +21,23 @@ float4 LightingPS(SurfaceVertex input) : SV_Target
+     if (gLab.preset == PresetBaseline)
+     {
+         float3 baseline = ShadeBaselineRadiance(normal, tangentHint, viewDirection, lightDirection);
+-        return float4(baseline, 1.0f);
++        float3 color = baseline;
++        if (gLab.outputView == OutputViewCoat || gLab.outputView == OutputViewEmission)
++        {
++            color = float3(0.0f, 0.0f, 0.0f);
++        }
++        else if (gLab.outputView == OutputViewAttenuation)
++        {
++            color = float3(1.0f, 1.0f, 1.0f);
++        }
++        return float4(color, 1.0f);
+     }
+ 
+-    // Non-baseline presets shade the layered material: the anisotropic base lobe
+-    // plus one dielectric clearcoat reflection with two macro-surface transmissions
+-    // attenuating the base. Emission is layered on in a later step.
+     ShadingBasis basis = MakeShadingBasis(normal, tangentHint);
+     LayeredResponse response = EvaluateLayered(basis, viewDirection, lightDirection);
+     float nDotL = saturate(dot(basis.normal, lightDirection));
+-    float3 irradiance = gLab.lightColor * gLab.lightIntensity * nDotL;
+-    return float4(response.reflectedBrdf * irradiance, 1.0f);
++    float3 color = SelectLayeredView(response, nDotL, gLab.outputView);
++    return float4(color, 1.0f);
+ }
+ 
+ FullscreenVertex FullscreenVS(uint vertexId : SV_VertexID)
+diff --git a/chapters/material-layering-and-specialized-lobes/Starter/Renderer.cpp b/chapters/material-layering-and-specialized-lobes/Starter/Renderer.cpp
+index 3b54e9a..5c9c896 100644
+--- a/chapters/material-layering-and-specialized-lobes/Starter/Renderer.cpp
++++ b/chapters/material-layering-and-specialized-lobes/Starter/Renderer.cpp
+@@ -396,7 +396,9 @@ gpu::LabConfiguration Renderer::ActiveConfiguration() const noexcept
+     {
+         return headlessConfiguration_;
+     }
+-    return gpu::ConfigurationForPreset(interactivePreset_);
++    gpu::LabConfiguration configuration = gpu::ConfigurationForPreset(interactivePreset_);
++    configuration.outputView = interactiveView_;
++    return configuration;
+ }
+ 
+ gpu::CameraMatrices Renderer::ActiveCamera(lgp::framework::Extent2D size) const noexcept
+@@ -483,6 +485,14 @@ void Renderer::ApplyInteractiveControls(lgp::framework::UpdateContext const &con
+     {
+         interactivePreset_ = gpu::ScenePreset::Clearcoat;
+     }
++    if (input.WasKeyPressed('4'))
++    {
++        interactivePreset_ = gpu::ScenePreset::Emissive;
++    }
++    if (input.WasKeyPressed('V'))
++    {
++        interactiveView_ = static_cast<gpu::OutputView>((static_cast<std::uint32_t>(interactiveView_) + 1U) % 5U);
++    }
+ 
+     if (input.mouse.IsButtonDown(lgp::framework::MouseButton::Right))
+     {
+diff --git a/chapters/material-layering-and-specialized-lobes/Starter/Renderer.hpp b/chapters/material-layering-and-specialized-lobes/Starter/Renderer.hpp
+index e175b17..c28ef93 100644
+--- a/chapters/material-layering-and-specialized-lobes/Starter/Renderer.hpp
++++ b/chapters/material-layering-and-specialized-lobes/Starter/Renderer.hpp
+@@ -80,6 +80,7 @@ class Renderer final : public lgp::framework::IChapterRenderer
+     bool hasHeadlessConfiguration_{};
+ 
+     gpu::ScenePreset interactivePreset_{gpu::ScenePreset::Baseline};
++    gpu::OutputView interactiveView_{gpu::OutputView::Final};
+     float orbitAzimuth_{0.0F};
+     float orbitElevation_{0.25F};
+     float orbitRadius_{3.1F};

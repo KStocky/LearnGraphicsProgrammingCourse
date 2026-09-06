@@ -1,10 +1,10 @@
 # Learn Graphics Programming
 
-Published learner version: `course-v2026.09.05.5`
+Published learner version: `course-v2026.09.06.1`
 
 This is a complete standalone learner repository. It contains the framework,
 Starter and Solution projects, assets, and cumulative teaching patches for every
-chapter available in `course-v2026.09.05.5`. It does not require a checkout of the private
+chapter available in `course-v2026.09.06.1`. It does not require a checkout of the private
 authoring repository.
 
 ## Requirements
@@ -47,11 +47,13 @@ not included in this learner distribution.
 - [GPU-Driven Scene Submission, Culling, and LOD](chapters/gpu-driven-scene-submission-culling-and-lod)
 - [Meshlets and Mesh Shader Pipelines](chapters/meshlets-and-mesh-shader-pipelines)
 - [Motion Vectors, Reprojection, and History Validation](chapters/motion-vectors-and-reprojection)
+- [Material Layering and Specialized BRDF Lobes](chapters/material-layering-and-specialized-lobes)
+- [Cascaded Shadow Maps](chapters/cascaded-shadow-maps)
 - [G-Buffers and Deferred Shading](chapters/gbuffer-and-deferred-shading)
 - [Tiled, Forward+, and Clustered Lighting](chapters/tiled-forward-plus-and-clustered-lighting)
 - [Visibility Buffers and Deferred Material Evaluation](chapters/visibility-buffers-and-material-evaluation)
 - [Monte Carlo Sampling Fundamentals](chapters/monte-carlo-sampling-fundamentals)
 - [Importance Sampling and Multiple Importance Sampling](chapters/importance-sampling-and-multiple-importance-sampling)
 
-The matching course site and tagged source archive use the same `course-v2026.09.05.5`
+The matching course site and tagged source archive use the same `course-v2026.09.06.1`
 identifier. Report learner-facing problems in this repository's Issues page.

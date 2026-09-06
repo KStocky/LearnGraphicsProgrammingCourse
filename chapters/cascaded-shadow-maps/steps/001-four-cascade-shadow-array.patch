@@ -1,0 +1,305 @@
+diff --git a/chapters/cascaded-shadow-maps/Starter/CascadedShadowLab.hlsl b/chapters/cascaded-shadow-maps/Starter/CascadedShadowLab.hlsl
+index 834fcb1..714a02d 100644
+--- a/chapters/cascaded-shadow-maps/Starter/CascadedShadowLab.hlsl
++++ b/chapters/cascaded-shadow-maps/Starter/CascadedShadowLab.hlsl
+@@ -11,7 +11,7 @@
+ // the Solution. gLab.cascadeViewProjection[0] holds the single light matrix and
+ // gLab.cascadeTexelBiasScale[0] is 1.
+ 
+-Texture2D<float> gShadowMap : register(t0);
++Texture2DArray<float> gShadowArray : register(t0);
+ SamplerComparisonState gShadowCompare : register(s0);
+ 
+ // Projects a receiver into the single shadow map and returns hardware-filtered
+@@ -34,7 +34,7 @@ float SampleShadowVisibility(float3 worldPosition, float3 worldNormal)
+         return 1.0f;
+     }
+     float comparisonDepth = ndc.z - (gLab.receiverDepthBias * biasScale);
+-    return gShadowMap.SampleCmpLevelZero(gShadowCompare, uv, comparisonDepth);
++    return gShadowArray.SampleCmpLevelZero(gShadowCompare, float3(uv, 0.0f), comparisonDepth);
+ }
+ 
+ float4 LightingPS(SurfaceVertex input) : SV_Target
+diff --git a/chapters/cascaded-shadow-maps/Starter/Renderer.cpp b/chapters/cascaded-shadow-maps/Starter/Renderer.cpp
+index e05380c..682b825 100644
+--- a/chapters/cascaded-shadow-maps/Starter/Renderer.cpp
++++ b/chapters/cascaded-shadow-maps/Starter/Renderer.cpp
+@@ -319,8 +319,10 @@ lgp::framework::Status Renderer::CreateConstantBuffers()
+         }
+         labConstantBuffers_.push_back(std::move(*labBuffer));
+ 
++        // One aligned slot per cascade so each depth pass reads its own matrix.
+         std::expected<lgp::framework::Buffer, lgp::framework::Error> shadowBuffer = lgp::framework::CreateUploadBuffer(
+-            *deviceResources_->device(), shadowConstantStride_, L"Ch24 shadow pass constants");
++            *deviceResources_->device(), static_cast<std::uint64_t>(shadowConstantStride_) * gpu::kMaxCascades,
++            L"Ch24 cascade pass constants");
+         if (!shadowBuffer)
+         {
+             return std::unexpected(std::move(shadowBuffer.error()));
+@@ -330,9 +332,9 @@ lgp::framework::Status Renderer::CreateConstantBuffers()
+     return {};
+ }
+ 
+-lgp::framework::Status Renderer::CreateShadowTarget()
++lgp::framework::Status Renderer::CreateShadowArray()
+ {
+-    shadowTarget_.Reset();
++    shadowArray_.Reset();
+ 
+     D3D12_HEAP_PROPERTIES heap{};
+     heap.Type = D3D12_HEAP_TYPE_DEFAULT;
+@@ -341,7 +343,7 @@ lgp::framework::Status Renderer::CreateShadowTarget()
+     texture.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+     texture.Width = gpu::kShadowResolution;
+     texture.Height = gpu::kShadowResolution;
+-    texture.DepthOrArraySize = 1U;
++    texture.DepthOrArraySize = static_cast<UINT16>(gpu::kMaxCascades);
+     texture.MipLevels = 1U;
+     texture.Format = gpu::kShadowTypelessFormat;
+     texture.SampleDesc.Count = 1U;
+@@ -353,25 +355,32 @@ lgp::framework::Status Renderer::CreateShadowTarget()
+     clear.DepthStencil.Depth = 1.0F;
+     if (HRESULT const result = deviceResources_->device()->CreateCommittedResource3(
+             &heap, D3D12_HEAP_FLAG_NONE, &texture, D3D12_BARRIER_LAYOUT_SHADER_RESOURCE, &clear, nullptr, 0U, nullptr,
+-            IID_PPV_ARGS(shadowTarget_.ReleaseAndGetAddressOf()));
++            IID_PPV_ARGS(shadowArray_.ReleaseAndGetAddressOf()));
+         FAILED(result))
+     {
+         return std::unexpected(lgp::framework::MakeHResultError("ID3D12Device10::CreateCommittedResource3", result,
+-                                                                "Failed to create the shadow map."));
++                                                                "Failed to create the cascade shadow array."));
+     }
+ 
+-    D3D12_DEPTH_STENCIL_VIEW_DESC dsv{};
+-    dsv.Format = gpu::kShadowDepthFormat;
+-    dsv.ViewDimension = D3D12_DSV_DIMENSION_TEXTURE2D;
+-    deviceResources_->device()->CreateDepthStencilView(shadowTarget_.Get(), &dsv, shadowDepthView_.cpuHandle);
++    for (std::uint32_t cascade = 0U; cascade < gpu::kMaxCascades; ++cascade)
++    {
++        D3D12_DEPTH_STENCIL_VIEW_DESC dsv{};
++        dsv.Format = gpu::kShadowDepthFormat;
++        dsv.ViewDimension = D3D12_DSV_DIMENSION_TEXTURE2DARRAY;
++        dsv.Texture2DArray.MipSlice = 0U;
++        dsv.Texture2DArray.FirstArraySlice = cascade;
++        dsv.Texture2DArray.ArraySize = 1U;
++        deviceResources_->device()->CreateDepthStencilView(shadowArray_.Get(), &dsv,
++                                                           shadowSliceViews_.at(cascade).cpuHandle);
++    }
+ 
+     D3D12_SHADER_RESOURCE_VIEW_DESC srv{};
+     srv.Format = gpu::kShadowResourceFormat;
+-    srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
++    srv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2DARRAY;
+     srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+-    srv.Texture2D.MipLevels = 1U;
+-    deviceResources_->device()->CreateShaderResourceView(shadowTarget_.Get(), &srv,
+-                                                         shadowShaderResourceView_.cpuHandle);
++    srv.Texture2DArray.MipLevels = 1U;
++    srv.Texture2DArray.ArraySize = gpu::kMaxCascades;
++    deviceResources_->device()->CreateShaderResourceView(shadowArray_.Get(), &srv, shadowShaderResourceView_.cpuHandle);
+     return {};
+ }
+ 
+@@ -432,8 +441,9 @@ lgp::framework::Status Renderer::Initialize(lgp::framework::ApplicationInitConte
+     deviceResources_ = &context.deviceResources;
+     headless_ = context.commandLine.headless;
+ 
+-    std::expected<lgp::framework::DescriptorHeap, lgp::framework::Error> dsvHeap = lgp::framework::CreateDescriptorHeap(
+-        *deviceResources_->device(), D3D12_DESCRIPTOR_HEAP_TYPE_DSV, 2U, false, L"Ch24 starter DSV heap");
++    std::expected<lgp::framework::DescriptorHeap, lgp::framework::Error> dsvHeap =
++        lgp::framework::CreateDescriptorHeap(*deviceResources_->device(), D3D12_DESCRIPTOR_HEAP_TYPE_DSV,
++                                             1U + gpu::kMaxCascades, false, L"Ch24 solution DSV heap");
+     if (!dsvHeap)
+     {
+         return std::unexpected(std::move(dsvHeap.error()));
+@@ -445,12 +455,15 @@ lgp::framework::Status Renderer::Initialize(lgp::framework::ApplicationInitConte
+         return std::unexpected(std::move(sceneDepthView.error()));
+     }
+     sceneDepthView_ = *sceneDepthView;
+-    std::expected<lgp::framework::DescriptorAllocation, lgp::framework::Error> shadowDepthView = dsvHeap_.Allocate(1U);
+-    if (!shadowDepthView)
++    for (std::uint32_t cascade = 0U; cascade < gpu::kMaxCascades; ++cascade)
+     {
+-        return std::unexpected(std::move(shadowDepthView.error()));
++        std::expected<lgp::framework::DescriptorAllocation, lgp::framework::Error> sliceView = dsvHeap_.Allocate(1U);
++        if (!sliceView)
++        {
++            return std::unexpected(std::move(sliceView.error()));
++        }
++        shadowSliceViews_.at(cascade) = *sliceView;
+     }
+-    shadowDepthView_ = *shadowDepthView;
+ 
+     std::expected<lgp::framework::DescriptorAllocation, lgp::framework::Error> shadowSrv =
+         deviceResources_->shader_visible_cbv_srv_uav_heap().Allocate(1U);
+@@ -480,7 +493,7 @@ lgp::framework::Status Renderer::Initialize(lgp::framework::ApplicationInitConte
+     {
+         return status;
+     }
+-    if (auto status = CreateShadowTarget(); !status)
++    if (auto status = CreateShadowArray(); !status)
+     {
+         return status;
+     }
+@@ -499,7 +512,7 @@ lgp::framework::Status Renderer::Update(lgp::framework::UpdateContext const &)
+ 
+ lgp::framework::Status Renderer::Render(lgp::framework::FrameContext const &frameContext)
+ {
+-    if (frameContext.commandList == nullptr || frameContext.renderTarget == nullptr || shadowTarget_ == nullptr ||
++    if (frameContext.commandList == nullptr || frameContext.renderTarget == nullptr || shadowArray_ == nullptr ||
+         sceneDepthTarget_ == nullptr || labConstantBuffers_.empty())
+     {
+         return {};
+@@ -520,12 +533,16 @@ lgp::framework::Status Renderer::Render(lgp::framework::FrameContext const &fram
+     {
+         return status;
+     }
+-    if (auto status =
+-            lgp::framework::WriteBuffer(shadowConstantBuffers_[slot],
+-                                        std::span<gpu::ShadowPassConstants const>{frameData->shadowPasses.data(), 1U});
+-        !status)
++    for (std::uint32_t cascade = 0U; cascade < gpu::kMaxCascades; ++cascade)
+     {
+-        return status;
++        if (auto status = lgp::framework::WriteBuffer(
++                shadowConstantBuffers_[slot],
++                std::span<gpu::ShadowPassConstants const>{&frameData->shadowPasses[cascade], 1U},
++                static_cast<std::uint64_t>(cascade) * shadowConstantStride_);
++            !status)
++        {
++            return status;
++        }
+     }
+ 
+     ID3D12GraphicsCommandList7 &commandList = *frameContext.commandList;
+@@ -533,8 +550,9 @@ lgp::framework::Status Renderer::Render(lgp::framework::FrameContext const &fram
+     commandList.IASetVertexBuffers(0U, 1U, &sceneVertexView_);
+     commandList.IASetIndexBuffer(&sceneIndexView_);
+ 
+-    // --- Depth pass: fill the single shadow map from the light's point of view. ---
+-    lgp::framework::TransitionTexture(commandList, *shadowTarget_.Get(), gpu::ShaderResourceState(),
++    // --- Depth passes: one per array slice. Each cascade fits a different slice
++    //     of the camera frustum, so the near cascade gets much finer texels. ---
++    lgp::framework::TransitionTexture(commandList, *shadowArray_.Get(), gpu::ShaderResourceState(),
+                                       gpu::DepthWriteState());
+     D3D12_VIEWPORT const shadowViewport{
+         0.0F, 0.0F, static_cast<float>(gpu::kShadowResolution), static_cast<float>(gpu::kShadowResolution), 0.0F, 1.0F};
+@@ -542,18 +560,23 @@ lgp::framework::Status Renderer::Render(lgp::framework::FrameContext const &fram
+                                    static_cast<LONG>(gpu::kShadowResolution)};
+     commandList.RSSetViewports(1U, &shadowViewport);
+     commandList.RSSetScissorRects(1U, &shadowScissor);
+-    commandList.OMSetRenderTargets(0U, nullptr, FALSE, &shadowDepthView_.cpuHandle);
+-    commandList.ClearDepthStencilView(shadowDepthView_.cpuHandle, D3D12_CLEAR_FLAG_DEPTH, 1.0F, 0U, 0U, nullptr);
+     commandList.SetGraphicsRootSignature(shadowRootSignature_.Get());
+-    commandList.SetGraphicsRootConstantBufferView(ShadowPassConstantsSlot,
+-                                                  shadowConstantBuffers_[slot].gpu_virtual_address());
+     commandList.SetPipelineState(shadowPipeline_.Get());
+-    commandList.DrawIndexedInstanced(sceneIndexCount_, 1U, 0U, 0, 0U);
++    for (std::uint32_t cascade = 0U; cascade < gpu::kMaxCascades; ++cascade)
++    {
++        commandList.OMSetRenderTargets(0U, nullptr, FALSE, &shadowSliceViews_.at(cascade).cpuHandle);
++        commandList.ClearDepthStencilView(shadowSliceViews_.at(cascade).cpuHandle, D3D12_CLEAR_FLAG_DEPTH, 1.0F, 0U, 0U,
++                                          nullptr);
++        D3D12_GPU_VIRTUAL_ADDRESS const address = shadowConstantBuffers_[slot].gpu_virtual_address() +
++                                                  (static_cast<std::uint64_t>(cascade) * shadowConstantStride_);
++        commandList.SetGraphicsRootConstantBufferView(ShadowPassConstantsSlot, address);
++        commandList.DrawIndexedInstanced(sceneIndexCount_, 1U, 0U, 0, 0U);
++    }
+ 
+-    lgp::framework::TransitionTexture(commandList, *shadowTarget_.Get(), gpu::DepthWriteState(),
++    lgp::framework::TransitionTexture(commandList, *shadowArray_.Get(), gpu::DepthWriteState(),
+                                       gpu::ShaderResourceState());
+ 
+-    // --- Lighting pass: shade the scene and sample the shadow map. ---
++    // --- Lighting pass: select a cascade per pixel and shade the scene. ---
+     lgp::framework::TransitionTexture(commandList, *frameContext.renderTarget, gpu::FrameStartState(frameContext),
+                                       gpu::RenderTargetState());
+     float const clearColor[]{0.05F, 0.06F, 0.09F, 1.0F};
+@@ -578,17 +601,20 @@ lgp::framework::Status Renderer::Render(lgp::framework::FrameContext const &fram
+ 
+ void Renderer::Shutdown(lgp::framework::DeviceResources &deviceResources) noexcept
+ {
+-    shadowTarget_.Reset();
++    shadowArray_.Reset();
+     sceneDepthTarget_.Reset();
+     if (sceneDepthView_)
+     {
+         dsvHeap_.Free(sceneDepthView_);
+         sceneDepthView_ = {};
+     }
+-    if (shadowDepthView_)
++    for (lgp::framework::DescriptorAllocation &sliceView : shadowSliceViews_)
+     {
+-        dsvHeap_.Free(shadowDepthView_);
+-        shadowDepthView_ = {};
++        if (sliceView)
++        {
++            dsvHeap_.Free(sliceView);
++            sliceView = {};
++        }
+     }
+     if (shadowShaderResourceView_)
+     {
+@@ -613,15 +639,15 @@ void Renderer::ConfigureHeadlessTest(HeadlessTestConfiguration const &configurat
+     hasHeadlessConfiguration_ = true;
+ }
+ 
+-std::expected<gpu::DepthReadback, lgp::framework::Error> Renderer::ReadBackShadowMap()
++std::expected<gpu::DepthReadback, lgp::framework::Error> Renderer::ReadBackShadowSlice(std::uint32_t cascade)
+ {
+-    if (deviceResources_ == nullptr || shadowTarget_ == nullptr)
++    if (deviceResources_ == nullptr || shadowArray_ == nullptr)
+     {
+         return std::unexpected(
+-            lgp::framework::MakeError("Renderer::ReadBackShadowMap", "The shadow map has not been created."));
++            lgp::framework::MakeError("Renderer::ReadBackShadowSlice", "The shadow array has not been created."));
+     }
+-    return gpu::ReadBackDepthSlice(*deviceResources_, *shadowTarget_.Get(),
+-                                   {gpu::kShadowResolution, gpu::kShadowResolution}, 0U, 1U);
++    return gpu::ReadBackDepthSlice(*deviceResources_, *shadowArray_.Get(),
++                                   {gpu::kShadowResolution, gpu::kShadowResolution}, cascade, gpu::kMaxCascades);
+ }
+ 
+ } // namespace ch24::cascaded_shadows::starter
+diff --git a/chapters/cascaded-shadow-maps/Starter/Renderer.hpp b/chapters/cascaded-shadow-maps/Starter/Renderer.hpp
+index 3a69c93..09abc1a 100644
+--- a/chapters/cascaded-shadow-maps/Starter/Renderer.hpp
++++ b/chapters/cascaded-shadow-maps/Starter/Renderer.hpp
+@@ -10,6 +10,7 @@
+ #include <lgp/framework/descriptors.hpp>
+ #include <lgp/framework/shader_compiler.hpp>
+ 
++#include <array>
+ #include <cstdint>
+ #include <expected>
+ #include <vector>
+@@ -37,7 +38,7 @@ class Renderer final : public lgp::framework::IChapterRenderer
+ 
+     void ConfigureHeadlessTest(HeadlessTestConfiguration const &configuration) noexcept;
+     [[nodiscard]] gpu::LabConfiguration ActiveConfiguration() const noexcept;
+-    [[nodiscard]] std::expected<gpu::DepthReadback, lgp::framework::Error> ReadBackShadowMap();
++    [[nodiscard]] std::expected<gpu::DepthReadback, lgp::framework::Error> ReadBackShadowSlice(std::uint32_t cascade);
+ 
+   private:
+     [[nodiscard]] lgp::framework::Status CreateShaders();
+@@ -45,7 +46,7 @@ class Renderer final : public lgp::framework::IChapterRenderer
+     [[nodiscard]] lgp::framework::Status CreatePipelineStates();
+     [[nodiscard]] lgp::framework::Status CreateSceneBuffers();
+     [[nodiscard]] lgp::framework::Status CreateConstantBuffers();
+-    [[nodiscard]] lgp::framework::Status CreateShadowTarget();
++    [[nodiscard]] lgp::framework::Status CreateShadowArray();
+     [[nodiscard]] lgp::framework::Status CreateSizeDependentTargets(lgp::framework::Extent2D size);
+ 
+     lgp::framework::DeviceResources *deviceResources_{};
+@@ -73,9 +74,9 @@ class Renderer final : public lgp::framework::IChapterRenderer
+ 
+     lgp::framework::DescriptorHeap dsvHeap_{};
+     lgp::framework::DescriptorAllocation sceneDepthView_{};
+-    lgp::framework::DescriptorAllocation shadowDepthView_{};
++    std::array<lgp::framework::DescriptorAllocation, gpu::kMaxCascades> shadowSliceViews_{};
+     lgp::framework::DescriptorAllocation shadowShaderResourceView_{};
+-    Microsoft::WRL::ComPtr<ID3D12Resource> shadowTarget_{};
++    Microsoft::WRL::ComPtr<ID3D12Resource> shadowArray_{};
+     Microsoft::WRL::ComPtr<ID3D12Resource> sceneDepthTarget_{};
+ 
+     gpu::LabConfiguration headlessConfiguration_{gpu::BaselineConfiguration()};

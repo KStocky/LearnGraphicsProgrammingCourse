@@ -1,0 +1,36 @@
+diff --git a/chapters/cascaded-shadow-maps/Starter/CascadedShadowLab.hlsl b/chapters/cascaded-shadow-maps/Starter/CascadedShadowLab.hlsl
+index 4e0469c..f443754 100644
+--- a/chapters/cascaded-shadow-maps/Starter/CascadedShadowLab.hlsl
++++ b/chapters/cascaded-shadow-maps/Starter/CascadedShadowLab.hlsl
+@@ -21,10 +21,9 @@ struct CascadeSelection
+     float blendWeight; // Weight of the secondary cascade in [0, 1).
+ };
+ 
+-// Selects the cascade for a positive view-space depth: the first cascade whose
+-// far split boundary strictly exceeds the receiver, matching the split boundaries the CPU
+-// contract computed. Cross-fading across the boundary is added in the next step,
+-// so for now adjacent cascades meet at a hard seam.
++// Selects the cascade(s) for a positive view-space depth. The transition band
++// sits at the upper end of each cascade interval only, so adjacent cascades never
++// blend twice and never leave a gap - matching ch24::cascaded_shadows::SelectCascade.
+ CascadeSelection SelectCascade(float viewDepth)
+ {
+     uint count = gLab.cascadeCount;
+@@ -42,6 +41,17 @@ CascadeSelection SelectCascade(float viewDepth)
+     selection.primary = primary;
+     selection.secondary = primary;
+     selection.blendWeight = 0.0f;
++
++    if (gLab.blendEnabled != 0u && (primary + 1u) < count)
++    {
++        float blendStart = gLab.cascadeBlendStartViewDepth[primary];
++        float splitFar = gLab.cascadeSplitViewDepth[primary];
++        if (viewDepth > blendStart && splitFar > blendStart)
++        {
++            selection.secondary = primary + 1u;
++            selection.blendWeight = saturate((viewDepth - blendStart) / (splitFar - blendStart));
++        }
++    }
+     return selection;
+ }
+ 
