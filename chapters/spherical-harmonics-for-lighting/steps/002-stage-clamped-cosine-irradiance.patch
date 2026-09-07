@@ -1,0 +1,107 @@
+diff --git a/chapters/spherical-harmonics-for-lighting/Starter/SphericalHarmonicsLab.hlsl b/chapters/spherical-harmonics-for-lighting/Starter/SphericalHarmonicsLab.hlsl
+index d97f592..30345c4 100644
+--- a/chapters/spherical-harmonics-for-lighting/Starter/SphericalHarmonicsLab.hlsl
++++ b/chapters/spherical-harmonics-for-lighting/Starter/SphericalHarmonicsLab.hlsl
+@@ -8,14 +8,16 @@
+ // reconstruction shows visible truncation/ringing/negative lobes -- that
+ // truncation error is exactly what this baseline is meant to expose.
+ //
+-// This checkpoint adds a second reconstruction alongside the unrotated
+-// baseline: DebugView::RotatedReconstruction, evaluated from the Rotated
+-// coefficient set the CPU builds via ch26::spherical_harmonics::Rotate (see
+-// Common/GpuLabSupport.cpp). It still does not populate the irradiance/
+-// interpolated/band-contribution fields of PixelStatistics: see Solution for
+-// those techniques. The SH coefficients themselves are never authored here:
+-// they arrive in the Coefficients cbuffer below, uploaded every frame by the
+-// CPU after calling ch26::spherical_harmonics::Project/Rotate (see
++// This checkpoint adds a rotated reconstruction (DebugView::RotatedReconstruction,
++// from the CPU-rotated Rotated coefficient set) and clamped-cosine diffuse
++// irradiance (DebugView::Irradiance, reconstructed from the Irradiance
++// coefficient set the CPU builds via ch26::spherical_harmonics::ConvolveClampedCosine,
++// treating this pixel's direction as a surface normal). It still does not
++// populate the interpolated/band-contribution fields of PixelStatistics: see
++// Solution for those techniques. The SH coefficients themselves are never
++// authored here: they arrive in the Coefficients cbuffer below, uploaded
++// every frame by the CPU after calling
++// ch26::spherical_harmonics::Project/Rotate/ConvolveClampedCosine (see
+ // Common/GpuLabSupport.cpp).
+ static const float Pi = 3.14159265358979323846f;
+ 
+@@ -65,7 +67,7 @@
+ 
+ // The CPU uploads the full gpu::SHCoefficientBundle (base/rotated/irradiance)
+ // every frame so the Starter and Solution share one root signature and one
+-// upload path; this checkpoint reads Base and Rotated, but not yet Irradiance.
++// upload path; this checkpoint reads Base, Rotated, and Irradiance.
+ cbuffer Coefficients : register(b1)
+ {
+     SHCoefficientSetRGB Base;
+@@ -197,8 +199,13 @@
+         FullReconstructChannel(Rotated.g, basis),
+         FullReconstructChannel(Rotated.b, basis));
+ 
++    float3 irradiance = float3(
++        FullReconstructChannel(Irradiance.r, basis),
++        FullReconstructChannel(Irradiance.g, basis),
++        FullReconstructChannel(Irradiance.b, basis));
++
+     bool valid = all(isfinite(source)) && all(isfinite(reconstruction)) && all(isfinite(absoluteError)) &&
+-                 all(isfinite(rotatedReconstruction));
++                 all(isfinite(rotatedReconstruction)) && all(isfinite(irradiance));
+ 
+     PixelStatistics statistics;
+     statistics.sourceR = source.x;
+@@ -213,9 +220,9 @@
+     statistics.rotatedReconstructionR = rotatedReconstruction.x;
+     statistics.rotatedReconstructionG = rotatedReconstruction.y;
+     statistics.rotatedReconstructionB = rotatedReconstruction.z;
+-    statistics.irradianceR = 0.0;
+-    statistics.irradianceG = 0.0;
+-    statistics.irradianceB = 0.0;
++    statistics.irradianceR = irradiance.x;
++    statistics.irradianceG = irradiance.y;
++    statistics.irradianceB = irradiance.z;
+     statistics.interpolatedR = 0.0;
+     statistics.interpolatedG = 0.0;
+     statistics.interpolatedB = 0.0;
+@@ -223,7 +230,7 @@
+     statistics.bandContribution = 0.0;
+     statistics.bandEnergy = 0.0;
+     statistics.activeBand = ActiveBand;
+-    statistics.status = valid ? (1u | 2u | 4u | 8u) : 0u; // kSourceValid | kReconstructionValid | kErrorValid | kRotatedValid.
++    statistics.status = valid ? (1u | 2u | 4u | 8u | 16u) : 0u; // kSourceValid | kReconstructionValid | kErrorValid | kRotatedValid | kIrradianceValid.
+     Statistics[pixelIndex] = statistics;
+ }
+ 
+@@ -256,15 +263,15 @@
+ static const uint ViewReconstruction = 1u;
+ static const uint ViewAbsoluteError = 2u;
+ static const uint ViewRotatedReconstruction = 3u;
++static const uint ViewIrradiance = 4u;
+ 
+ float4 DisplayPS(float4 position : SV_Position) : SV_Target0
+ {
+-    // The Starter never computes the irradiance/interpolated/band-
+-    // contribution views: rather than silently rendering a placeholder for
+-    // data it never wrote, it explicitly flags any other requested view as
+-    // invalid.
++    // The Starter never computes the interpolated/band-contribution views:
++    // rather than silently rendering a placeholder for data it never wrote,
++    // it explicitly flags any other requested view as invalid.
+     if (DebugView != ViewSource && DebugView != ViewReconstruction && DebugView != ViewAbsoluteError &&
+-        DebugView != ViewRotatedReconstruction)
++        DebugView != ViewRotatedReconstruction && DebugView != ViewIrradiance)
+     {
+         return float4(1.0, 0.0, 1.0, 1.0);
+     }
+@@ -289,6 +296,10 @@
+         return float4(statistics.rotatedReconstructionR, statistics.rotatedReconstructionG,
+                      statistics.rotatedReconstructionB, 1.0);
+     }
++    if (DebugView == ViewIrradiance)
++    {
++        return float4(statistics.irradianceR, statistics.irradianceG, statistics.irradianceB, 1.0);
++    }
+     return float4(saturate(float3(statistics.absoluteErrorR, statistics.absoluteErrorG, statistics.absoluteErrorB)),
+                  1.0);
+ }

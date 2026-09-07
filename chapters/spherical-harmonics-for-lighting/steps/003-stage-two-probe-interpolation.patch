@@ -1,0 +1,108 @@
+diff --git a/chapters/spherical-harmonics-for-lighting/Starter/SphericalHarmonicsLab.hlsl b/chapters/spherical-harmonics-for-lighting/Starter/SphericalHarmonicsLab.hlsl
+index 30345c4..366d524 100644
+--- a/chapters/spherical-harmonics-for-lighting/Starter/SphericalHarmonicsLab.hlsl
++++ b/chapters/spherical-harmonics-for-lighting/Starter/SphericalHarmonicsLab.hlsl
+@@ -8,13 +8,13 @@
+ // reconstruction shows visible truncation/ringing/negative lobes -- that
+ // truncation error is exactly what this baseline is meant to expose.
+ //
+-// This checkpoint adds a rotated reconstruction (DebugView::RotatedReconstruction,
+-// from the CPU-rotated Rotated coefficient set) and clamped-cosine diffuse
+-// irradiance (DebugView::Irradiance, reconstructed from the Irradiance
+-// coefficient set the CPU builds via ch26::spherical_harmonics::ConvolveClampedCosine,
+-// treating this pixel's direction as a surface normal). It still does not
+-// populate the interpolated/band-contribution fields of PixelStatistics: see
+-// Solution for those techniques. The SH coefficients themselves are never
++// This checkpoint adds a rotated reconstruction (DebugView::RotatedReconstruction),
++// clamped-cosine diffuse irradiance (DebugView::Irradiance), and two-probe
++// coefficient interpolation (DebugView::Interpolated): a per-pixel linear
++// blend of the Base and Rotated coefficient sets, blended before HLSL
++// evaluation, with the blend factor swept left-to-right across the screen.
++// It still does not populate the band-contribution field of PixelStatistics:
++// see Solution for that technique. The SH coefficients themselves are never
+ // authored here: they arrive in the Coefficients cbuffer below, uploaded
+ // every frame by the CPU after calling
+ // ch26::spherical_harmonics::Project/Rotate/ConvolveClampedCosine (see
+@@ -204,8 +204,30 @@
+         FullReconstructChannel(Irradiance.g, basis),
+         FullReconstructChannel(Irradiance.b, basis));
+ 
++    // Two-probe interpolation: linearly blend the base and rotated
++    // *coefficient sets* (before any HLSL evaluation), with an obvious
++    // bounded screen-space experiment -- the blend factor sweeps 0..1 across
++    // the width of the image, left = probe A (base), right = probe B
++    // (rotated).
++    float blendFactor = saturate(((float) x + 0.5) / (float) Width);
++    float4 blendedR[4];
++    float4 blendedG[4];
++    float4 blendedB[4];
++    [unroll]
++    for (uint lane = 0u; lane < 4u; ++lane)
++    {
++        blendedR[lane] = lerp(Base.r[lane], Rotated.r[lane], blendFactor);
++        blendedG[lane] = lerp(Base.g[lane], Rotated.g[lane], blendFactor);
++        blendedB[lane] = lerp(Base.b[lane], Rotated.b[lane], blendFactor);
++    }
++    float3 interpolated = float3(
++        FullReconstructChannel(blendedR, basis),
++        FullReconstructChannel(blendedG, basis),
++        FullReconstructChannel(blendedB, basis));
++
+     bool valid = all(isfinite(source)) && all(isfinite(reconstruction)) && all(isfinite(absoluteError)) &&
+-                 all(isfinite(rotatedReconstruction)) && all(isfinite(irradiance));
++                 all(isfinite(rotatedReconstruction)) && all(isfinite(irradiance)) && all(isfinite(interpolated)) &&
++                 isfinite(blendFactor);
+ 
+     PixelStatistics statistics;
+     statistics.sourceR = source.x;
+@@ -223,14 +245,14 @@
+     statistics.irradianceR = irradiance.x;
+     statistics.irradianceG = irradiance.y;
+     statistics.irradianceB = irradiance.z;
+-    statistics.interpolatedR = 0.0;
+-    statistics.interpolatedG = 0.0;
+-    statistics.interpolatedB = 0.0;
+-    statistics.probeBlendFactor = 0.0;
++    statistics.interpolatedR = interpolated.x;
++    statistics.interpolatedG = interpolated.y;
++    statistics.interpolatedB = interpolated.z;
++    statistics.probeBlendFactor = blendFactor;
+     statistics.bandContribution = 0.0;
+     statistics.bandEnergy = 0.0;
+     statistics.activeBand = ActiveBand;
+-    statistics.status = valid ? (1u | 2u | 4u | 8u | 16u) : 0u; // kSourceValid | kReconstructionValid | kErrorValid | kRotatedValid | kIrradianceValid.
++    statistics.status = valid ? (1u | 2u | 4u | 8u | 16u | 32u) : 0u; // kSourceValid | kReconstructionValid | kErrorValid | kRotatedValid | kIrradianceValid | kInterpolatedValid.
+     Statistics[pixelIndex] = statistics;
+ }
+ 
+@@ -264,14 +286,15 @@
+ static const uint ViewAbsoluteError = 2u;
+ static const uint ViewRotatedReconstruction = 3u;
+ static const uint ViewIrradiance = 4u;
++static const uint ViewInterpolated = 5u;
+ 
+ float4 DisplayPS(float4 position : SV_Position) : SV_Target0
+ {
+-    // The Starter never computes the interpolated/band-contribution views:
+-    // rather than silently rendering a placeholder for data it never wrote,
+-    // it explicitly flags any other requested view as invalid.
++    // The Starter never computes the band-contribution view: rather than
++    // silently rendering a placeholder for data it never wrote, it
++    // explicitly flags any other requested view as invalid.
+     if (DebugView != ViewSource && DebugView != ViewReconstruction && DebugView != ViewAbsoluteError &&
+-        DebugView != ViewRotatedReconstruction && DebugView != ViewIrradiance)
++        DebugView != ViewRotatedReconstruction && DebugView != ViewIrradiance && DebugView != ViewInterpolated)
+     {
+         return float4(1.0, 0.0, 1.0, 1.0);
+     }
+@@ -300,6 +323,10 @@
+     {
+         return float4(statistics.irradianceR, statistics.irradianceG, statistics.irradianceB, 1.0);
+     }
++    if (DebugView == ViewInterpolated)
++    {
++        return float4(statistics.interpolatedR, statistics.interpolatedG, statistics.interpolatedB, 1.0);
++    }
+     return float4(saturate(float3(statistics.absoluteErrorR, statistics.absoluteErrorG, statistics.absoluteErrorB)),
+                  1.0);
+ }

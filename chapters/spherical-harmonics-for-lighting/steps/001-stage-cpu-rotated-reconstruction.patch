@@ -1,0 +1,107 @@
+diff --git a/chapters/spherical-harmonics-for-lighting/Starter/SphericalHarmonicsLab.hlsl b/chapters/spherical-harmonics-for-lighting/Starter/SphericalHarmonicsLab.hlsl
+index 88a6dc2..d97f592 100644
+--- a/chapters/spherical-harmonics-for-lighting/Starter/SphericalHarmonicsLab.hlsl
++++ b/chapters/spherical-harmonics-for-lighting/Starter/SphericalHarmonicsLab.hlsl
+@@ -8,13 +8,15 @@
+ // reconstruction shows visible truncation/ringing/negative lobes -- that
+ // truncation error is exactly what this baseline is meant to expose.
+ //
+-// This file intentionally only renders the *unrotated* baseline: the source
+-// environment, its order-3 SH reconstruction, and the absolute error between
+-// them. It never populates the rotated/irradiance/interpolated/band-contribution
+-// fields of PixelStatistics: see Solution for those techniques. The SH
+-// coefficients themselves are never authored here: they arrive in the
+-// Coefficients cbuffer below, uploaded every frame by the CPU after calling
+-// ch26::spherical_harmonics::Project (see Common/GpuLabSupport.cpp).
++// This checkpoint adds a second reconstruction alongside the unrotated
++// baseline: DebugView::RotatedReconstruction, evaluated from the Rotated
++// coefficient set the CPU builds via ch26::spherical_harmonics::Rotate (see
++// Common/GpuLabSupport.cpp). It still does not populate the irradiance/
++// interpolated/band-contribution fields of PixelStatistics: see Solution for
++// those techniques. The SH coefficients themselves are never authored here:
++// they arrive in the Coefficients cbuffer below, uploaded every frame by the
++// CPU after calling ch26::spherical_harmonics::Project/Rotate (see
++// Common/GpuLabSupport.cpp).
+ static const float Pi = 3.14159265358979323846f;
+ 
+ struct PixelStatistics
+@@ -63,7 +65,7 @@
+ 
+ // The CPU uploads the full gpu::SHCoefficientBundle (base/rotated/irradiance)
+ // every frame so the Starter and Solution share one root signature and one
+-// upload path; this baseline only ever reads the leading Base member.
++// upload path; this checkpoint reads Base and Rotated, but not yet Irradiance.
+ cbuffer Coefficients : register(b1)
+ {
+     SHCoefficientSetRGB Base;
+@@ -190,7 +192,13 @@
+         FullReconstructChannel(Base.b, basis));
+     float3 absoluteError = abs(reconstruction - source);
+ 
+-    bool valid = all(isfinite(source)) && all(isfinite(reconstruction)) && all(isfinite(absoluteError));
++    float3 rotatedReconstruction = float3(
++        FullReconstructChannel(Rotated.r, basis),
++        FullReconstructChannel(Rotated.g, basis),
++        FullReconstructChannel(Rotated.b, basis));
++
++    bool valid = all(isfinite(source)) && all(isfinite(reconstruction)) && all(isfinite(absoluteError)) &&
++                 all(isfinite(rotatedReconstruction));
+ 
+     PixelStatistics statistics;
+     statistics.sourceR = source.x;
+@@ -202,9 +210,9 @@
+     statistics.absoluteErrorR = absoluteError.x;
+     statistics.absoluteErrorG = absoluteError.y;
+     statistics.absoluteErrorB = absoluteError.z;
+-    statistics.rotatedReconstructionR = 0.0;
+-    statistics.rotatedReconstructionG = 0.0;
+-    statistics.rotatedReconstructionB = 0.0;
++    statistics.rotatedReconstructionR = rotatedReconstruction.x;
++    statistics.rotatedReconstructionG = rotatedReconstruction.y;
++    statistics.rotatedReconstructionB = rotatedReconstruction.z;
+     statistics.irradianceR = 0.0;
+     statistics.irradianceG = 0.0;
+     statistics.irradianceB = 0.0;
+@@ -215,7 +223,7 @@
+     statistics.bandContribution = 0.0;
+     statistics.bandEnergy = 0.0;
+     statistics.activeBand = ActiveBand;
+-    statistics.status = valid ? (1u | 2u | 4u) : 0u; // kSourceValid | kReconstructionValid | kErrorValid.
++    statistics.status = valid ? (1u | 2u | 4u | 8u) : 0u; // kSourceValid | kReconstructionValid | kErrorValid | kRotatedValid.
+     Statistics[pixelIndex] = statistics;
+ }
+ 
+@@ -247,14 +255,16 @@
+ static const uint ViewSource = 0u;
+ static const uint ViewReconstruction = 1u;
+ static const uint ViewAbsoluteError = 2u;
++static const uint ViewRotatedReconstruction = 3u;
+ 
+ float4 DisplayPS(float4 position : SV_Position) : SV_Target0
+ {
+-    // The Starter never computes the rotated/irradiance/interpolated/
+-    // band-contribution views: rather than silently rendering a placeholder
+-    // for data it never wrote, it explicitly flags any other requested view
+-    // as invalid.
+-    if (DebugView != ViewSource && DebugView != ViewReconstruction && DebugView != ViewAbsoluteError)
++    // The Starter never computes the irradiance/interpolated/band-
++    // contribution views: rather than silently rendering a placeholder for
++    // data it never wrote, it explicitly flags any other requested view as
++    // invalid.
++    if (DebugView != ViewSource && DebugView != ViewReconstruction && DebugView != ViewAbsoluteError &&
++        DebugView != ViewRotatedReconstruction)
+     {
+         return float4(1.0, 0.0, 1.0, 1.0);
+     }
+@@ -274,6 +284,11 @@
+     {
+         return float4(statistics.reconstructionR, statistics.reconstructionG, statistics.reconstructionB, 1.0);
+     }
++    if (DebugView == ViewRotatedReconstruction)
++    {
++        return float4(statistics.rotatedReconstructionR, statistics.rotatedReconstructionG,
++                     statistics.rotatedReconstructionB, 1.0);
++    }
+     return float4(saturate(float3(statistics.absoluteErrorR, statistics.absoluteErrorG, statistics.absoluteErrorB)),
+                  1.0);
+ }
