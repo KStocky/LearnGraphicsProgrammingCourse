@@ -1,0 +1,140 @@
+diff --git a/chapters/blue-noise-and-stochastic-reconstruction/Starter/BlueNoiseLab.hlsl b/chapters/blue-noise-and-stochastic-reconstruction/Starter/BlueNoiseLab.hlsl
+index 985e6dc..e349ccc 100644
+--- a/chapters/blue-noise-and-stochastic-reconstruction/Starter/BlueNoiseLab.hlsl
++++ b/chapters/blue-noise-and-stochastic-reconstruction/Starter/BlueNoiseLab.hlsl
+@@ -1,16 +1,19 @@
+ // Chapter 25 Starter: an honest one-sample-per-pixel baseline, now extended
+-// with a temporal low-discrepancy sequence.
++// with a temporal low-discrepancy sequence and the real uploaded blue-noise
++// rank tile.
+ //
+ // Every pixel independently draws ONE white-noise Bernoulli observation
+ // (sample < p(x, y)) per frame -- there is no accumulation across frames.
+-// This checkpoint adds a second, equal-cost technique: a per-pixel Van der
+-// Corput sequence indexed by the animation frame, offset by a fixed
+-// (frame-independent) Cranley-Patterson spatial phase so neighboring pixels
+-// don't share the same low-discrepancy draw. The blue-noise rank tile is not
+-// wired up yet; this file still does not populate PixelStatistics'
+-// rawBlueUnit/rawBlueHit/filteredBlue/blueTileRank fields: see Solution for
+-// that technique.
++// This checkpoint adds a third, equal-cost technique: the deterministic
++// 64x64 ranked blue-noise tile, uploaded as a real structured-buffer SRV and
++// looked up with a deterministic per-frame toroidal integer offset. The
++// normalized filter reconstruction for blue noise is not wired up yet; this
++// file still does not populate PixelStatistics' filteredBlue field: see
++// Solution for that technique.
+ static const float TwoPi = 6.28318530717958647693;
++static const uint TileSize = 64u;
++static const uint TileMask = 63u;
++static const uint TileCellCount = 4096u;
+ 
+ struct PixelStatistics
+ {
+@@ -38,6 +41,7 @@ cbuffer DispatchConstants : register(b0)
+ };
+ 
+ RWStructuredBuffer<PixelStatistics> Statistics : register(u0);
++StructuredBuffer<uint> BlueNoiseTile : register(t0);
+ 
+ uint PcgHash(uint value)
+ {
+@@ -85,6 +89,29 @@ float ExactProbability(uint x, uint y, uint width, uint height)
+     return 0.5 + 0.4 * sin(TwoPi * u) * cos(TwoPi * v);
+ }
+ 
++uint WrapCoordinate(uint value, uint offset)
++{
++    return (value + offset) & TileMask;
++}
++
++// Deterministic per-frame toroidal translation of the ranked tile: this
++// preserves the tile's spatial pattern and rank histogram (every rank still
++// appears exactly once per 64x64 tile) while moving which cell lands on each
++// pixel from frame to frame. This is temporal *translation* of a fixed 2D
++// pattern -- it is not a true spatiotemporal blue-noise (STBN) sequence, and
++// XOR rank-scrambling is deliberately not used here to fake one: the CPU
++// contract only proves that scrambling is a bijection that preserves the
++// rank histogram, not that arbitrary threshold subsets stay blue-noise-like
++// under it.
++uint BlueRankAt(uint x, uint y, uint frame)
++{
++    uint offsetX = (frame * 7u) & TileMask;
++    uint offsetY = (frame * 13u) & TileMask;
++    uint tileX = WrapCoordinate(x, offsetX);
++    uint tileY = WrapCoordinate(y, offsetY);
++    return BlueNoiseTile[tileY * TileSize + tileX];
++}
++
+ float RawWhiteHitAt(uint x, uint y, uint width, uint height, uint frame, uint seed)
+ {
+     uint pixelIndex = y * width + x;
+@@ -121,6 +148,10 @@ void SampleCS(uint3 dispatchThreadId : SV_DispatchThreadID)
+     float lowDiscrepancyUnit = frac(RadicalInverseBase2(AnimationFrame) + spatialPhase);
+     float lowDiscrepancyHit = lowDiscrepancyUnit < exact ? 1.0 : 0.0;
+ 
++    uint blueRank = BlueRankAt(x, y, AnimationFrame);
++    float blueUnit = (float(blueRank) + 0.5) / float(TileCellCount);
++    float blueHit = blueUnit < exact ? 1.0 : 0.0;
++
+     // Normalized 3x3 tent filter, evaluated on the fly by recomputing each
+     // clamped-to-edge neighbor's own independent white-noise hit. This keeps
+     // the compute pass single-dispatch with no ping-pong buffer.
+@@ -140,22 +171,23 @@ void SampleCS(uint3 dispatchThreadId : SV_DispatchThreadID)
+     float filteredWhite = filteredSum / weightSum;
+ 
+     bool valid = all(isfinite(float4(exact, whiteUnit, whiteHit, lowDiscrepancyUnit))) &&
+-                 all(isfinite(float2(lowDiscrepancyHit, filteredWhite)));
++                 all(isfinite(float3(lowDiscrepancyHit, blueUnit, blueHit))) &&
++                 isfinite(filteredWhite);
+ 
+     PixelStatistics statistics;
+     statistics.exact = exact;
+     statistics.rawWhiteUnit = whiteUnit;
+     statistics.rawLowDiscrepancyUnit = lowDiscrepancyUnit;
+-    statistics.rawBlueUnit = 0.0;
++    statistics.rawBlueUnit = blueUnit;
+     statistics.rawWhiteHit = whiteHit;
+     statistics.rawLowDiscrepancyHit = lowDiscrepancyHit;
+-    statistics.rawBlueHit = 0.0;
++    statistics.rawBlueHit = blueHit;
+     statistics.filteredWhite = filteredWhite;
+     statistics.filteredBlue = 0.0;
+-    statistics.blueTileRank = 0u;
++    statistics.blueTileRank = blueRank;
+     statistics.animationFrame = AnimationFrame;
+-    // kExactValid | kWhiteValid | kLowDiscrepancyValid | kFilteredWhiteValid
+-    statistics.status = valid ? (1u | 2u | 4u | 16u) : 0u;
++    // kExactValid | kWhiteValid | kLowDiscrepancyValid | kBlueValid | kFilteredWhiteValid
++    statistics.status = valid ? (1u | 2u | 4u | 8u | 16u) : 0u;
+     statistics.reserved = 0u;
+     Statistics[pixelIndex] = statistics;
+ }
+@@ -189,15 +221,16 @@ StructuredBuffer<PixelStatistics> DisplayStatistics : register(t0);
+ static const uint ViewExact = 0u;
+ static const uint ViewRawWhite = 1u;
+ static const uint ViewRawLowDiscrepancy = 2u;
++static const uint ViewRawBlue = 3u;
+ static const uint ViewFilteredWhite = 4u;
+ 
+ float4 DisplayPS(float4 position : SV_Position) : SV_Target0
+ {
+-    // The Starter never computes blue-noise or comparison views: rather
++    // The Starter never computes filtered-blue or comparison views: rather
+     // than silently rendering a placeholder for data it never wrote, it
+     // explicitly flags any other requested view as invalid.
+     if (DebugView != ViewExact && DebugView != ViewRawWhite && DebugView != ViewRawLowDiscrepancy &&
+-        DebugView != ViewFilteredWhite)
++        DebugView != ViewRawBlue && DebugView != ViewFilteredWhite)
+     {
+         return float4(1.0, 0.0, 1.0, 1.0);
+     }
+@@ -221,5 +254,9 @@ float4 DisplayPS(float4 position : SV_Position) : SV_Target0
+     {
+         return float4(statistics.rawLowDiscrepancyHit.xxx, 1.0);
+     }
++    if (DebugView == ViewRawBlue)
++    {
++        return float4(statistics.rawBlueHit.xxx, 1.0);
++    }
+     return float4(statistics.filteredWhite.xxx, 1.0);
+ }

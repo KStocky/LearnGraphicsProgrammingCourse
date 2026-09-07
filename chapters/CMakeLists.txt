@@ -94,3 +94,7 @@ lgp_chapter_is_selected("importance-sampling-and-multiple-importance-sampling" s
 if(selected)
     add_subdirectory("importance-sampling-and-multiple-importance-sampling")
 endif()
+lgp_chapter_is_selected("blue-noise-and-stochastic-reconstruction" selected)
+if(selected)
+    add_subdirectory("blue-noise-and-stochastic-reconstruction")
+endif()

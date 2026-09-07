@@ -1,0 +1,179 @@
+diff --git a/chapters/blue-noise-and-stochastic-reconstruction/Starter/BlueNoiseLab.hlsl b/chapters/blue-noise-and-stochastic-reconstruction/Starter/BlueNoiseLab.hlsl
+index e349ccc..dbc5345 100644
+--- a/chapters/blue-noise-and-stochastic-reconstruction/Starter/BlueNoiseLab.hlsl
++++ b/chapters/blue-noise-and-stochastic-reconstruction/Starter/BlueNoiseLab.hlsl
+@@ -1,15 +1,14 @@
+-// Chapter 25 Starter: an honest one-sample-per-pixel baseline, now extended
+-// with a temporal low-discrepancy sequence and the real uploaded blue-noise
+-// rank tile.
++// Chapter 25 Starter: white noise, a temporal low-discrepancy sequence, and
++// the real uploaded blue-noise rank tile, now with normalized filtered-blue
++// reconstruction and side-by-side comparative diagnostics.
+ //
+-// Every pixel independently draws ONE white-noise Bernoulli observation
+-// (sample < p(x, y)) per frame -- there is no accumulation across frames.
+-// This checkpoint adds a third, equal-cost technique: the deterministic
+-// 64x64 ranked blue-noise tile, uploaded as a real structured-buffer SRV and
+-// looked up with a deterministic per-frame toroidal integer offset. The
+-// normalized filter reconstruction for blue noise is not wired up yet; this
+-// file still does not populate PixelStatistics' filteredBlue field: see
+-// Solution for that technique.
++// Every pixel independently draws ONE Bernoulli observation (sample <
++// p(x, y)) per technique per frame -- there is no accumulation across
++// frames. Blue noise does not reduce a single pixel's own Monte Carlo
++// variance, it only changes *where* the resulting error is spatially placed
++// relative to its neighbors; that only becomes visible after the shared
++// normalized tent-filter reconstruction step, which this file now computes
++// for both the white and blue techniques.
+ static const float TwoPi = 6.28318530717958647693;
+ static const uint TileSize = 64u;
+ static const uint TileMask = 63u;
+@@ -120,6 +119,14 @@ float RawWhiteHitAt(uint x, uint y, uint width, uint height, uint frame, uint se
+     return unitSample < exact ? 1.0 : 0.0;
+ }
+ 
++float RawBlueHitAt(uint x, uint y, uint width, uint height, uint frame)
++{
++    uint rank = BlueRankAt(x, y, frame);
++    float unitSample = (float(rank) + 0.5) / float(TileCellCount);
++    float exact = ExactProbability(x, y, width, height);
++    return unitSample < exact ? 1.0 : 0.0;
++}
++
+ float TentWeight1D(int offset)
+ {
+     return offset == 0 ? 2.0 : 1.0;
+@@ -153,9 +160,11 @@ void SampleCS(uint3 dispatchThreadId : SV_DispatchThreadID)
+     float blueHit = blueUnit < exact ? 1.0 : 0.0;
+ 
+     // Normalized 3x3 tent filter, evaluated on the fly by recomputing each
+-    // clamped-to-edge neighbor's own independent white-noise hit. This keeps
+-    // the compute pass single-dispatch with no ping-pong buffer.
+-    float filteredSum = 0.0;
++    // clamped-to-edge neighbor's own independent hit for the same technique
++    // and frame. This keeps the compute pass single-dispatch with no
++    // ping-pong buffer, at the cost of recomputing each neighbor's hash.
++    float filteredWhiteSum = 0.0;
++    float filteredBlueSum = 0.0;
+     float weightSum = 0.0;
+     for (int dy = -1; dy <= 1; ++dy)
+     {
+@@ -164,15 +173,17 @@ void SampleCS(uint3 dispatchThreadId : SV_DispatchThreadID)
+             uint nx = uint(clamp(int(x) + dx, 0, int(Width) - 1));
+             uint ny = uint(clamp(int(y) + dy, 0, int(Height) - 1));
+             float weight = TentWeight1D(dx) * TentWeight1D(dy);
+-            filteredSum += weight * RawWhiteHitAt(nx, ny, Width, Height, AnimationFrame, Seed);
++            filteredWhiteSum += weight * RawWhiteHitAt(nx, ny, Width, Height, AnimationFrame, Seed);
++            filteredBlueSum += weight * RawBlueHitAt(nx, ny, Width, Height, AnimationFrame);
+             weightSum += weight;
+         }
+     }
+-    float filteredWhite = filteredSum / weightSum;
++    float filteredWhite = filteredWhiteSum / weightSum;
++    float filteredBlue = filteredBlueSum / weightSum;
+ 
+-    bool valid = all(isfinite(float4(exact, whiteUnit, whiteHit, lowDiscrepancyUnit))) &&
+-                 all(isfinite(float3(lowDiscrepancyHit, blueUnit, blueHit))) &&
+-                 isfinite(filteredWhite);
++    bool valid = all(isfinite(float4(exact, whiteUnit, lowDiscrepancyUnit, blueUnit))) &&
++                 all(isfinite(float4(whiteHit, lowDiscrepancyHit, blueHit, filteredWhite))) &&
++                 isfinite(filteredBlue);
+ 
+     PixelStatistics statistics;
+     statistics.exact = exact;
+@@ -183,11 +194,11 @@ void SampleCS(uint3 dispatchThreadId : SV_DispatchThreadID)
+     statistics.rawLowDiscrepancyHit = lowDiscrepancyHit;
+     statistics.rawBlueHit = blueHit;
+     statistics.filteredWhite = filteredWhite;
+-    statistics.filteredBlue = 0.0;
++    statistics.filteredBlue = filteredBlue;
+     statistics.blueTileRank = blueRank;
+     statistics.animationFrame = AnimationFrame;
+-    // kExactValid | kWhiteValid | kLowDiscrepancyValid | kBlueValid | kFilteredWhiteValid
+-    statistics.status = valid ? (1u | 2u | 4u | 8u | 16u) : 0u;
++    // kExactValid | kWhiteValid | kLowDiscrepancyValid | kBlueValid | kFilteredWhiteValid | kFilteredBlueValid
++    statistics.status = valid ? 0x3Fu : 0u;
+     statistics.reserved = 0u;
+     Statistics[pixelIndex] = statistics;
+ }
+@@ -218,19 +229,31 @@ cbuffer DisplayConstants : register(b0)
+ 
+ StructuredBuffer<PixelStatistics> DisplayStatistics : register(t0);
+ 
++float3 HeatMap(float value)
++{
++    float t = saturate(value);
++    return saturate(float3(1.5 * t, 1.5 - abs(3.0 * t - 1.5), 1.5 * (1.0 - t)));
++}
++
+ static const uint ViewExact = 0u;
+ static const uint ViewRawWhite = 1u;
+ static const uint ViewRawLowDiscrepancy = 2u;
+ static const uint ViewRawBlue = 3u;
+ static const uint ViewFilteredWhite = 4u;
++static const uint ViewFilteredBlue = 5u;
++static const uint ViewRawComparison = 6u;
++static const uint ViewFilteredComparison = 7u;
++static const uint ViewAbsoluteErrorComparison = 8u;
+ 
+ float4 DisplayPS(float4 position : SV_Position) : SV_Target0
+ {
+-    // The Starter never computes filtered-blue or comparison views: rather
++    // The Starter never computes the pattern-threshold diagnostic: rather
+     // than silently rendering a placeholder for data it never wrote, it
+     // explicitly flags any other requested view as invalid.
+     if (DebugView != ViewExact && DebugView != ViewRawWhite && DebugView != ViewRawLowDiscrepancy &&
+-        DebugView != ViewRawBlue && DebugView != ViewFilteredWhite)
++        DebugView != ViewRawBlue && DebugView != ViewFilteredWhite && DebugView != ViewFilteredBlue &&
++        DebugView != ViewRawComparison && DebugView != ViewFilteredComparison &&
++        DebugView != ViewAbsoluteErrorComparison)
+     {
+         return float4(1.0, 0.0, 1.0, 1.0);
+     }
+@@ -242,6 +265,8 @@ float4 DisplayPS(float4 position : SV_Position) : SV_Target0
+         return float4(1.0, 0.0, 1.0, 1.0);
+     }
+ 
++    float exact = max(statistics.exact, 1.0e-4);
++
+     if (DebugView == ViewExact)
+     {
+         return float4(statistics.exact.xxx, 1.0);
+@@ -258,5 +283,36 @@ float4 DisplayPS(float4 position : SV_Position) : SV_Target0
+     {
+         return float4(statistics.rawBlueHit.xxx, 1.0);
+     }
+-    return float4(statistics.filteredWhite.xxx, 1.0);
++    if (DebugView == ViewFilteredWhite)
++    {
++        return float4(statistics.filteredWhite.xxx, 1.0);
++    }
++    if (DebugView == ViewFilteredBlue)
++    {
++        return float4(statistics.filteredBlue.xxx, 1.0);
++    }
++    if (DebugView == ViewRawComparison)
++    {
++        uint band = min(2u, (pixel.x * 3u) / DisplayWidth);
++        uint sourceX = pixel.x * 3u - band * DisplayWidth;
++        statistics = DisplayStatistics[pixel.y * DisplayWidth + sourceX];
++        float value =
++            band == 0u ? statistics.rawWhiteHit : (band == 1u ? statistics.rawLowDiscrepancyHit : statistics.rawBlueHit);
++        return float4(value.xxx, 1.0);
++    }
++    if (DebugView == ViewFilteredComparison)
++    {
++        uint band = min(1u, (pixel.x * 2u) / DisplayWidth);
++        uint sourceX = pixel.x * 2u - band * DisplayWidth;
++        statistics = DisplayStatistics[pixel.y * DisplayWidth + sourceX];
++        float value = band == 0u ? statistics.filteredWhite : statistics.filteredBlue;
++        return float4(value.xxx, 1.0);
++    }
++    uint band = min(1u, (pixel.x * 2u) / DisplayWidth);
++    uint sourceX = pixel.x * 2u - band * DisplayWidth;
++    statistics = DisplayStatistics[pixel.y * DisplayWidth + sourceX];
++    float value = band == 0u ? statistics.filteredWhite : statistics.filteredBlue;
++    exact = max(statistics.exact, 1.0e-4);
++    float error = abs(value - statistics.exact) / exact;
++    return float4(HeatMap(error * 4.0), 1.0);
+ }

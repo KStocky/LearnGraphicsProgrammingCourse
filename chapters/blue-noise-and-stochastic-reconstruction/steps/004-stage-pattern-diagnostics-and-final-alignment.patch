@@ -1,0 +1,165 @@
+diff --git a/chapters/blue-noise-and-stochastic-reconstruction/Starter/BlueNoiseLab.hlsl b/chapters/blue-noise-and-stochastic-reconstruction/Starter/BlueNoiseLab.hlsl
+index dbc5345..48dfb16 100644
+--- a/chapters/blue-noise-and-stochastic-reconstruction/Starter/BlueNoiseLab.hlsl
++++ b/chapters/blue-noise-and-stochastic-reconstruction/Starter/BlueNoiseLab.hlsl
+@@ -1,14 +1,13 @@
+-// Chapter 25 Starter: white noise, a temporal low-discrepancy sequence, and
+-// the real uploaded blue-noise rank tile, now with normalized filtered-blue
+-// reconstruction and side-by-side comparative diagnostics.
++// Chapter 25 Solution: equal-cost sample-address strategies compared.
+ //
+-// Every pixel independently draws ONE Bernoulli observation (sample <
+-// p(x, y)) per technique per frame -- there is no accumulation across
+-// frames. Blue noise does not reduce a single pixel's own Monte Carlo
+-// variance, it only changes *where* the resulting error is spatially placed
+-// relative to its neighbors; that only becomes visible after the shared
+-// normalized tent-filter reconstruction step, which this file now computes
+-// for both the white and blue techniques.
++// Every pixel independently draws exactly ONE Bernoulli observation
++// (sample < p(x, y)) per technique per frame -- white noise, a temporally
++// low-discrepancy sequence, and a deterministic 64x64 ranked blue-noise tile.
++// All three cost exactly one evaluation per pixel; blue noise does not
++// reduce a single pixel's own Monte Carlo variance, it only changes *where*
++// the resulting error is spatially placed relative to its neighbors. That
++// only becomes visible after the shared normalized tent-filter reconstruction
++// step, which this file also computes for the white and blue techniques.
+ static const float TwoPi = 6.28318530717958647693;
+ static const uint TileSize = 64u;
+ static const uint TileMask = 63u;
+@@ -145,6 +144,7 @@ void SampleCS(uint3 dispatchThreadId : SV_DispatchThreadID)
+     uint pixelIndex = y * Width + x;
+ 
+     float exact = ExactProbability(x, y, Width, Height);
++
+     float whiteUnit = WhiteUnit(pixelIndex, AnimationFrame, Seed, 0u);
+     float whiteHit = whiteUnit < exact ? 1.0 : 0.0;
+ 
+@@ -197,8 +197,7 @@ void SampleCS(uint3 dispatchThreadId : SV_DispatchThreadID)
+     statistics.filteredBlue = filteredBlue;
+     statistics.blueTileRank = blueRank;
+     statistics.animationFrame = AnimationFrame;
+-    // kExactValid | kWhiteValid | kLowDiscrepancyValid | kBlueValid | kFilteredWhiteValid | kFilteredBlueValid
+-    statistics.status = valid ? 0x3Fu : 0u;
++    statistics.status = valid ? 0x3Fu : 0u; // all six kSolutionValidStatus bits
+     statistics.reserved = 0u;
+     Statistics[pixelIndex] = statistics;
+ }
+@@ -244,20 +243,10 @@ static const uint ViewFilteredBlue = 5u;
+ static const uint ViewRawComparison = 6u;
+ static const uint ViewFilteredComparison = 7u;
+ static const uint ViewAbsoluteErrorComparison = 8u;
++static const uint ViewPatternDiagnostic = 9u;
+ 
+ float4 DisplayPS(float4 position : SV_Position) : SV_Target0
+ {
+-    // The Starter never computes the pattern-threshold diagnostic: rather
+-    // than silently rendering a placeholder for data it never wrote, it
+-    // explicitly flags any other requested view as invalid.
+-    if (DebugView != ViewExact && DebugView != ViewRawWhite && DebugView != ViewRawLowDiscrepancy &&
+-        DebugView != ViewRawBlue && DebugView != ViewFilteredWhite && DebugView != ViewFilteredBlue &&
+-        DebugView != ViewRawComparison && DebugView != ViewFilteredComparison &&
+-        DebugView != ViewAbsoluteErrorComparison)
+-    {
+-        return float4(1.0, 0.0, 1.0, 1.0);
+-    }
+-
+     uint2 pixel = min(uint2(position.xy), uint2(DisplayWidth - 1u, DisplayHeight - 1u));
+     PixelStatistics statistics = DisplayStatistics[pixel.y * DisplayWidth + pixel.x];
+     if ((statistics.status & ExpectedStatus) != ExpectedStatus)
+@@ -304,11 +293,34 @@ float4 DisplayPS(float4 position : SV_Position) : SV_Target0
+         float value = band == 0u ? statistics.filteredWhite : statistics.filteredBlue;
+         return float4(value.xxx, 1.0);
+     }
+-    uint band = min(1u, (pixel.x * 2u) / DisplayWidth);
+-    uint sourceX = pixel.x * 2u - band * DisplayWidth;
+-    statistics = DisplayStatistics[pixel.y * DisplayWidth + sourceX];
+-    float value = band == 0u ? statistics.filteredWhite : statistics.filteredBlue;
+-    exact = max(statistics.exact, 1.0e-4);
+-    float error = abs(value - statistics.exact) / exact;
+-    return float4(HeatMap(error * 4.0), 1.0);
++    if (DebugView == ViewAbsoluteErrorComparison)
++    {
++        uint band = min(1u, (pixel.x * 2u) / DisplayWidth);
++        uint sourceX = pixel.x * 2u - band * DisplayWidth;
++        statistics = DisplayStatistics[pixel.y * DisplayWidth + sourceX];
++        float value = band == 0u ? statistics.filteredWhite : statistics.filteredBlue;
++        exact = max(statistics.exact, 1.0e-4);
++        float error = abs(value - statistics.exact) / exact;
++        return float4(HeatMap(error * 4.0), 1.0);
++    }
++
++    // ViewPatternDiagnostic: a fixed-size threshold membership field,
++    // independent of p(x, y) -- left half is the blue-tile rank thresholded
++    // at ThresholdRank, right half is an equal-density white-noise threshold
++    // using the same per-pixel unit sample already computed for the raw
++    // white technique. This is purely a visual aid; the numeric low-frequency
++    // energy comparison in the GPU tests uses an exact equal-count selection
++    // from the readback, not this density-matched approximation.
++    bool leftHalf = pixel.x * 2u < DisplayWidth;
++    uint band = leftHalf ? 0u : 1u;
++    uint sourceX = pixel.x * 2u - band * DisplayWidth;
++    statistics = DisplayStatistics[pixel.y * DisplayWidth + sourceX];
++    if (leftHalf)
++    {
++        float member = statistics.blueTileRank < ThresholdRank ? 1.0 : 0.0;
++        return float4(member.xxx, 1.0);
++    }
++    float density = float(ThresholdRank) / float(TileCellCount);
++    float member = statistics.rawWhiteUnit < density ? 1.0 : 0.0;
++    return float4(member.xxx, 1.0);
+ }
+diff --git a/chapters/blue-noise-and-stochastic-reconstruction/Starter/Main.cpp b/chapters/blue-noise-and-stochastic-reconstruction/Starter/Main.cpp
+index 1dddf38..694b751 100644
+--- a/chapters/blue-noise-and-stochastic-reconstruction/Starter/Main.cpp
++++ b/chapters/blue-noise-and-stochastic-reconstruction/Starter/Main.cpp
+@@ -4,10 +4,10 @@
+ 
+ int wmain(int argc, wchar_t **argv)
+ {
+-    ch25::blue_noise::starter::Renderer renderer{};
++    ch25::blue_noise::solution::Renderer renderer{};
+ 
+     lgp::framework::ApplicationConfiguration configuration{};
+-    configuration.title = L"Ch25 Blue Noise Starter (white noise + normalized spatial filter)";
++    configuration.title = L"Ch25 Blue Noise Solution (white / low-discrepancy / blue-noise-tile comparison)";
+     configuration.width = 320U;
+     configuration.height = 180U;
+     configuration.enableDebugLayer = false;
+diff --git a/chapters/blue-noise-and-stochastic-reconstruction/Starter/Renderer.cpp b/chapters/blue-noise-and-stochastic-reconstruction/Starter/Renderer.cpp
+index 58a2cf0..75a34a4 100644
+--- a/chapters/blue-noise-and-stochastic-reconstruction/Starter/Renderer.cpp
++++ b/chapters/blue-noise-and-stochastic-reconstruction/Starter/Renderer.cpp
+@@ -1,11 +1,11 @@
+ #include "Renderer.hpp"
+ 
+-namespace ch25::blue_noise::starter
++namespace ch25::blue_noise::solution
+ {
+ 
+ Renderer::Renderer()
+-    : RendererCore(std::filesystem::path{__FILE__}.parent_path() / "BlueNoiseLab.hlsl", gpu::LabVariant::Starter)
++    : RendererCore(std::filesystem::path{__FILE__}.parent_path() / "BlueNoiseLab.hlsl", gpu::LabVariant::Solution)
+ {
+ }
+ 
+-} // namespace ch25::blue_noise::starter
++} // namespace ch25::blue_noise::solution
+diff --git a/chapters/blue-noise-and-stochastic-reconstruction/Starter/Renderer.hpp b/chapters/blue-noise-and-stochastic-reconstruction/Starter/Renderer.hpp
+index 13b6f03..e4406e5 100644
+--- a/chapters/blue-noise-and-stochastic-reconstruction/Starter/Renderer.hpp
++++ b/chapters/blue-noise-and-stochastic-reconstruction/Starter/Renderer.hpp
+@@ -2,7 +2,7 @@
+ 
+ #include "../Common/GpuLabSupport.hpp"
+ 
+-namespace ch25::blue_noise::starter
++namespace ch25::blue_noise::solution
+ {
+ 
+ using HeadlessTestConfiguration = gpu::LabConfiguration;
+@@ -13,4 +13,4 @@ class Renderer final : public gpu::RendererCore
+     Renderer();
+ };
+ 
+-} // namespace ch25::blue_noise::starter
++} // namespace ch25::blue_noise::solution
