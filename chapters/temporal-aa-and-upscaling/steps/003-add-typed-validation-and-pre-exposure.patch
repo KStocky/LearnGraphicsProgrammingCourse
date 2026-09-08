@@ -1,0 +1,72 @@
+diff --git a/chapters/temporal-aa-and-upscaling/Starter/TemporalAaLab.hlsl b/chapters/temporal-aa-and-upscaling/Starter/TemporalAaLab.hlsl
+--- a/chapters/temporal-aa-and-upscaling/Starter/TemporalAaLab.hlsl
++++ b/chapters/temporal-aa-and-upscaling/Starter/TemporalAaLab.hlsl
+@@ -1,13 +1,13 @@
+-// Chapter 28 checkpoint 2: motion reprojection and jitter-compensated storage.
++// Chapter 28 checkpoint 3: typed history validation and pre-exposure handling.
+ //
+-// History is now sampled from the previous frame's surface position instead
+-// of the current pixel. The contract-level previousUv adds this frame's
+-// motion vector plus the difference between the previous and current jitter
+-// offsets to the current jittered UV; historyStorageUv then removes the
+-// previous frame's jitter to convert that raster-space UV into the unjittered
+-// display-grid coordinate the ping-pong history buffer actually stores.
+-// Object 2 is the only moving surface in this scene, so static geometry keeps
+-// a zero motion vector and samples its own previous pixel.
++// The single RejectNoHistory/RejectReset/RejectFootprint lifecycle check now
++// grows into the complete typed rejection contract: depth and normal agree
++// with the same surface, the object identifier matches, and the sampled
++// surface was neither reactive nor freshly disoccluded. Pre-exposure changes
++// between frames are handled explicitly: historyColor and historyLuminance
++// are rescaled by the current-over-previous exposure ratio before any
++// comparison, and an exposure swing beyond 4x or a luminance swing beyond 8x
++// both reject the sample outright.
+ #include "../Common/TemporalAaShared.hlsli"
+-
++
+ HistoryPixel GatherHistory(float2 uv, out bool footprintValid)
+@@ -95,6 +95,21 @@ HistoryPixel GatherHistory(float2 uv, out bool footprintValid)
+     if (!hasHistory) reasons |= RejectNoHistory;
+     if (reset) reasons |= RejectReset;
+     if (!footprintValid) reasons |= RejectFootprint;
++    float depthTolerance = max(0.001f, 0.005f * max(scene.depth, history.depth));
++    if (abs(history.depth - scene.depth) > depthTolerance) reasons |= RejectDepth;
++    if (dot(scene.normal, float3(history.normalX, history.normalY, history.normalZ)) < 0.8f) reasons |= RejectNormal;
++    if (scene.objectId != history.objectId) reasons |= RejectObject;
++    if (scene.reactive >= 0.95f) reasons |= RejectReactive;
++    if (scene.disocclusion >= 0.5f) reasons |= RejectDisocclusion;
++    float exposureScale = CurrentPreExposure / PreviousPreExposure;
++    float exposureRatio = max(exposureScale, 1.0f / exposureScale);
++    if (exposureRatio > 4.0f) reasons |= RejectExposure;
++    float historyLuminance = history.luminance * exposureScale;
++    float luminanceRatio =
++        (max(Luminance(spatial), historyLuminance) + 1.0e-4f) /
++        (min(Luminance(spatial), historyLuminance) + 1.0e-4f);
++    if (luminanceRatio > 8.0f) reasons |= RejectLuminance;
++    float3 historyColor = float3(history.colorR, history.colorG, history.colorB) * exposureScale;
+-
++
+     uint nextCount = reasons == 0u ? min(history.sampleCount + 1u, 64u) : 1u;
+     HistoryPixel next;
+@@ -129,15 +144,16 @@ HistoryPixel GatherHistory(float2 uv, out bool footprintValid)
+     output.previousHistoryY = previousUv.y;
+     output.historyStorageX = historyStorageUv.x;
+     output.historyStorageY = historyStorageUv.y;
+-    output.historyR = history.colorR;
+-    output.historyG = history.colorG;
+-    output.historyB = history.colorB;
+-    output.historyLuminance = history.luminance;
++    output.historyR = historyColor.r;
++    output.historyG = historyColor.g;
++    output.historyB = historyColor.b;
++    output.historyLuminance = historyLuminance;
+     output.rejectionReasons = reasons;
+     output.previousSampleCount = history.sampleCount;
+     output.nextSampleCount = nextCount;
+     output.currentObjectId = scene.objectId;
+-    output.status = 263u;
++    output.sampledObjectId = history.objectId;
++    output.status = 271u;
+     output.renderWidth = RenderWidth;
+     output.renderHeight = RenderHeight;
+     Statistics[index] = output;

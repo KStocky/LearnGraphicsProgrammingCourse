@@ -1,0 +1,111 @@
+diff --git a/chapters/temporal-aa-and-upscaling/Starter/TemporalAaLab.hlsl b/chapters/temporal-aa-and-upscaling/Starter/TemporalAaLab.hlsl
+--- a/chapters/temporal-aa-and-upscaling/Starter/TemporalAaLab.hlsl
++++ b/chapters/temporal-aa-and-upscaling/Starter/TemporalAaLab.hlsl
+@@ -1,13 +1,4 @@
+-// Chapter 28 checkpoint 4: YCoCg neighborhood clipping and temporal resolve.
+-//
+-// The accepted history color is variance-clipped in scene-linear YCoCg
+-// against a 3x3 neighborhood built from the same spatial reconstruction the
+-// current pixel used, then clamped to the neighborhood's RGB min/max. The
+-// blend weight toward that constrained history is the product of a validity
+-// gate, a sample-count confidence ramp from 0.05 up to 0.95, a motion-length
+-// falloff, and reactive/disocclusion attenuation. History now stores the
+-// resolved result instead of the raw spatial sample, closing the feedback
+-// loop that lets accepted samples accumulate confidence across frames.
++// Chapter 28 Solution: scene-linear temporal resolve and temporal upscaling.
+ #include "../Common/TemporalAaShared.hlsli"
+-
++
+ HistoryPixel GatherHistory(float2 uv, out bool footprintValid)
+@@ -129,6 +120,10 @@ HistoryPixel GatherHistory(float2 uv, out bool footprintValid)
+     float feedback = validityFactor * unconstrainedFeedback * motionFactor * reactiveFactor * disocclusionFactor;
+     float3 resolved = reasons == 0u ? lerp(spatial, constrained, feedback) : spatial;
+     uint nextCount = reasons == 0u ? min(history.sampleCount + 1u, 64u) : 1u;
++    float3 appliedDetail;
++    float overshoot;
++    float3 sharpened =
++        BoundedSharpen(resolved, neighborAverage, minimumColor, maximumColor, SharpeningStrength, appliedDetail, overshoot);
+-
++
+     HistoryPixel next;
+     next.colorR = resolved.r;
+@@ -180,12 +175,19 @@ HistoryPixel GatherHistory(float2 uv, out bool footprintValid)
+     output.resolvedR = resolved.r;
+     output.resolvedG = resolved.g;
+     output.resolvedB = resolved.b;
++    output.sharpenedR = sharpened.r;
++    output.sharpenedG = sharpened.g;
++    output.sharpenedB = sharpened.b;
++    output.sharpeningDeltaR = appliedDetail.r;
++    output.sharpeningDeltaG = appliedDetail.g;
++    output.sharpeningDeltaB = appliedDetail.b;
++    output.overshootObserved = overshoot;
+     output.rejectionReasons = reasons;
+     output.previousSampleCount = history.sampleCount;
+     output.nextSampleCount = nextCount;
+     output.currentObjectId = scene.objectId;
+     output.sampledObjectId = history.objectId;
+-    output.status = 383u;
++    output.status = 511u;
+     output.renderWidth = RenderWidth;
+     output.renderHeight = RenderHeight;
+     Statistics[index] = output;
+diff --git a/chapters/temporal-aa-and-upscaling/Starter/Main.cpp b/chapters/temporal-aa-and-upscaling/Starter/Main.cpp
+--- a/chapters/temporal-aa-and-upscaling/Starter/Main.cpp
++++ b/chapters/temporal-aa-and-upscaling/Starter/Main.cpp
+@@ -4,13 +4,13 @@
+-
++
+ int wmain(int argc, wchar_t **argv)
+ {
+-    std::puts("Ch28 Starter: current-frame bilinear reconstruction from a jittered reduced-resolution analytic scene.");
+     std::puts(
+-        "No temporal history is read. Views compare the native current frame with reduced spatial reconstruction.");
+-    std::puts("Checkpoint: display=321x181 render=203x115 scale=0.63 history=disabled jitter=Halton8.");
+-    ch28::temporal_aa::starter::Renderer renderer{};
++        "Ch28 Solution: display-resolution temporal history, rejection, YCoCg clipping, feedback, and sharpening.");
++    std::puts("Native TAA and temporal upscaling are distinct modes; default upscale scale=0.63, Halton period=8.");
++    std::puts("Checkpoint: display=321x181 render=203x115 history=ping-pong metadata feedback=[0.05,0.95].");
++    ch28::temporal_aa::solution::Renderer renderer{};
+     lgp::framework::ApplicationConfiguration configuration{};
+-    configuration.title = L"Ch28 Temporal AA Starter (spatial-only baseline)";
++    configuration.title = L"Ch28 Temporal AA and Upscaling Solution";
+     configuration.width = 321U;
+     configuration.height = 181U;
+     auto result = lgp::framework::RunApplication(configuration, argc, argv, renderer);
+diff --git a/chapters/temporal-aa-and-upscaling/Starter/Renderer.cpp b/chapters/temporal-aa-and-upscaling/Starter/Renderer.cpp
+--- a/chapters/temporal-aa-and-upscaling/Starter/Renderer.cpp
++++ b/chapters/temporal-aa-and-upscaling/Starter/Renderer.cpp
+@@ -1,9 +1,9 @@
+ #include "Renderer.hpp"
+-
++
+-namespace ch28::temporal_aa::starter
++namespace ch28::temporal_aa::solution
+ {
+ Renderer::Renderer()
+-    : RendererCore(std::filesystem::path{__FILE__}.parent_path() / "TemporalAaLab.hlsl", gpu::LabVariant::Starter)
++    : RendererCore(std::filesystem::path{__FILE__}.parent_path() / "TemporalAaLab.hlsl", gpu::LabVariant::Solution)
+ {
+ }
+-} // namespace ch28::temporal_aa::starter
++} // namespace ch28::temporal_aa::solution
+diff --git a/chapters/temporal-aa-and-upscaling/Starter/Renderer.hpp b/chapters/temporal-aa-and-upscaling/Starter/Renderer.hpp
+--- a/chapters/temporal-aa-and-upscaling/Starter/Renderer.hpp
++++ b/chapters/temporal-aa-and-upscaling/Starter/Renderer.hpp
+@@ -1,7 +1,7 @@
+ #pragma once
+ #include "../Common/GpuLabSupport.hpp"
+-
++
+-namespace ch28::temporal_aa::starter
++namespace ch28::temporal_aa::solution
+ {
+ using HeadlessTestConfiguration = gpu::LabConfiguration;
+ class Renderer final : public gpu::RendererCore
+@@ -9,4 +9,4 @@ class Renderer final : public gpu::RendererCore
+   public:
+     Renderer();
+ };
+-} // namespace ch28::temporal_aa::starter
++} // namespace ch28::temporal_aa::solution

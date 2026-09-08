@@ -106,3 +106,7 @@ lgp_chapter_is_selected("environment-lighting-and-image-based-lighting" selected
 if(selected)
     add_subdirectory("environment-lighting-and-image-based-lighting")
 endif()
+lgp_chapter_is_selected("temporal-aa-and-upscaling" selected)
+if(selected)
+    add_subdirectory("temporal-aa-and-upscaling")
+endif()

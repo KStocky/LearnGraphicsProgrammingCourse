@@ -1,0 +1,80 @@
+diff --git a/chapters/temporal-aa-and-upscaling/Starter/TemporalAaLab.hlsl b/chapters/temporal-aa-and-upscaling/Starter/TemporalAaLab.hlsl
+--- a/chapters/temporal-aa-and-upscaling/Starter/TemporalAaLab.hlsl
++++ b/chapters/temporal-aa-and-upscaling/Starter/TemporalAaLab.hlsl
+@@ -1,13 +1,13 @@
+-// Chapter 28 checkpoint 1: display-resolution history lifecycle and safe I/O.
++// Chapter 28 checkpoint 2: motion reprojection and jitter-compensated storage.
+ //
+-// The Starter's honest spatial-only reconstruction is unchanged: this
+-// checkpoint only introduces the display-resolution ping-pong history buffer
+-// contract. GatherHistory bilinearly filters color/luminance and takes
+-// metadata from the nearest texel. The read is gated by the caller-supplied
+-// hasHistory/reset lifecycle flags and a footprint bound check, so no frame
+-// ever samples uninitialized or stale history data. Reprojection (motion and
+-// jitter-compensated storage coordinates) is not introduced yet: this
+-// checkpoint samples the unjittered display grid at the current pixel.
++// History is now sampled from the previous frame's surface position instead
++// of the current pixel. The contract-level previousUv adds this frame's
++// motion vector plus the difference between the previous and current jitter
++// offsets to the current jittered UV; historyStorageUv then removes the
++// previous frame's jitter to convert that raster-space UV into the unjittered
++// display-grid coordinate the ping-pong history buffer actually stores.
++// Object 2 is the only moving surface in this scene, so static geometry keeps
++// a zero motion vector and samples its own previous pixel.
+ #include "../Common/TemporalAaShared.hlsli"
+-
++
+ HistoryPixel GatherHistory(float2 uv, out bool footprintValid)
+@@ -57,13 +57,23 @@ HistoryPixel GatherHistory(float2 uv, out bool footprintValid)
+     float2 priorJitterPixels =
+         (Flags & 4u) != 0u ? CentroidCorrectedHalton(PreviousAnimationFrame, JitterPhasePeriod) : 0.0f;
+     float2 displayUv = (float2(pixel) + 0.5f) / float2(Width, Height);
+-    SceneValue scene = EvaluateScene(displayUv + jitterPixels / float2(RenderWidth, RenderHeight), AnimationFrame);
++    float2 currentJitterUv = jitterPixels / float2(RenderWidth, RenderHeight);
++    float2 previousJitterUv = priorJitterPixels / float2(RenderWidth, RenderHeight);
++    float2 currentJitteredUv = displayUv + currentJitterUv;
++    SceneValue scene = EvaluateScene(currentJitteredUv, AnimationFrame);
+     float3 spatial = SpatialBilinear(pixel, AnimationFrame, jitterPixels) * CurrentPreExposure;
+     float3 nativeSpatial =
+         SpatialBilinearAtExtent(pixel, AnimationFrame, jitterPixels, uint2(Width, Height)) * CurrentPreExposure;
+-
++
++    float2 motion = 0.0f;
++    if (scene.objectId == 2u)
++    {
++        motion = MovingCenter(PreviousAnimationFrame) - MovingCenter(AnimationFrame);
++    }
++    float2 previousUv = currentJitteredUv + motion + previousJitterUv - currentJitterUv;
++    float2 historyStorageUv = previousUv - previousJitterUv;
++
+     float2 minimumHistoryUv = 0.5f / float2(Width, Height);
+-    float2 historyStorageUv = displayUv;
+     bool footprintValid =
+         all(historyStorageUv >= minimumHistoryUv) && all(historyStorageUv <= 1.0f - minimumHistoryUv);
+     HistoryPixel history = (HistoryPixel)0;
+@@ -109,10 +119,16 @@ HistoryPixel GatherHistory(float2 uv, out bool footprintValid)
+     output.spatialG = spatial.g;
+     output.spatialB = spatial.b;
+     output.currentDepth = scene.depth;
++    output.motionX = motion.x;
++    output.motionY = motion.y;
+     output.currentJitterX = jitterPixels.x;
+     output.currentJitterY = jitterPixels.y;
+     output.previousJitterX = priorJitterPixels.x;
+     output.previousJitterY = priorJitterPixels.y;
++    output.previousHistoryX = previousUv.x;
++    output.previousHistoryY = previousUv.y;
++    output.historyStorageX = historyStorageUv.x;
++    output.historyStorageY = historyStorageUv.y;
+     output.historyR = history.colorR;
+     output.historyG = history.colorG;
+     output.historyB = history.colorB;
+@@ -121,7 +137,7 @@ HistoryPixel GatherHistory(float2 uv, out bool footprintValid)
+     output.previousSampleCount = history.sampleCount;
+     output.nextSampleCount = nextCount;
+     output.currentObjectId = scene.objectId;
+-    output.status = 259u;
++    output.status = 263u;
+     output.renderWidth = RenderWidth;
+     output.renderHeight = RenderHeight;
+     Statistics[index] = output;

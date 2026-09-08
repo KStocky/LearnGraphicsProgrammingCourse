@@ -1,0 +1,93 @@
+diff --git a/chapters/temporal-aa-and-upscaling/Starter/TemporalAaLab.hlsl b/chapters/temporal-aa-and-upscaling/Starter/TemporalAaLab.hlsl
+--- a/chapters/temporal-aa-and-upscaling/Starter/TemporalAaLab.hlsl
++++ b/chapters/temporal-aa-and-upscaling/Starter/TemporalAaLab.hlsl
+@@ -1,13 +1,13 @@
+-// Chapter 28 checkpoint 3: typed history validation and pre-exposure handling.
++// Chapter 28 checkpoint 4: YCoCg neighborhood clipping and temporal resolve.
+ //
+-// The single RejectNoHistory/RejectReset/RejectFootprint lifecycle check now
+-// grows into the complete typed rejection contract: depth and normal agree
+-// with the same surface, the object identifier matches, and the sampled
+-// surface was neither reactive nor freshly disoccluded. Pre-exposure changes
+-// between frames are handled explicitly: historyColor and historyLuminance
+-// are rescaled by the current-over-previous exposure ratio before any
+-// comparison, and an exposure swing beyond 4x or a luminance swing beyond 8x
+-// both reject the sample outright.
++// The accepted history color is variance-clipped in scene-linear YCoCg
++// against a 3x3 neighborhood built from the same spatial reconstruction the
++// current pixel used, then clamped to the neighborhood's RGB min/max. The
++// blend weight toward that constrained history is the product of a validity
++// gate, a sample-count confidence ramp from 0.05 up to 0.95, a motion-length
++// falloff, and reactive/disocclusion attenuation. History now stores the
++// resolved result instead of the raw spatial sample, closing the feedback
++// loop that lets accepted samples accumulate confidence across frames.
+ #include "../Common/TemporalAaShared.hlsli"
+-
++
+ HistoryPixel GatherHistory(float2 uv, out bool footprintValid)
+@@ -109,14 +109,32 @@ HistoryPixel GatherHistory(float2 uv, out bool footprintValid)
+         (max(Luminance(spatial), historyLuminance) + 1.0e-4f) /
+         (min(Luminance(spatial), historyLuminance) + 1.0e-4f);
+     if (luminanceRatio > 8.0f) reasons |= RejectLuminance;
++
++    float3 minimumColor, maximumColor, mean, variance, neighborAverage;
++    Neighborhood(pixel, AnimationFrame, jitterPixels, minimumColor, maximumColor, mean, variance, neighborAverage);
+     float3 historyColor = float3(history.colorR, history.colorG, history.colorB) * exposureScale;
++    float clipScale = 1.0f;
++    float3 constrained = spatial;
++    if (reasons == 0u)
++    {
++        constrained = ConstrainHistoryColor(historyColor, minimumColor, maximumColor, mean, variance, clipScale);
++    }
+-
++
++    float validityFactor = reasons == 0u ? 1.0f : 0.0f;
++    float sampleCountFactor = min(1.0f, float(history.sampleCount) / 16.0f);
++    float motionFactor = max(0.0f, 1.0f - length(motion) / 0.1f);
++    float reactiveFactor = 1.0f - scene.reactive;
++    float disocclusionFactor = 1.0f - scene.disocclusion;
++    float unconstrainedFeedback = lerp(0.05f, 0.95f, sampleCountFactor);
++    float feedback = validityFactor * unconstrainedFeedback * motionFactor * reactiveFactor * disocclusionFactor;
++    float3 resolved = reasons == 0u ? lerp(spatial, constrained, feedback) : spatial;
+     uint nextCount = reasons == 0u ? min(history.sampleCount + 1u, 64u) : 1u;
++
+     HistoryPixel next;
+-    next.colorR = spatial.r;
+-    next.colorG = spatial.g;
+-    next.colorB = spatial.b;
+-    next.luminance = Luminance(spatial);
++    next.colorR = resolved.r;
++    next.colorG = resolved.g;
++    next.colorB = resolved.b;
++    next.luminance = Luminance(resolved);
+     next.depth = scene.depth;
+     next.normalX = scene.normal.x;
+     next.normalY = scene.normal.y;
+@@ -148,12 +166,26 @@ HistoryPixel GatherHistory(float2 uv, out bool footprintValid)
+     output.historyG = historyColor.g;
+     output.historyB = historyColor.b;
+     output.historyLuminance = historyLuminance;
++    output.constrainedR = constrained.r;
++    output.constrainedG = constrained.g;
++    output.constrainedB = constrained.b;
++    output.varianceClipScale = clipScale;
++    output.validityFactor = validityFactor;
++    output.sampleCountFactor = sampleCountFactor;
++    output.lockStatus = validityFactor * sampleCountFactor * reactiveFactor * disocclusionFactor;
++    output.motionFactor = motionFactor;
++    output.reactiveFactor = reactiveFactor;
++    output.disocclusionFactor = disocclusionFactor;
++    output.historyFeedback = feedback;
++    output.resolvedR = resolved.r;
++    output.resolvedG = resolved.g;
++    output.resolvedB = resolved.b;
+     output.rejectionReasons = reasons;
+     output.previousSampleCount = history.sampleCount;
+     output.nextSampleCount = nextCount;
+     output.currentObjectId = scene.objectId;
+     output.sampledObjectId = history.objectId;
+-    output.status = 271u;
++    output.status = 383u;
+     output.renderWidth = RenderWidth;
+     output.renderHeight = RenderHeight;
+     Statistics[index] = output;
