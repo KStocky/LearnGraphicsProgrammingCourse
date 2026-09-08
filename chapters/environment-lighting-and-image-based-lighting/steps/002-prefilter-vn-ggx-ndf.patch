@@ -1,0 +1,85 @@
+diff --git a/chapters/environment-lighting-and-image-based-lighting/Starter/EnvironmentLightingLab.hlsl b/chapters/environment-lighting-and-image-based-lighting/Starter/EnvironmentLightingLab.hlsl
+index dc92389..35939c3 100644
+--- a/chapters/environment-lighting-and-image-based-lighting/Starter/EnvironmentLightingLab.hlsl
++++ b/chapters/environment-lighting-and-image-based-lighting/Starter/EnvironmentLightingLab.hlsl
+@@ -1,9 +1,10 @@
+-// Chapter 27 checkpoint 1: diffuse environment irradiance.
++// Chapter 27 checkpoint 2: V=N isotropic-GGX environment prefiltering.
+ //
+-// The deterministic lat-long environment is integrated over every texel with
+-// that row's exact solid angle and the clamped cosine N.wi. The result stores
+-// irradiance E; the Lambertian albedo/pi factor remains a separate shading
+-// operation. Specular lighting still uses the Starter's sharp lookup.
++// Diffuse stores irradiance E and applies albedo/pi only in shading. The new
++// specular prefilter uses the shared true base-2 Hammersley sequence and
++// isotropic GGX NDF sampling (not VNDF) with the distant-environment V=N
++// approximation. This checkpoint samples mip zero so proposal behavior is
++// isolated before PDF-driven footprint selection is introduced.
+ #include "../Common/EnvironmentLightingShared.hlsli"
+ 
+ float3 IntegrateIrradiance(float3 normal)
+@@ -23,6 +24,26 @@ float3 IntegrateIrradiance(float3 normal)
+     return irradiance;
+ }
+ 
++void IntegratePrefilter(float3 normal, out float3 baseResult, out uint accepted)
++{
++    float3 accumulation = 0.0f;
++    float weight = 0.0f;
++    accepted = 0u;
++    for (uint sampleIndex = 0u; sampleIndex < PrefilterSampleCount; ++sampleIndex)
++    {
++        GgxSample sample =
++            SampleGgxReflection(normal, normal, Roughness, Hammersley(sampleIndex, PrefilterSampleCount));
++        if (sample.nDotL <= 0.0f || sample.lightPdf <= 0.0f)
++        {
++            continue;
++        }
++        accumulation += SampleEnvironment(sample.lightDirection, 0.0f) * sample.nDotL;
++        weight += sample.nDotL;
++        ++accepted;
++    }
++    baseResult = accumulation / weight;
++}
++
+ [numthreads(8, 8, 1)] void SampleCS(uint3 dispatchThreadId : SV_DispatchThreadID)
+ {
+     if (dispatchThreadId.x >= Width || dispatchThreadId.y >= Height)
+@@ -38,13 +59,16 @@ float3 IntegrateIrradiance(float3 normal)
+     float3 baselineSpecular = source * F0;
+     float3 irradiance = IntegrateIrradiance(normal);
+     float3 shadedDiffuse = irradiance * Albedo / Pi;
++    float3 prefilterBase;
++    uint accepted;
++    IntegratePrefilter(normal, prefilterBase, accepted);
+ 
+     float2 probeUnit = Hammersley(5u, 16u);
+     GgxSample probe =
+         SampleGgxReflection(float3(0.0f, 1.0f, 0.0f), normalize(float3(0.6f, 0.8f, 0.0f)), Roughness, probeUnit);
+-    bool valid = Finite3(source) && Finite3(baselineDiffuse) && Finite3(baselineSpecular) &&
+-                 Finite3(irradiance) && Finite3(shadedDiffuse) && Finite3(probe.halfVector) &&
+-                 Finite3(probe.lightDirection) && isfinite(probe.lightPdf);
++    bool valid = accepted > 0u && Finite3(source) && Finite3(baselineDiffuse) && Finite3(baselineSpecular) &&
++                 Finite3(irradiance) && Finite3(shadedDiffuse) && Finite3(prefilterBase) &&
++                 Finite3(probe.halfVector) && Finite3(probe.lightDirection) && isfinite(probe.lightPdf);
+ 
+     PixelStatistics output = (PixelStatistics)0;
+     output.sourceR = source.r;
+@@ -62,6 +86,9 @@ float3 IntegrateIrradiance(float3 normal)
+     output.shadedDiffuseR = shadedDiffuse.r;
+     output.shadedDiffuseG = shadedDiffuse.g;
+     output.shadedDiffuseB = shadedDiffuse.b;
++    output.prefilterBaseR = prefilterBase.r;
++    output.prefilterBaseG = prefilterBase.g;
++    output.prefilterBaseB = prefilterBase.b;
+     output.probeRadicalInverse = probeUnit.y;
+     output.probeHalfX = probe.halfVector.x;
+     output.probeHalfY = probe.halfVector.y;
+@@ -75,6 +102,7 @@ float3 IntegrateIrradiance(float3 normal)
+     output.probeNdf = probe.ndf;
+     output.probeHalfPdf = probe.halfPdf;
+     output.probeLightPdf = probe.lightPdf;
++    output.acceptedPrefilterSamples = accepted;
+     output.status = valid ? (1u | 2u | 64u) : 0u;
+     Statistics[index] = output;
+ }

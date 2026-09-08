@@ -1,0 +1,108 @@
+diff --git a/chapters/environment-lighting-and-image-based-lighting/Starter/EnvironmentLightingLab.hlsl b/chapters/environment-lighting-and-image-based-lighting/Starter/EnvironmentLightingLab.hlsl
+index aae1724..d15fbd6 100644
+--- a/chapters/environment-lighting-and-image-based-lighting/Starter/EnvironmentLightingLab.hlsl
++++ b/chapters/environment-lighting-and-image-based-lighting/Starter/EnvironmentLightingLab.hlsl
+@@ -1,10 +1,11 @@
+-// Chapter 27 checkpoint 3: exact-Smith split-sum integration.
++// Chapter 27 checkpoint 4: row-local lat-long mip selection.
+ //
+-// Diffuse irradiance and the V=N isotropic-GGX base-level prefilter are now
+-// accompanied by split-sum A/B data for F0*A+B. The integral uses exact
+-// uncorrelated Smith G1(V)G1(L) and Schlick Fresnel for a single-scatter GGX
+-// BRDF under a white environment; it deliberately does not compensate the
+-// energy lost to multiple scattering at high roughness.
++// Diffuse irradiance, V=N isotropic-GGX prefiltering, and exact-Smith split-sum
++// data are complete. The prefilter now converts each light-direction PDF and
++// sample count into a solid-angle footprint, compares it with the exact texel
++// solid angle of that sampled lat-long row, and records mean/maximum mip plus
++// equator-versus-pole evidence. The pole diagnostic intentionally exposes the
++// projection's anisotropic footprint distortion.
+ #include "../Common/EnvironmentLightingShared.hlsli"
+ 
+ float3 IntegrateIrradiance(float3 normal)
+@@ -24,10 +25,14 @@ float3 IntegrateIrradiance(float3 normal)
+     return irradiance;
+ }
+ 
+-void IntegratePrefilter(float3 normal, out float3 baseResult, out uint accepted)
++void IntegratePrefilter(float3 normal, out float3 baseResult, out float3 mipResult, out float meanMip,
++                        out float maximumMip, out uint accepted)
+ {
+-    float3 accumulation = 0.0f;
++    float3 baseAccumulation = 0.0f;
++    float3 mipAccumulation = 0.0f;
+     float weight = 0.0f;
++    float mipSum = 0.0f;
++    maximumMip = 0.0f;
+     accepted = 0u;
+     for (uint sampleIndex = 0u; sampleIndex < PrefilterSampleCount; ++sampleIndex)
+     {
+@@ -37,11 +42,17 @@ void IntegratePrefilter(float3 normal, out float3 baseResult, out uint accepted)
+         {
+             continue;
+         }
+-        accumulation += SampleEnvironment(sample.lightDirection, 0.0f) * sample.nDotL;
++        float mip = SelectEnvironmentMip(sample.lightDirection, sample.lightPdf, PrefilterSampleCount, Roughness);
++        baseAccumulation += SampleEnvironment(sample.lightDirection, 0.0f) * sample.nDotL;
++        mipAccumulation += SampleEnvironment(sample.lightDirection, mip) * sample.nDotL;
+         weight += sample.nDotL;
++        mipSum += mip;
++        maximumMip = max(maximumMip, mip);
+         ++accepted;
+     }
+-    baseResult = accumulation / weight;
++    baseResult = baseAccumulation / weight;
++    mipResult = mipAccumulation / weight;
++    meanMip = mipSum / (float)accepted;
+ }
+ 
+ float2 IntegrateSplitSum(float nDotView, float roughness)
+@@ -82,8 +93,11 @@ float2 IntegrateSplitSum(float nDotView, float roughness)
+     float3 irradiance = IntegrateIrradiance(normal);
+     float3 shadedDiffuse = irradiance * Albedo / Pi;
+     float3 prefilterBase;
++    float3 prefilterMip;
++    float meanMip;
++    float maximumMip;
+     uint accepted;
+-    IntegratePrefilter(normal, prefilterBase, accepted);
++    IntegratePrefilter(normal, prefilterBase, prefilterMip, meanMip, maximumMip, accepted);
+     float2 split = IntegrateSplitSum(NDotView, Roughness);
+     float lutNDotView = ((float)dispatchThreadId.x + 0.5f) / (float)Width;
+     float lutRoughness = ((float)dispatchThreadId.y + 0.5f) / (float)Height;
+@@ -92,10 +106,13 @@ float2 IntegrateSplitSum(float nDotView, float roughness)
+     float2 probeUnit = Hammersley(5u, 16u);
+     GgxSample probe =
+         SampleGgxReflection(float3(0.0f, 1.0f, 0.0f), normalize(float3(0.6f, 0.8f, 0.0f)), Roughness, probeUnit);
++    float equatorMip = SelectEnvironmentMip(float3(1.0f, 0.0f, 0.0f), 0.01f, PrefilterSampleCount, Roughness);
++    float poleMip = SelectEnvironmentMip(float3(0.0f, 1.0f, 0.0f), 0.01f, PrefilterSampleCount, Roughness);
+     bool valid = accepted > 0u && Finite3(source) && Finite3(baselineDiffuse) && Finite3(baselineSpecular) &&
+                  Finite3(irradiance) && Finite3(shadedDiffuse) && Finite3(prefilterBase) &&
+-                 all(isfinite(split)) && all(isfinite(lut)) && Finite3(probe.halfVector) &&
+-                 Finite3(probe.lightDirection) && isfinite(probe.lightPdf);
++                 Finite3(prefilterMip) && all(isfinite(split)) && all(isfinite(lut)) && isfinite(meanMip) &&
++                 isfinite(maximumMip) && Finite3(probe.halfVector) && Finite3(probe.lightDirection) &&
++                 isfinite(probe.lightPdf) && poleMip >= equatorMip;
+ 
+     PixelStatistics output = (PixelStatistics)0;
+     output.sourceR = source.r;
+@@ -116,12 +133,19 @@ float2 IntegrateSplitSum(float nDotView, float roughness)
+     output.prefilterBaseR = prefilterBase.r;
+     output.prefilterBaseG = prefilterBase.g;
+     output.prefilterBaseB = prefilterBase.b;
++    output.prefilterMipR = prefilterMip.r;
++    output.prefilterMipG = prefilterMip.g;
++    output.prefilterMipB = prefilterMip.b;
+     output.splitA = split.x;
+     output.splitB = split.y;
+     output.lutA = lut.x;
+     output.lutB = lut.y;
+     output.lutRoughness = lutRoughness;
+     output.lutNDotView = lutNDotView;
++    output.meanSelectedMip = meanMip;
++    output.maximumSelectedMip = maximumMip;
++    output.equatorMip = equatorMip;
++    output.poleMip = poleMip;
+     output.probeRadicalInverse = probeUnit.y;
+     output.probeHalfX = probe.halfVector.x;
+     output.probeHalfY = probe.halfVector.y;

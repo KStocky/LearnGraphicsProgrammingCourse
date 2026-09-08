@@ -1,0 +1,138 @@
+diff --git a/chapters/environment-lighting-and-image-based-lighting/Starter/EnvironmentLightingLab.hlsl b/chapters/environment-lighting-and-image-based-lighting/Starter/EnvironmentLightingLab.hlsl
+index d15fbd6..1f29ca3 100644
+--- a/chapters/environment-lighting-and-image-based-lighting/Starter/EnvironmentLightingLab.hlsl
++++ b/chapters/environment-lighting-and-image-based-lighting/Starter/EnvironmentLightingLab.hlsl
+@@ -1,11 +1,15 @@
+-// Chapter 27 checkpoint 4: row-local lat-long mip selection.
++// Chapter 27 Solution: isotropic GGX environment lighting.
+ //
+-// Diffuse irradiance, V=N isotropic-GGX prefiltering, and exact-Smith split-sum
+-// data are complete. The prefilter now converts each light-direction PDF and
+-// sample count into a solid-angle footprint, compares it with the exact texel
+-// solid angle of that sampled lat-long row, and records mean/maximum mip plus
+-// equator-versus-pole evidence. The pole diagnostic intentionally exposes the
+-// projection's anisotropic footprint distortion.
++// Diffuse stores irradiance E = integral L(wi) max(N.wi,0) dwi and applies
++// albedo/pi only in shading. Specular prefiltering uses isotropic GGX NDF
++// sampling (not VNDF) and the distant-environment V=N approximation. Its N.L
++// weighted estimator builds a roughness-dependent environment value; it is not
++// described as the full microfacet BRDF integral. The split-sum term separately
++// uses exact uncorrelated Smith G1(V)G1(L), Schlick Fresnel, and returns A/B for
++// F0*A+B. View 8 evaluates the complete (N.V, roughness) 2D LUT into the
++// structured output surface. Mip selection uses the exact solid angle of the
++// sampled lat-long row; the pole view intentionally exposes that this footprint
++// remains distorted.
+ #include "../Common/EnvironmentLightingShared.hlsli"
+ 
+ float3 IntegrateIrradiance(float3 normal)
+@@ -92,6 +96,7 @@ float2 IntegrateSplitSum(float nDotView, float roughness)
+     float3 baselineSpecular = source * F0;
+     float3 irradiance = IntegrateIrradiance(normal);
+     float3 shadedDiffuse = irradiance * Albedo / Pi;
++
+     float3 prefilterBase;
+     float3 prefilterMip;
+     float meanMip;
+@@ -102,17 +107,18 @@ float2 IntegrateSplitSum(float nDotView, float roughness)
+     float lutNDotView = ((float)dispatchThreadId.x + 0.5f) / (float)Width;
+     float lutRoughness = ((float)dispatchThreadId.y + 0.5f) / (float)Height;
+     float2 lut = IntegrateSplitSum(lutNDotView, lutRoughness);
++    float3 shadedSpecular = prefilterMip * (F0 * split.x + split.y);
+ 
+     float2 probeUnit = Hammersley(5u, 16u);
+     GgxSample probe =
+         SampleGgxReflection(float3(0.0f, 1.0f, 0.0f), normalize(float3(0.6f, 0.8f, 0.0f)), Roughness, probeUnit);
+     float equatorMip = SelectEnvironmentMip(float3(1.0f, 0.0f, 0.0f), 0.01f, PrefilterSampleCount, Roughness);
+     float poleMip = SelectEnvironmentMip(float3(0.0f, 1.0f, 0.0f), 0.01f, PrefilterSampleCount, Roughness);
+-    bool valid = accepted > 0u && Finite3(source) && Finite3(baselineDiffuse) && Finite3(baselineSpecular) &&
+-                 Finite3(irradiance) && Finite3(shadedDiffuse) && Finite3(prefilterBase) &&
+-                 Finite3(prefilterMip) && all(isfinite(split)) && all(isfinite(lut)) && isfinite(meanMip) &&
+-                 isfinite(maximumMip) && Finite3(probe.halfVector) && Finite3(probe.lightDirection) &&
+-                 isfinite(probe.lightPdf) && poleMip >= equatorMip;
++
++    bool valid = accepted > 0u && Finite3(source) && Finite3(irradiance) && Finite3(shadedDiffuse) &&
++                 Finite3(prefilterBase) && Finite3(prefilterMip) && all(isfinite(split)) && all(isfinite(lut)) &&
++                 Finite3(shadedSpecular) && isfinite(meanMip) && isfinite(maximumMip) && Finite3(probe.halfVector) &&
++                 Finite3(probe.lightDirection) && isfinite(probe.lightPdf) && poleMip >= equatorMip;
+ 
+     PixelStatistics output = (PixelStatistics)0;
+     output.sourceR = source.r;
+@@ -142,6 +148,9 @@ float2 IntegrateSplitSum(float nDotView, float roughness)
+     output.lutB = lut.y;
+     output.lutRoughness = lutRoughness;
+     output.lutNDotView = lutNDotView;
++    output.shadedSpecularR = shadedSpecular.r;
++    output.shadedSpecularG = shadedSpecular.g;
++    output.shadedSpecularB = shadedSpecular.b;
+     output.meanSelectedMip = meanMip;
+     output.maximumSelectedMip = maximumMip;
+     output.equatorMip = equatorMip;
+@@ -160,6 +169,6 @@ float2 IntegrateSplitSum(float nDotView, float roughness)
+     output.probeHalfPdf = probe.halfPdf;
+     output.probeLightPdf = probe.lightPdf;
+     output.acceptedPrefilterSamples = accepted;
+-    output.status = valid ? (1u | 2u | 64u) : 0u;
++    output.status = valid ? (1u | 2u | 4u | 8u | 16u | 32u | 64u) : 0u;
+     Statistics[index] = output;
+ }
+diff --git a/chapters/environment-lighting-and-image-based-lighting/Starter/Main.cpp b/chapters/environment-lighting-and-image-based-lighting/Starter/Main.cpp
+index 837c3b7..7bf3dfe 100644
+--- a/chapters/environment-lighting-and-image-based-lighting/Starter/Main.cpp
++++ b/chapters/environment-lighting-and-image-based-lighting/Starter/Main.cpp
+@@ -4,12 +4,13 @@
+ 
+ int wmain(int argc, wchar_t **argv)
+ {
++    std::puts("Ch27 Solution: irradiance E, V=N GGX NDF prefilter, exact-Smith split sum, and row-local lat-long mip "
++              "diagnostics.");
+     std::puts(
+-        "Ch27 Starter: analytic lat-long lookup; diffuse and sharp-specular baselines are intentionally incomplete.");
+-    std::puts("Defaults: roughness=0.55 N.V=0.65; views 1-3, Q/E roughness, A/D N.V.");
+-    ch27::environment_lighting::starter::Renderer renderer{};
++        "Defaults: roughness=0.55 N.V=0.65; views 1-9 (8=BRDF LUT, 9=paired comparison), Q/E roughness, A/D N.V.");
++    ch27::environment_lighting::solution::Renderer renderer{};
+     lgp::framework::ApplicationConfiguration configuration{};
+-    configuration.title = L"Ch27 Environment Lighting Starter (bounded direct-lookup baseline)";
++    configuration.title = L"Ch27 Environment Lighting Solution (diffuse + split-sum IBL)";
+     configuration.width = 320U;
+     configuration.height = 180U;
+     configuration.enableDebugLayer = false;
+diff --git a/chapters/environment-lighting-and-image-based-lighting/Starter/Renderer.cpp b/chapters/environment-lighting-and-image-based-lighting/Starter/Renderer.cpp
+index e582b86..797de7e 100644
+--- a/chapters/environment-lighting-and-image-based-lighting/Starter/Renderer.cpp
++++ b/chapters/environment-lighting-and-image-based-lighting/Starter/Renderer.cpp
+@@ -1,12 +1,12 @@
+ #include "Renderer.hpp"
+ 
+-namespace ch27::environment_lighting::starter
++namespace ch27::environment_lighting::solution
+ {
+ 
+ Renderer::Renderer()
+     : RendererCore(std::filesystem::path{__FILE__}.parent_path() / "EnvironmentLightingLab.hlsl",
+-                   gpu::LabVariant::Starter)
++                   gpu::LabVariant::Solution)
+ {
+ }
+ 
+-} // namespace ch27::environment_lighting::starter
++} // namespace ch27::environment_lighting::solution
+diff --git a/chapters/environment-lighting-and-image-based-lighting/Starter/Renderer.hpp b/chapters/environment-lighting-and-image-based-lighting/Starter/Renderer.hpp
+index 6866004..d00de32 100644
+--- a/chapters/environment-lighting-and-image-based-lighting/Starter/Renderer.hpp
++++ b/chapters/environment-lighting-and-image-based-lighting/Starter/Renderer.hpp
+@@ -2,7 +2,7 @@
+ 
+ #include "../Common/GpuLabSupport.hpp"
+ 
+-namespace ch27::environment_lighting::starter
++namespace ch27::environment_lighting::solution
+ {
+ 
+ using HeadlessTestConfiguration = gpu::LabConfiguration;
+@@ -13,4 +13,4 @@ class Renderer final : public gpu::RendererCore
+     Renderer();
+ };
+ 
+-} // namespace ch27::environment_lighting::starter
++} // namespace ch27::environment_lighting::solution

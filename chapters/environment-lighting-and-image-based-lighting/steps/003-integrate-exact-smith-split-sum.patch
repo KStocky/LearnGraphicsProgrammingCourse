@@ -1,0 +1,83 @@
+diff --git a/chapters/environment-lighting-and-image-based-lighting/Starter/EnvironmentLightingLab.hlsl b/chapters/environment-lighting-and-image-based-lighting/Starter/EnvironmentLightingLab.hlsl
+index 35939c3..aae1724 100644
+--- a/chapters/environment-lighting-and-image-based-lighting/Starter/EnvironmentLightingLab.hlsl
++++ b/chapters/environment-lighting-and-image-based-lighting/Starter/EnvironmentLightingLab.hlsl
+@@ -1,10 +1,10 @@
+-// Chapter 27 checkpoint 2: V=N isotropic-GGX environment prefiltering.
++// Chapter 27 checkpoint 3: exact-Smith split-sum integration.
+ //
+-// Diffuse stores irradiance E and applies albedo/pi only in shading. The new
+-// specular prefilter uses the shared true base-2 Hammersley sequence and
+-// isotropic GGX NDF sampling (not VNDF) with the distant-environment V=N
+-// approximation. This checkpoint samples mip zero so proposal behavior is
+-// isolated before PDF-driven footprint selection is introduced.
++// Diffuse irradiance and the V=N isotropic-GGX base-level prefilter are now
++// accompanied by split-sum A/B data for F0*A+B. The integral uses exact
++// uncorrelated Smith G1(V)G1(L) and Schlick Fresnel for a single-scatter GGX
++// BRDF under a white environment; it deliberately does not compensate the
++// energy lost to multiple scattering at high roughness.
+ #include "../Common/EnvironmentLightingShared.hlsli"
+ 
+ float3 IntegrateIrradiance(float3 normal)
+@@ -44,6 +44,28 @@ void IntegratePrefilter(float3 normal, out float3 baseResult, out uint accepted)
+     baseResult = accumulation / weight;
+ }
+ 
++float2 IntegrateSplitSum(float nDotView, float roughness)
++{
++    float3 normal = float3(0.0f, 1.0f, 0.0f);
++    float3 viewDirection = float3(sqrt(max(0.0f, 1.0f - nDotView * nDotView)), nDotView, 0.0f);
++    float gView = SmithG1(nDotView, roughness);
++    float2 result = 0.0f;
++    for (uint sampleIndex = 0u; sampleIndex < SplitSumSampleCount; ++sampleIndex)
++    {
++        GgxSample sample =
++            SampleGgxReflection(normal, viewDirection, roughness, Hammersley(sampleIndex, SplitSumSampleCount));
++        if (sample.nDotL <= 0.0f || sample.nDotH <= 0.0f || sample.vDotH <= 0.0f)
++        {
++            continue;
++        }
++        float visibility = (gView * SmithG1(sample.nDotL, roughness) * sample.vDotH) / (sample.nDotH * nDotView);
++        float fresnelComplement = pow(1.0f - sample.vDotH, 5.0f);
++        result.x += (1.0f - fresnelComplement) * visibility;
++        result.y += fresnelComplement * visibility;
++    }
++    return result / (float)SplitSumSampleCount;
++}
++
+ [numthreads(8, 8, 1)] void SampleCS(uint3 dispatchThreadId : SV_DispatchThreadID)
+ {
+     if (dispatchThreadId.x >= Width || dispatchThreadId.y >= Height)
+@@ -62,13 +84,18 @@ void IntegratePrefilter(float3 normal, out float3 baseResult, out uint accepted)
+     float3 prefilterBase;
+     uint accepted;
+     IntegratePrefilter(normal, prefilterBase, accepted);
++    float2 split = IntegrateSplitSum(NDotView, Roughness);
++    float lutNDotView = ((float)dispatchThreadId.x + 0.5f) / (float)Width;
++    float lutRoughness = ((float)dispatchThreadId.y + 0.5f) / (float)Height;
++    float2 lut = IntegrateSplitSum(lutNDotView, lutRoughness);
+ 
+     float2 probeUnit = Hammersley(5u, 16u);
+     GgxSample probe =
+         SampleGgxReflection(float3(0.0f, 1.0f, 0.0f), normalize(float3(0.6f, 0.8f, 0.0f)), Roughness, probeUnit);
+     bool valid = accepted > 0u && Finite3(source) && Finite3(baselineDiffuse) && Finite3(baselineSpecular) &&
+                  Finite3(irradiance) && Finite3(shadedDiffuse) && Finite3(prefilterBase) &&
+-                 Finite3(probe.halfVector) && Finite3(probe.lightDirection) && isfinite(probe.lightPdf);
++                 all(isfinite(split)) && all(isfinite(lut)) && Finite3(probe.halfVector) &&
++                 Finite3(probe.lightDirection) && isfinite(probe.lightPdf);
+ 
+     PixelStatistics output = (PixelStatistics)0;
+     output.sourceR = source.r;
+@@ -89,6 +116,12 @@ void IntegratePrefilter(float3 normal, out float3 baseResult, out uint accepted)
+     output.prefilterBaseR = prefilterBase.r;
+     output.prefilterBaseG = prefilterBase.g;
+     output.prefilterBaseB = prefilterBase.b;
++    output.splitA = split.x;
++    output.splitB = split.y;
++    output.lutA = lut.x;
++    output.lutB = lut.y;
++    output.lutRoughness = lutRoughness;
++    output.lutNDotView = lutNDotView;
+     output.probeRadicalInverse = probeUnit.y;
+     output.probeHalfX = probe.halfVector.x;
+     output.probeHalfY = probe.halfVector.y;
