@@ -1,0 +1,156 @@
+diff --git a/chapters/screen-space-reflections-and-indirect-lighting/Starter/ScreenSpaceReflectionLab.hlsl b/chapters/screen-space-reflections-and-indirect-lighting/Starter/ScreenSpaceReflectionLab.hlsl
+--- a/chapters/screen-space-reflections-and-indirect-lighting/Starter/ScreenSpaceReflectionLab.hlsl
++++ b/chapters/screen-space-reflections-and-indirect-lighting/Starter/ScreenSpaceReflectionLab.hlsl
+@@ -1,15 +1,12 @@
+-// Chapter 29 checkpoint 3: march the segment, refine the crossing, bound the thickness, and finish the miss taxonomy.
++// Chapter 29 checkpoint 4: decomposed confidence and one application of the split-sum weight.
+ //
+-// The traversal introduced in the previous checkpoint now walks the segment it measured. The step schedule is
+-// uniform in screen space, every sample interpolates UV and 1/viewDepth in the same parameter, and the first step
+-// that passes behind the sampled surface is refined by bisection. A depth buffer stores one surface and not a solid,
+-// so a crossing only counts as contact when the ray is behind that surface by no more than a finite thickness
+-// interval; everything deeper is information the screen does not have. The outcomes that only marching can decide -
+-// thickness exceeded, no crossing, the exhausted step budget, and the exhausted ray length - complete the typed miss
+-// taxonomy, and the step, refinement, geometry-sample, and thickness-rejection counts are published so the cost of
+-// the search is visible. The shaded colour is still the environment-only baseline: this checkpoint decides what the
+-// screen contains without spending it. A hierarchical depth pyramid would let the same ray skip empty screen
+-// regions; that acceleration is a separate contract and is deliberately not running here.
++// A screen-space hit is evidence, not certainty. The classified trace becomes six independently bounded confidence
++// factors - validity, screen-edge proximity, distance travelled, thickness agreement, roughness, and how far the ray
++// points back toward the camera - and they stay decomposed so a learner can see which assumption failed. Their
++// product is a fade weight, not a probability. Screen radiance and environment radiance are then combined with the
++// weights confidence and 1 - confidence, which sum to exactly one, so the incoming radiance is a partition of a
++// single quantity instead of a sum of two guesses. The split-sum weight F0 * A + B is applied once, after that
++// combination, so a partial screen answer can never be shaded twice.
+ #include "../Common/ScreenSpaceReflectionShared.hlsli"
+
+ struct ReflectionRay
+@@ -378,6 +375,46 @@ TraceResult TraceScreenSpaceRay(ReflectionRay ray, uint maximumStepCount)
+     return result;
+ }
+
++struct ConfidenceFactors
++{
++    float validity;
++    float screenEdge;
++    float rayDistance;
++    float thickness;
++    float roughness;
++    float towardCamera;
++    float combined;
++};
++
++// Confidence stays decomposed so a learner can see which assumption failed. Each factor is independently bounded to
++// [0, 1] and the combined value is their product: it is a fade weight, not a probability.
++ConfidenceFactors EvaluateConfidence(TraceResult trace, float roughness, float towardCameraCosine)
++{
++    ConfidenceFactors factors;
++    // Roughness and view-facing depend only on the shaded surface and the ray, so they are reported for a miss too.
++    factors.roughness = FadeOut(roughness, RoughnessFadeStart, RoughnessFadeEnd);
++    factors.towardCamera = FadeOut(towardCameraCosine, TowardCameraFadeStart, TowardCameraFadeEnd);
++    factors.validity = 0.0f;
++    factors.screenEdge = 0.0f;
++    factors.rayDistance = 0.0f;
++    factors.thickness = 0.0f;
++    factors.combined = 0.0f;
++    if (!trace.hit)
++    {
++        return factors;
++    }
++    float borderDistance =
++        min(min(trace.hitUv.x, 1.0f - trace.hitUv.x), min(trace.hitUv.y, 1.0f - trace.hitUv.y));
++    float travelledFraction = saturate(trace.hitRayDistance / MaximumRayDistance);
++    factors.validity = 1.0f;
++    factors.screenEdge = saturate(borderDistance / ScreenEdgeFadeUv);
++    factors.rayDistance = FadeOut(travelledFraction, DistanceFadeStartFraction, 1.0f);
++    factors.thickness = FadeOut(trace.hitDepthDelta, 0.0f, trace.hitThicknessInterval * ThicknessFadeFraction);
++    factors.combined = factors.validity * factors.screenEdge * factors.rayDistance * factors.thickness *
++                       factors.roughness * factors.towardCamera;
++    return factors;
++}
++
+ [numthreads(8, 8, 1)] void ScreenSpaceCS(uint3 dispatchThreadId : SV_DispatchThreadID)
+ {
+     if (dispatchThreadId.x >= Width || dispatchThreadId.y >= Height)
+@@ -480,36 +517,73 @@ TraceResult TraceScreenSpaceRay(ReflectionRay ray, uint maximumStepCount)
+     record.flags |= trace.segment.valid ? RecordSegmentValid : 0u;
+     record.status |= StatusTraversal;
+
++    ConfidenceFactors confidence = EvaluateConfidence(trace, surface.roughness, ray.towardCameraCosine);
++    record.confidenceValidity = confidence.validity;
++    record.confidenceScreenEdge = confidence.screenEdge;
++    record.confidenceRayDistance = confidence.rayDistance;
++    record.confidenceThickness = confidence.thickness;
++    record.confidenceRoughness = confidence.roughness;
++    record.confidenceTowardCamera = confidence.towardCamera;
++    record.confidenceCombined = confidence.combined;
++    record.status |= StatusConfidence;
++
++    // The screen answers with the radiance that already left the surface it found; the environment answers for
++    // everything the screen could not see. The weights are confidence and 1 - confidence, so they sum to exactly
++    // one and the incoming radiance is a partition of a single quantity.
++    float3 screenRadiance = trace.hit ? SurfaceRadiance(LoadSurface(TexelFromUv(trace.hitUv)))
++                                      : float3(0.0f, 0.0f, 0.0f);
+     float3 environmentRadiance = EvaluateEnvironment(ray.direction);
++    float screenWeight = confidence.combined;
++    float environmentWeight = 1.0f - confidence.combined;
++    float3 incomingRadiance = screenRadiance * screenWeight + environmentRadiance * environmentWeight;
++
++    // The split-sum weight F0 * A + B is applied once, after the two sources have already been combined, so a
++    // partial screen answer can never be shaded twice.
+     float2 splitSum = IntegrateSplitSum(nDotV, surface.roughness, SplitSumSampleCount);
+     float3 normalIncidenceReflectance = float3(0.04f, 0.04f, 0.04f);
+     float3 specularWeight = normalIncidenceReflectance * splitSum.x + splitSum.y;
++    float3 reflection = incomingRadiance * specularWeight;
+     float3 baselineReflection = environmentRadiance * specularWeight;
+     float3 baseline = direct + baselineReflection;
+
++    record.screenWeight = screenWeight;
++    record.environmentWeight = environmentWeight;
++    record.screenRadianceR = screenRadiance.r;
++    record.screenRadianceG = screenRadiance.g;
++    record.screenRadianceB = screenRadiance.b;
+     record.environmentRadianceR = environmentRadiance.r;
+     record.environmentRadianceG = environmentRadiance.g;
+     record.environmentRadianceB = environmentRadiance.b;
++    record.incomingRadianceR = incomingRadiance.r;
++    record.incomingRadianceG = incomingRadiance.g;
++    record.incomingRadianceB = incomingRadiance.b;
+     record.splitSumA = splitSum.x;
+     record.splitSumB = splitSum.y;
+     record.specularWeightR = specularWeight.r;
+     record.specularWeightG = specularWeight.g;
+     record.specularWeightB = specularWeight.b;
++    record.reflectionR = reflection.r;
++    record.reflectionG = reflection.g;
++    record.reflectionB = reflection.b;
+     record.baselineReflectionR = baselineReflection.r;
+     record.baselineReflectionG = baselineReflection.g;
+     record.baselineReflectionB = baselineReflection.b;
+     record.baselineR = baseline.r;
+     record.baselineG = baseline.g;
+     record.baselineB = baseline.b;
+-    record.finalR = baseline.r;
+-    record.finalG = baseline.g;
+-    record.finalB = baseline.b;
+-    record.temporalR = baseline.r;
+-    record.temporalG = baseline.g;
+-    record.temporalB = baseline.b;
+-    if (Finite3(baseline) && Finite3(viewPosition))
++    if (Finite3(baseline) && Finite3(reflection) && Finite3(incomingRadiance))
+     {
+-        record.status |= StatusBaseline;
++        record.status |= StatusComposition | StatusBaseline;
+     }
++
++    // No accumulation exists yet, so the temporal record reports this frame's composition unchanged.
++    float3 screenSpaceContribution = reflection;
++    float3 finalRadiance = direct + screenSpaceContribution;
++    record.finalR = finalRadiance.r;
++    record.finalG = finalRadiance.g;
++    record.finalB = finalRadiance.b;
++    record.temporalR = finalRadiance.r;
++    record.temporalG = finalRadiance.g;
++    record.temporalB = finalRadiance.b;
+     Diagnostics[index] = record;
+ }

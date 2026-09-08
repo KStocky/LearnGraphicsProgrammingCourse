@@ -1,0 +1,85 @@
+diff --git a/chapters/screen-space-reflections-and-indirect-lighting/Starter/ScreenSpaceReflectionLab.hlsl b/chapters/screen-space-reflections-and-indirect-lighting/Starter/ScreenSpaceReflectionLab.hlsl
+--- a/chapters/screen-space-reflections-and-indirect-lighting/Starter/ScreenSpaceReflectionLab.hlsl
++++ b/chapters/screen-space-reflections-and-indirect-lighting/Starter/ScreenSpaceReflectionLab.hlsl
+@@ -1,18 +1,42 @@
+-// Chapter 29 Starter: the honest deferred baseline.
++// Chapter 29 checkpoint 1: the reconstruction-capable skeleton and the reflection ray inputs.
+ //
+-// The G-buffer pass has already published depth, normals, roughness, albedo, material identity, and the
+-// scene-linear outgoing radiance of every visible surface. This pass shades exactly what a deferred renderer with a
+-// distant environment can say on its own:
+-//
+-//     outgoing = directRadiance + environmentRadiance(mirrorDirection) * (F0 * A + B)
+-//
+-// It never asks the depth buffer what is actually in the mirror direction, so a bright object standing on the floor
+-// leaves no reflection at all. Every screen-space field in the diagnostic record stays zero and the miss reason
+-// stays InvalidInput, because no ray was traced. There is no hidden Solution logic here to switch on later: the
+-// screen-space traversal, confidence, composition, indirect estimate, and temporal reuse are the work the chapter
+-// asks the learner to add.
++// The shaded result is still the honest deferred baseline: direct outgoing radiance plus a mirror-direction
++// environment term with the split-sum weight applied exactly once. What changes is that the mirror direction is no
++// longer a bare vector. It is carried by an explicit ReflectionRay that also owns the quantities screen-space
++// traversal will need: an origin displaced off the surface along the normal, the view-facing cosine that decides
++// whether the surface can reflect anything toward the eye at all, and the maximum distance the ray may travel.
++// Nothing is traced yet, so no screen evidence exists and the record's miss reason stays InvalidInput.
+ #include "../Common/ScreenSpaceReflectionShared.hlsli"
+
++struct ReflectionRay
++{
++    float3 origin;
++    float3 direction;
++    float3 viewDirection;
++    float nDotV;
++    float appliedNormalBias;
++    float maximumDistance;
++    float towardCameraCosine;
++    bool facingValid;
++};
++
++// R = 2 * dot(N, V) * N - V, renormalised, with the origin displaced along the normal by
++// constantNormalBias + depthProportionalNormalBias * viewDepth. The depth-proportional term keeps the displacement
++// roughly constant in screen space as the surface recedes.
++ReflectionRay BuildReflectionRay(float3 viewPosition, float3 normal, float3 direction, float maximumDistance)
++{
++    ReflectionRay ray;
++    ray.viewDirection = normalize(-viewPosition);
++    ray.nDotV = dot(normal, ray.viewDirection);
++    ray.facingValid = ray.nDotV > MinimumFacingCosine;
++    ray.appliedNormalBias = ConstantNormalBias + DepthProportionalNormalBias * viewPosition.z;
++    ray.origin = viewPosition + normal * ray.appliedNormalBias;
++    ray.direction = direction;
++    ray.maximumDistance = maximumDistance;
++    ray.towardCameraCosine = dot(ray.direction, ray.viewDirection);
++    return ray;
++}
++
+ [numthreads(8, 8, 1)] void ScreenSpaceCS(uint3 dispatchThreadId : SV_DispatchThreadID)
+ {
+     if (dispatchThreadId.x >= Width || dispatchThreadId.y >= Height)
+@@ -77,17 +101,21 @@
+     record.status |= StatusReconstruction;
+
+     float3 mirrorDirection = MirrorDirection(normal, viewDirection);
+-    float3 environmentRadiance = EvaluateEnvironment(mirrorDirection);
++    ReflectionRay ray = BuildReflectionRay(viewPosition, normal, mirrorDirection, MaximumRayDistance);
++    record.rayDirectionX = ray.direction.x;
++    record.rayDirectionY = ray.direction.y;
++    record.rayDirectionZ = ray.direction.z;
++    record.appliedNormalBias = ray.appliedNormalBias;
++    record.towardCameraCosine = ray.towardCameraCosine;
++    record.status |= StatusRay;
++
++    float3 environmentRadiance = EvaluateEnvironment(ray.direction);
+     float2 splitSum = IntegrateSplitSum(nDotV, surface.roughness, SplitSumSampleCount);
+     float3 normalIncidenceReflectance = float3(0.04f, 0.04f, 0.04f);
+     float3 specularWeight = normalIncidenceReflectance * splitSum.x + splitSum.y;
+     float3 baselineReflection = environmentRadiance * specularWeight;
+     float3 baseline = direct + baselineReflection;
+
+-    record.rayDirectionX = mirrorDirection.x;
+-    record.rayDirectionY = mirrorDirection.y;
+-    record.rayDirectionZ = mirrorDirection.z;
+-    record.towardCameraCosine = dot(mirrorDirection, viewDirection);
+     record.environmentRadianceR = environmentRadiance.r;
+     record.environmentRadianceG = environmentRadiance.g;
+     record.environmentRadianceB = environmentRadiance.b;

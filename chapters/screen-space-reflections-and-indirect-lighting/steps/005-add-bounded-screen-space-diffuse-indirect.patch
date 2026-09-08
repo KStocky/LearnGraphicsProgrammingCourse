@@ -1,0 +1,149 @@
+diff --git a/chapters/screen-space-reflections-and-indirect-lighting/Starter/ScreenSpaceReflectionLab.hlsl b/chapters/screen-space-reflections-and-indirect-lighting/Starter/ScreenSpaceReflectionLab.hlsl
+--- a/chapters/screen-space-reflections-and-indirect-lighting/Starter/ScreenSpaceReflectionLab.hlsl
++++ b/chapters/screen-space-reflections-and-indirect-lighting/Starter/ScreenSpaceReflectionLab.hlsl
+@@ -1,12 +1,12 @@
+-// Chapter 29 checkpoint 4: decomposed confidence and one application of the split-sum weight.
++// Chapter 29 checkpoint 5: bounded one-bounce screen-space diffuse indirect lighting.
+ //
+-// A screen-space hit is evidence, not certainty. The classified trace becomes six independently bounded confidence
+-// factors - validity, screen-edge proximity, distance travelled, thickness agreement, roughness, and how far the ray
+-// points back toward the camera - and they stay decomposed so a learner can see which assumption failed. Their
+-// product is a fade weight, not a probability. Screen radiance and environment radiance are then combined with the
+-// weights confidence and 1 - confidence, which sum to exactly one, so the incoming radiance is a partition of a
+-// single quantity instead of a sum of two guesses. The split-sum weight F0 * A + B is applied once, after that
+-// combination, so a partial screen answer can never be shaded twice.
++// The same screen evidence that answers a mirror ray can answer a diffuse one. This checkpoint traces a small
++// deterministic set of cosine-weighted hemisphere samples from the shaded point, reuses the radiance that already
++// left each hit surface this frame, and falls back to the environment for every sample the screen could not answer,
++// because a screen-space miss is unmeasured light rather than zero light. The estimator keeps its two factors of pi
++// separate: the cosine density makes cos / pdf exactly pi, while the albedo / pi belongs to the Lambertian surface,
++// so the two must never be cancelled by hand. Every sample is clamped to a maximum radiance and the hit, miss, and
++// clamp counts are published, so the bias that bound introduces stays visible instead of hidden.
+ #include "../Common/ScreenSpaceReflectionShared.hlsli"
+
+ struct ReflectionRay
+@@ -415,6 +415,85 @@ ConfidenceFactors EvaluateConfidence(TraceResult trace, float roughness, float t
+     return factors;
+ }
+
++struct IndirectEstimate
++{
++    float3 meanIncoming;
++    float3 irradiance;
++    float3 outgoing;
++    float averageCosineOverPdf;
++    uint hitCount;
++    uint missCount;
++    uint clampedCount;
++    uint sampleCount;
++};
++
++// One bounce only: a screen hit contributes the radiance that already left that surface this frame and nothing is
++// traced from it. irradiance = (1/N) * sum L * cos / pdf, and outgoing = (albedo / pi) * irradiance. With the
++// cosine density cos / pdf is exactly pi, so the pi in the Lambertian BRDF and the pi in the estimator are separate
++// quantities that must never be cancelled by hand.
++//
++// The sample set is the same deterministic Hammersley sequence for every pixel. That makes the estimate exactly
++// reproducible and easy to reason about, at the cost of correlating the error across the image: neighbouring pixels
++// make the same mistake, so the bias appears as structure rather than noise. Decorrelating it per pixel and then
++// filtering the result is Chapter 25 and Chapter 28 material, and is not attempted here.
++IndirectEstimate EstimateDiffuseIndirect(float3 viewPosition, float3 normal, float3 albedo)
++{
++    IndirectEstimate estimate;
++    estimate.meanIncoming = float3(0.0f, 0.0f, 0.0f);
++    estimate.irradiance = float3(0.0f, 0.0f, 0.0f);
++    estimate.outgoing = float3(0.0f, 0.0f, 0.0f);
++    estimate.averageCosineOverPdf = 0.0f;
++    estimate.hitCount = 0u;
++    estimate.missCount = 0u;
++    estimate.clampedCount = 0u;
++    estimate.sampleCount = IndirectSampleCount;
++
++    float3 tangent;
++    float3 bitangent;
++    BuildTangentFrame(normal, tangent, bitangent);
++    float3 accumulatedIncoming = float3(0.0f, 0.0f, 0.0f);
++    float3 accumulated = float3(0.0f, 0.0f, 0.0f);
++    float accumulatedWeight = 0.0f;
++    [loop] for (uint sampleIndex = 0u; sampleIndex < IndirectSampleCount; ++sampleIndex)
++    {
++        float cosine;
++        float3 local = MapCosineHemisphere(Hammersley(sampleIndex, IndirectSampleCount), cosine);
++        float3 direction = normalize(tangent * local.x + bitangent * local.y + normal * local.z);
++        ReflectionRay ray = BuildReflectionRay(viewPosition, normal, direction, IndirectMaximumRayDistance);
++        TraceResult trace = TraceScreenSpaceRay(ray, IndirectMaximumStepCount);
++
++        float3 incoming;
++        if (trace.hit)
++        {
++            incoming = SurfaceRadiance(LoadSurface(TexelFromUv(trace.hitUv)));
++            ++estimate.hitCount;
++        }
++        else
++        {
++            // Explicit fallback: a screen-space miss is not zero light, it is unmeasured light.
++            incoming = EvaluateEnvironment(direction);
++            ++estimate.missCount;
++        }
++        float3 clamped = min(incoming, IndirectMaximumRadiance);
++        if (any(clamped != incoming))
++        {
++            ++estimate.clampedCount;
++        }
++        float pdf = cosine / Pi;
++        float weight = cosine / pdf;
++        accumulatedIncoming += clamped;
++        accumulated += clamped * weight;
++        accumulatedWeight += weight;
++    }
++
++    float sampleCount = float(max(1u, IndirectSampleCount));
++    estimate.meanIncoming = accumulatedIncoming / sampleCount;
++    estimate.irradiance = accumulated / sampleCount;
++    estimate.averageCosineOverPdf = accumulatedWeight / sampleCount;
++    estimate.outgoing = (albedo / Pi) * estimate.irradiance;
++    return estimate;
++}
++
+ [numthreads(8, 8, 1)] void ScreenSpaceCS(uint3 dispatchThreadId : SV_DispatchThreadID)
+ {
+     if (dispatchThreadId.x >= Width || dispatchThreadId.y >= Height)
+@@ -432,6 +511,7 @@ ConfidenceFactors EvaluateConfidence(TraceResult trace, float roughness, float t
+     record.materialId = surface.materialId;
+     record.motionX = surface.motionX;
+     record.motionY = surface.motionY;
++    record.indirectSampleCount = IndirectSampleCount;
+     record.status = StatusGBuffer;
+
+     float3 direct = SurfaceRadiance(surface);
+@@ -576,8 +656,28 @@ ConfidenceFactors EvaluateConfidence(TraceResult trace, float roughness, float t
+         record.status |= StatusComposition | StatusBaseline;
+     }
+
+-    // No accumulation exists yet, so the temporal record reports this frame's composition unchanged.
+-    float3 screenSpaceContribution = reflection;
++    IndirectEstimate indirect = (IndirectEstimate)0;
++    if ((Flags & FlagIndirect) != 0u)
++    {
++        indirect = EstimateDiffuseIndirect(viewPosition, normal, float3(surface.albedoR, surface.albedoG,
++                                                                       surface.albedoB));
++    }
++    record.indirectMeanIncomingR = indirect.meanIncoming.r;
++    record.indirectMeanIncomingG = indirect.meanIncoming.g;
++    record.indirectMeanIncomingB = indirect.meanIncoming.b;
++    record.indirectIrradianceR = indirect.irradiance.r;
++    record.indirectIrradianceG = indirect.irradiance.g;
++    record.indirectIrradianceB = indirect.irradiance.b;
++    record.indirectOutgoingR = indirect.outgoing.r;
++    record.indirectOutgoingG = indirect.outgoing.g;
++    record.indirectOutgoingB = indirect.outgoing.b;
++    record.indirectAverageCosineOverPdf = indirect.averageCosineOverPdf;
++    record.indirectHitCount = indirect.hitCount;
++    record.indirectMissCount = indirect.missCount;
++    record.indirectClampedCount = indirect.clampedCount;
++    record.status |= StatusIndirect;
++
++    float3 screenSpaceContribution = reflection + indirect.outgoing;
+     float3 finalRadiance = direct + screenSpaceContribution;
+     record.finalR = finalRadiance.r;
+     record.finalG = finalRadiance.g;

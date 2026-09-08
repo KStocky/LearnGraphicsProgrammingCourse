@@ -1,0 +1,250 @@
+diff --git a/chapters/screen-space-reflections-and-indirect-lighting/Starter/ScreenSpaceReflectionLab.hlsl b/chapters/screen-space-reflections-and-indirect-lighting/Starter/ScreenSpaceReflectionLab.hlsl
+--- a/chapters/screen-space-reflections-and-indirect-lighting/Starter/ScreenSpaceReflectionLab.hlsl
++++ b/chapters/screen-space-reflections-and-indirect-lighting/Starter/ScreenSpaceReflectionLab.hlsl
+@@ -1,12 +1,16 @@
+-// Chapter 29 checkpoint 5: bounded one-bounce screen-space diffuse indirect lighting.
++// Chapter 29 Solution: screen-space reflections and one-bounce screen-space diffuse indirect lighting.
+ //
+-// The same screen evidence that answers a mirror ray can answer a diffuse one. This checkpoint traces a small
+-// deterministic set of cosine-weighted hemisphere samples from the shaded point, reuses the radiance that already
+-// left each hit surface this frame, and falls back to the environment for every sample the screen could not answer,
+-// because a screen-space miss is unmeasured light rather than zero light. The estimator keeps its two factors of pi
+-// separate: the cosine density makes cos / pdf exactly pi, while the albedo / pi belongs to the Lambertian surface,
+-// so the two must never be cancelled by hand. Every sample is clamped to a maximum radiance and the hit, miss, and
+-// clamp counts are published, so the bias that bound introduces stays visible instead of hidden.
++// Everything here reads the screen and nothing else. The analytic scene was consumed by the G-buffer pass; from
++// this point on the only evidence available is device depth, the surface record, and the previous frame's
++// accumulated contribution. That restriction is the whole point: the code below is written so that every place
++// where the screen cannot answer produces a typed miss and a decomposed confidence factor instead of a plausible
++// colour.
++//
++// Traversal is deterministic perspective-correct linear marching: UV and 1/viewDepth are both linear in the same
++// segment parameter, so interpolating them together is exact, not an approximation. The step schedule is uniform in
++// screen space and every step, refinement, geometry sample, and thickness rejection is published. A hierarchical
++// depth pyramid would let the same ray skip empty screen regions; that acceleration is a separate contract and is
++// deliberately not running here, so no diagnostic in this shader may be read as evidence of it.
+ #include "../Common/ScreenSpaceReflectionShared.hlsli"
+
+ struct ReflectionRay
+@@ -519,11 +523,12 @@ IndirectEstimate EstimateDiffuseIndirect(float3 viewPosition, float3 normal, flo
+     record.directG = direct.g;
+     record.directB = direct.b;
+
++    HistoryPixel emptyHistory = (HistoryPixel)0;
++    HistoryWrite[index] = emptyHistory;
++
+     bool background = surface.materialId == MaterialBackground || IsBackgroundDeviceDepth(deviceDepth);
+     if (background)
+     {
+-        // Background pixels carry the environment they already show. They have no surface, so there is nothing to
+-        // reconstruct and nothing to reflect.
+         record.flags |= RecordBackground;
+         record.baselineR = direct.r;
+         record.baselineG = direct.g;
+@@ -534,7 +539,14 @@ IndirectEstimate EstimateDiffuseIndirect(float3 viewPosition, float3 normal, flo
+         record.temporalR = direct.r;
+         record.temporalG = direct.g;
+         record.temporalB = direct.b;
+-        record.status |= StatusReconstruction | StatusBaseline;
++        record.currentWeight = 1.0f;
++        record.historyRejectionReasons = HistoryRejectNoHistory;
++        record.previousUvX = uv.x;
++        record.previousUvY = uv.y;
++        record.previousViewDepth = 0.0f;
++        // A background pixel has nothing to reconstruct, trace, or accumulate, so every stage is complete for it.
++        record.status = StatusGBuffer | StatusReconstruction | StatusBaseline | StatusRay | StatusTraversal |
++                        StatusConfidence | StatusComposition | StatusIndirect | StatusTemporal;
+         Diagnostics[index] = record;
+         return;
+     }
+@@ -682,8 +694,128 @@ IndirectEstimate EstimateDiffuseIndirect(float3 viewPosition, float3 normal, flo
+     record.finalR = finalRadiance.r;
+     record.finalG = finalRadiance.g;
+     record.finalB = finalRadiance.b;
+-    record.temporalR = finalRadiance.r;
+-    record.temporalG = finalRadiance.g;
+-    record.temporalB = finalRadiance.b;
++
++    // The accumulated signal is the sum of two screen-space estimates, so the confidence that drives accumulation
++    // has to describe that sum rather than either half of it. The specular half is trusted by the traced
++    // confidence; the diffuse half is trusted in proportion to how many of its rays the screen actually answered,
++    // because a missed indirect ray falls back to the environment and is a guess. Blending the two by the radiance
++    // each contributes keeps the result a convex combination: it always lies between the two confidences, and a
++    // term that adds no light cannot change how much the sum is trusted. When neither term carries any radiance the
++    // two halves share a zero sum equally.
++    bool indirectEnabled = (Flags & FlagIndirect) != 0u;
++    float indirectConfidence =
++        indirectEnabled ? float(indirect.hitCount) / float(max(1u, IndirectSampleCount)) : 0.0f;
++    float specularShare = Luminance(reflection);
++    float indirectShare = Luminance(indirect.outgoing);
++    if (specularShare + indirectShare <= 0.0f)
++    {
++        specularShare = 1.0f;
++        indirectShare = 1.0f;
++    }
++    float currentConfidence =
++        indirectEnabled
++            ? ((specularShare * confidence.combined) + (indirectShare * indirectConfidence)) /
++                  (specularShare + indirectShare)
++            : confidence.combined;
++    record.indirectConfidence = indirectConfidence;
++    record.currentConfidence = currentConfidence;
++
++    // Chapter 28 conventions, reused rather than re-derived: motion is previousUV - currentUV, history is
++    // scene-linear, and the two display-resolution history buffers are owned by the frame sequence. Only the
++    // screen-space contribution is accumulated, so the direct term can never be double counted.
++    //
++    // The motion vector describes the surface, not what that surface reflects. The floor is static and reports zero
++    // motion, so the moving emitter's reflection is reprojected as if it were painted on the floor and smears. That
++    // is a real limitation of surface motion vectors, not an accumulation bug; production renderers reproject
++    // reflections through the virtual mirrored hit position instead, which this lab does not attempt.
++    float2 previousUv = uv + float2(surface.motionX, surface.motionY);
++    bool inBounds = all(previousUv >= 0.0f) && all(previousUv <= 1.0f);
++    bool temporalEnabled = (Flags & FlagTemporal) != 0u;
++    bool historyResourceValid = (Flags & FlagHistoryValid) != 0u && (Flags & FlagReset) == 0u;
++    bool sampled = temporalEnabled && inBounds && historyResourceValid;
++    HistoryPixel history = (HistoryPixel)0;
++    if (sampled)
++    {
++        uint2 historyTexel = TexelFromUv(previousUv);
++        history = HistoryRead[historyTexel.y * Width + historyTexel.x];
++    }
++
++    // Two independent pieces of evidence decide whether the sampled texel is the same surface, and both are
++    // published. The depth comparison uses the depth this surface had in the previous frame, so a surface that
++    // moved along the view axis is still recognised as itself; it is made in linear view units, so the device-depth
++    // convention that stored it cannot change the answer.
++    float depthDifference = sampled ? abs(surface.previousViewDepth - history.viewDepth) : 0.0f;
++    float depthTolerance =
++        sampled ? AbsoluteDepthTolerance +
++                      RelativeDepthTolerance * max(surface.previousViewDepth, history.viewDepth)
++                : 0.0f;
++    uint historyRejection = 0u;
++    historyRejection |= temporalEnabled ? 0u : HistoryRejectDisabled;
++    historyRejection |= historyResourceValid ? 0u : HistoryRejectNoHistory;
++    historyRejection |= inBounds ? 0u : HistoryRejectOffScreen;
++    if (sampled)
++    {
++        historyRejection |= history.sampleCount > 0u ? 0u : HistoryRejectNoSamples;
++        historyRejection |= (MaterialIdentityRequired != 0u && history.materialId != surface.materialId)
++                                ? HistoryRejectMaterial
++                                : 0u;
++        historyRejection |= depthDifference > depthTolerance ? HistoryRejectDepth : 0u;
++    }
++    bool historyUsable = historyRejection == 0u;
++
++    uint boundedPreviousCount = min(history.sampleCount, MaximumTemporalSampleCount);
++    float historyScore = historyUsable ? history.confidence * float(boundedPreviousCount) : 0.0f;
++    float currentScore = currentConfidence;
++    float total = historyScore + currentScore;
++    // Confidence and age decide how the two samples share the result; the ceiling decides how much of the result a
++    // history sample is ever allowed to own. Without it a pixel whose current confidence is zero would take the
++    // history at weight one, and both the colour and the confidence would be fixed points: stale lighting could
++    // survive for as long as the surface stayed on screen. The current frame therefore always keeps at least
++    // 1 - MaximumHistoryWeight, so an unconfirmed history decays geometrically instead of freezing.
++    float historyWeight = min(total > 0.0f ? historyScore / total : 0.0f, MaximumHistoryWeight);
++    float currentWeight = 1.0f - historyWeight;
++    float3 historyColor = historyUsable ? float3(history.colorR, history.colorG, history.colorB) : 0.0f;
++    float historyConfidence = historyUsable ? history.confidence : 0.0f;
++    float3 temporalContribution = screenSpaceContribution * currentWeight + historyColor * historyWeight;
++    float outputConfidence = currentWeight * currentConfidence + historyWeight * historyConfidence;
++    uint nextSampleCount = historyUsable ? min(boundedPreviousCount + 1u, MaximumTemporalSampleCount) : 1u;
++
++    HistoryPixel next;
++    next.colorR = temporalContribution.r;
++    next.colorG = temporalContribution.g;
++    next.colorB = temporalContribution.b;
++    next.confidence = outputConfidence;
++    next.viewDepth = viewDepth;
++    next.materialId = surface.materialId;
++    next.sampleCount = nextSampleCount;
++    next.padding = 0u;
++    HistoryWrite[index] = next;
++
++    float3 temporalRadiance = direct + temporalContribution;
++    record.previousUvX = previousUv.x;
++    record.previousUvY = previousUv.y;
++    record.previousViewDepth = surface.previousViewDepth;
++    record.currentWeight = currentWeight;
++    record.historyWeight = historyWeight;
++    record.historyR = historyColor.r;
++    record.historyG = historyColor.g;
++    record.historyB = historyColor.b;
++    record.historyConfidence = historyConfidence;
++    record.historyViewDepth = history.viewDepth;
++    record.historyDepthDifference = depthDifference;
++    record.historyDepthTolerance = depthTolerance;
++    record.outputConfidence = outputConfidence;
++    record.temporalR = temporalRadiance.r;
++    record.temporalG = temporalRadiance.g;
++    record.temporalB = temporalRadiance.b;
++    record.previousSampleCount = history.sampleCount;
++    record.nextSampleCount = nextSampleCount;
++    record.historyMaterialId = history.materialId;
++    record.historyRejectionReasons = historyRejection;
++    record.flags |= historyUsable ? RecordHistoryUsable : 0u;
++    if (Finite3(finalRadiance) && Finite3(temporalRadiance) && Finite3(indirect.outgoing))
++    {
++        record.status |= StatusTemporal;
++    }
+     Diagnostics[index] = record;
+ }
+diff --git a/chapters/screen-space-reflections-and-indirect-lighting/Starter/Main.cpp b/chapters/screen-space-reflections-and-indirect-lighting/Starter/Main.cpp
+--- a/chapters/screen-space-reflections-and-indirect-lighting/Starter/Main.cpp
++++ b/chapters/screen-space-reflections-and-indirect-lighting/Starter/Main.cpp
+@@ -4,12 +4,15 @@
+
+ int wmain(int argc, wchar_t **argv)
+ {
+-    std::puts("Ch29 Starter: deferred baseline with a distant environment and no screen-space transport.");
+-    std::puts("Keys: 1 baseline, 2 linear depth, 3 normals and roughness, D depth convention, E environment mode.");
+-    std::puts("Solution-only keys are ignored here. Checkpoint: the emissive slab casts no reflection on the floor.");
+-    ch29::screen_space_reflections::starter::Renderer renderer{};
++    std::puts("Ch29 Solution: screen-space reflections, environment fallback, and one-bounce screen-space indirect.");
++    std::puts("Views: 1 baseline, 2 depth, 3 normals, 4 hit/miss, 5 confidence factors, 6 combined confidence,");
++    std::puts("       7 screen reflection, 8 environment fallback, 9 diffuse indirect, 0 final composition,");
++    std::puts("       H temporal history acceptance.");
++    std::puts("Keys: R reset history, D depth convention, E environment, S screen tracing, G indirect, T temporal,");
++    std::puts("      B step length, M step budget. Traversal is linear marching; no hierarchical depth is running.");
++    ch29::screen_space_reflections::solution::Renderer renderer{};
+     lgp::framework::ApplicationConfiguration configuration{};
+-    configuration.title = L"Ch29 Screen-Space Reflections Starter (environment-only baseline)";
++    configuration.title = L"Ch29 Screen-Space Reflections and Indirect Lighting Solution";
+     configuration.width = 321U;
+     configuration.height = 181U;
+     auto result = lgp::framework::RunApplication(configuration, argc, argv, renderer);
+diff --git a/chapters/screen-space-reflections-and-indirect-lighting/Starter/Renderer.cpp b/chapters/screen-space-reflections-and-indirect-lighting/Starter/Renderer.cpp
+--- a/chapters/screen-space-reflections-and-indirect-lighting/Starter/Renderer.cpp
++++ b/chapters/screen-space-reflections-and-indirect-lighting/Starter/Renderer.cpp
+@@ -1,10 +1,10 @@
+ #include "Renderer.hpp"
+
+-namespace ch29::screen_space_reflections::starter
++namespace ch29::screen_space_reflections::solution
+ {
+ Renderer::Renderer()
+     : RendererCore(std::filesystem::path{__FILE__}.parent_path() / "ScreenSpaceReflectionLab.hlsl",
+-                   gpu::LabVariant::Starter)
++                   gpu::LabVariant::Solution)
+ {
+ }
+-} // namespace ch29::screen_space_reflections::starter
++} // namespace ch29::screen_space_reflections::solution
+diff --git a/chapters/screen-space-reflections-and-indirect-lighting/Starter/Renderer.hpp b/chapters/screen-space-reflections-and-indirect-lighting/Starter/Renderer.hpp
+--- a/chapters/screen-space-reflections-and-indirect-lighting/Starter/Renderer.hpp
++++ b/chapters/screen-space-reflections-and-indirect-lighting/Starter/Renderer.hpp
+@@ -1,7 +1,7 @@
+ #pragma once
+ #include "../Common/GpuLabSupport.hpp"
+
+-namespace ch29::screen_space_reflections::starter
++namespace ch29::screen_space_reflections::solution
+ {
+ using HeadlessTestConfiguration = gpu::LabConfiguration;
+ class Renderer final : public gpu::RendererCore
+@@ -9,4 +9,4 @@ class Renderer final : public gpu::RendererCore
+   public:
+     Renderer();
+ };
+-} // namespace ch29::screen_space_reflections::starter
++} // namespace ch29::screen_space_reflections::solution

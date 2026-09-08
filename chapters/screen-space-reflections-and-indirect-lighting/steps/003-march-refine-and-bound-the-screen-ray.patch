@@ -1,0 +1,262 @@
+diff --git a/chapters/screen-space-reflections-and-indirect-lighting/Starter/ScreenSpaceReflectionLab.hlsl b/chapters/screen-space-reflections-and-indirect-lighting/Starter/ScreenSpaceReflectionLab.hlsl
+--- a/chapters/screen-space-reflections-and-indirect-lighting/Starter/ScreenSpaceReflectionLab.hlsl
++++ b/chapters/screen-space-reflections-and-indirect-lighting/Starter/ScreenSpaceReflectionLab.hlsl
+@@ -1,15 +1,15 @@
+-// Chapter 29 checkpoint 2: clip the reflection ray, project it into a screen segment, and type the misses that
+-// need no marching.
++// Chapter 29 checkpoint 3: march the segment, refine the crossing, bound the thickness, and finish the miss taxonomy.
+ //
+-// The ray built in the previous checkpoint is clipped against the six view-frustum half-spaces and then projected
+-// into the screen domain the depth buffer actually covers. Clipping first is what makes the projection safe: a
+-// segment that crosses the near plane has no screen image, and a segment that leaves the unit square has no depth
+-// to compare against. The projected segment stores both endpoints in UV and in reciprocal view depth, because
+-// 1/viewDepth is linear in the same parameter as UV, so interpolating the pair together is exact perspective-correct
+-// traversal rather than an approximation. Three outcomes are already decided without sampling any depth: a
+-// back-facing surface, a segment that survives no frustum plane, and a segment that cannot be projected at all.
+-// Nothing marches along the segment yet, so a ray that gets this far honestly reports that none of the steps it
+-// needs have been taken, and the shaded colour is unchanged.
++// The traversal introduced in the previous checkpoint now walks the segment it measured. The step schedule is
++// uniform in screen space, every sample interpolates UV and 1/viewDepth in the same parameter, and the first step
++// that passes behind the sampled surface is refined by bisection. A depth buffer stores one surface and not a solid,
++// so a crossing only counts as contact when the ray is behind that surface by no more than a finite thickness
++// interval; everything deeper is information the screen does not have. The outcomes that only marching can decide -
++// thickness exceeded, no crossing, the exhausted step budget, and the exhausted ray length - complete the typed miss
++// taxonomy, and the step, refinement, geometry-sample, and thickness-rejection counts are published so the cost of
++// the search is visible. The shaded colour is still the environment-only baseline: this checkpoint decides what the
++// screen contains without spending it. A hierarchical depth pyramid would let the same ray skip empty screen
++// regions; that acceleration is a separate contract and is deliberately not running here.
+ #include "../Common/ScreenSpaceReflectionShared.hlsli"
+
+ struct ReflectionRay
+@@ -171,12 +171,71 @@ struct TraceResult
+ {
+     bool hit;
+     uint missReason;
++    float2 hitUv;
++    float hitRayViewDepth;
++    float hitSceneViewDepth;
++    float hitDepthDelta;
++    float hitThicknessInterval;
++    float hitRayDistance;
++    float hitParameter;
++    uint stepCount;
++    uint refinementCount;
++    uint geometrySampleCount;
++    uint thicknessRejectionCount;
+     uint requiredStepCount;
+     bool stepBudgetExhausted;
+     ScreenSegment segment;
+     float segmentExitDistance;
+ };
+
++struct TraversalSample
++{
++    float2 uv;
++    float viewDepth;
++    float3 viewPosition;
++    float rayDistance;
++};
++
++TraversalSample SampleScreenRay(ScreenSegment segment, ReflectionRay ray, float parameter)
++{
++    TraversalSample result;
++    result.uv = lerp(segment.startUv, segment.endUv, parameter);
++    float reciprocal = lerp(segment.startReciprocalViewDepth, segment.endReciprocalViewDepth, parameter);
++    result.viewDepth = 1.0f / reciprocal;
++    result.viewPosition = ViewPositionFromUv(result.uv, result.viewDepth);
++    result.rayDistance = dot(result.viewPosition - ray.origin, ray.direction);
++    return result;
++}
++
++struct ScenePoint
++{
++    bool hasGeometry;
++    float sceneViewDepth;
++    float depthDelta;
++    float thicknessInterval;
++};
++
++// Depth buffers store one surface, not a solid. A crossing is only a contact when the ray passes behind the sampled
++// surface by no more than the thickness interval; everything deeper is information the screen does not have.
++ScenePoint EvaluateScenePoint(TraversalSample traversalSample)
++{
++    ScenePoint scenePoint;
++    scenePoint.hasGeometry = false;
++    scenePoint.sceneViewDepth = 0.0f;
++    scenePoint.depthDelta = 0.0f;
++    scenePoint.thicknessInterval = 0.0f;
++    float deviceDepth = SampleDeviceDepthNearest(traversalSample.uv);
++    if (IsBackgroundDeviceDepth(deviceDepth))
++    {
++        return scenePoint;
++    }
++    scenePoint.hasGeometry = true;
++    scenePoint.sceneViewDepth = ViewDepthFromDeviceDepth(deviceDepth);
++    scenePoint.depthDelta = traversalSample.viewDepth - scenePoint.sceneViewDepth;
++    scenePoint.thicknessInterval = ConstantThickness + DepthProportionalThickness * scenePoint.sceneViewDepth;
++    return scenePoint;
++}
++
+ TraceResult MakeTraceMiss(uint missReason)
+ {
+     TraceResult result = (TraceResult)0;
+@@ -185,8 +244,8 @@ TraceResult MakeTraceMiss(uint missReason)
+     return result;
+ }
+
+-// The order in which the mutually exclusive miss reasons are decided matches TraceScreenSpaceRay in the CPU
+-// contracts. The three decided here need no depth sample at all: they are properties of the ray and the frustum.
++// Mirrors TraceScreenSpaceRay in the CPU contracts, including the order in which the mutually exclusive miss
++// reasons are decided.
+ TraceResult TraceScreenSpaceRay(ReflectionRay ray, uint maximumStepCount)
+ {
+     if (!ray.facingValid)
+@@ -204,19 +263,118 @@ TraceResult TraceScreenSpaceRay(ReflectionRay ray, uint maximumStepCount)
+         return MakeTraceMiss(MissBehindCamera);
+     }
+
++    float parameterPerStep = segment.screenLengthTexels > 0.0f ? StepLengthTexels / segment.screenLengthTexels : 1.0f;
+     float required =
+         segment.screenLengthTexels > 0.0f ? ceil(segment.screenLengthTexels / StepLengthTexels) : 1.0f;
+     uint requiredStepCount = uint(clamp(required, 1.0f, 257.0f));
++    uint stepCount = min(requiredStepCount, maximumStepCount);
+
+     TraceResult result = (TraceResult)0;
++    result.missReason = MissNone;
+     result.requiredStepCount = requiredStepCount;
+     result.stepBudgetExhausted = requiredStepCount > maximumStepCount;
+     result.segment = segment;
+     result.segmentExitDistance = clipped.exitDistance;
+
+-    // Marching arrives in the next checkpoint. Until it does, none of the requiredStepCount steps this segment needs
+-    // has been taken, so the ray honestly reports the step budget as the reason it has no screen answer yet.
+-    result.missReason = MissMaximumSteps;
++    float lowParameter = 0.0f;
++    bool previousBehind = false;
++    bool reachedSegmentEnd = false;
++    [loop] for (uint stepIndex = 1u; stepIndex <= stepCount; ++stepIndex)
++    {
++        float parameter = min(1.0f, (float(stepIndex) + StartOffsetFraction) * parameterPerStep);
++        TraversalSample traversalSample = SampleScreenRay(segment, ray, parameter);
++        ScenePoint scenePoint = EvaluateScenePoint(traversalSample);
++        ++result.stepCount;
++
++        if (!scenePoint.hasGeometry)
++        {
++            lowParameter = parameter;
++            previousBehind = false;
++            if (parameter >= 1.0f)
++            {
++                reachedSegmentEnd = true;
++                break;
++            }
++            continue;
++        }
++        ++result.geometrySampleCount;
++
++        bool behind = scenePoint.depthDelta >= 0.0f;
++        if (behind && !previousBehind)
++        {
++            float refinedLow = lowParameter;
++            float refinedHigh = parameter;
++            [loop] for (uint refinement = 0u; refinement < RefinementStepCount; ++refinement)
++            {
++                float middle = 0.5f * (refinedLow + refinedHigh);
++                ScenePoint middlePoint = EvaluateScenePoint(SampleScreenRay(segment, ray, middle));
++                ++result.refinementCount;
++                if (middlePoint.hasGeometry && middlePoint.depthDelta >= 0.0f)
++                {
++                    refinedHigh = middle;
++                }
++                else
++                {
++                    refinedLow = middle;
++                }
++            }
++
++            TraversalSample hitSample = SampleScreenRay(segment, ray, refinedHigh);
++            ScenePoint hitPoint = EvaluateScenePoint(hitSample);
++            if (hitPoint.hasGeometry && hitPoint.depthDelta >= 0.0f &&
++                hitPoint.depthDelta <= hitPoint.thicknessInterval)
++            {
++                result.hit = true;
++                result.missReason = MissNone;
++                result.hitUv = hitSample.uv;
++                result.hitRayViewDepth = hitSample.viewDepth;
++                result.hitSceneViewDepth = hitPoint.sceneViewDepth;
++                result.hitDepthDelta = hitPoint.depthDelta;
++                result.hitThicknessInterval = hitPoint.thicknessInterval;
++                result.hitRayDistance = hitSample.rayDistance;
++                result.hitParameter = refinedHigh;
++                return result;
++            }
++            ++result.thicknessRejectionCount;
++        }
++
++        lowParameter = parameter;
++        previousBehind = behind;
++        if (parameter >= 1.0f)
++        {
++            reachedSegmentEnd = true;
++            break;
++        }
++    }
++
++    if (result.thicknessRejectionCount > 0u)
++    {
++        result.missReason = MissThicknessExceeded;
++        return result;
++    }
++    if (result.stepBudgetExhausted || !reachedSegmentEnd)
++    {
++        result.stepBudgetExhausted = true;
++        result.missReason = MissMaximumSteps;
++        return result;
++    }
++    if (result.geometrySampleCount == 0u)
++    {
++        result.missReason = MissNoCrossing;
++        return result;
++    }
++    if (clipped.exitLimit == ClipRayEnd)
++    {
++        result.missReason = MissMaximumDistance;
++    }
++    else if (clipped.exitLimit == ClipNearPlane)
++    {
++        result.missReason = MissBehindCamera;
++    }
++    else
++    {
++        result.missReason = MissOffScreen;
++    }
+     return result;
+ }
+
+@@ -298,6 +456,18 @@ TraceResult TraceScreenSpaceRay(ReflectionRay ray, uint maximumStepCount)
+         trace = TraceScreenSpaceRay(ray, MaximumStepCount);
+     }
+     record.missReason = trace.missReason;
++    record.hitUvX = trace.hitUv.x;
++    record.hitUvY = trace.hitUv.y;
++    record.hitRayViewDepth = trace.hitRayViewDepth;
++    record.hitSceneViewDepth = trace.hitSceneViewDepth;
++    record.hitDepthDelta = trace.hitDepthDelta;
++    record.hitThicknessInterval = trace.hitThicknessInterval;
++    record.hitRayDistance = trace.hitRayDistance;
++    record.hitParameter = trace.hitParameter;
++    record.stepCount = trace.stepCount;
++    record.refinementCount = trace.refinementCount;
++    record.geometrySampleCount = trace.geometrySampleCount;
++    record.thicknessRejectionCount = trace.thicknessRejectionCount;
+     record.requiredStepCount = trace.requiredStepCount;
+     record.segmentStartUvX = trace.segment.startUv.x;
+     record.segmentStartUvY = trace.segment.startUv.y;
+@@ -305,6 +475,7 @@ TraceResult TraceScreenSpaceRay(ReflectionRay ray, uint maximumStepCount)
+     record.segmentEndUvY = trace.segment.endUv.y;
+     record.segmentScreenLengthTexels = trace.segment.screenLengthTexels;
+     record.segmentExitDistance = trace.segmentExitDistance;
++    record.flags |= trace.hit ? RecordHit : 0u;
+     record.flags |= trace.stepBudgetExhausted ? RecordStepBudgetExhausted : 0u;
+     record.flags |= trace.segment.valid ? RecordSegmentValid : 0u;
+     record.status |= StatusTraversal;

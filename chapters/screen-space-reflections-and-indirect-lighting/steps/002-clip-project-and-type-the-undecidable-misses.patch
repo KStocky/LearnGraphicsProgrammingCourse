@@ -1,0 +1,236 @@
+diff --git a/chapters/screen-space-reflections-and-indirect-lighting/Starter/ScreenSpaceReflectionLab.hlsl b/chapters/screen-space-reflections-and-indirect-lighting/Starter/ScreenSpaceReflectionLab.hlsl
+--- a/chapters/screen-space-reflections-and-indirect-lighting/Starter/ScreenSpaceReflectionLab.hlsl
++++ b/chapters/screen-space-reflections-and-indirect-lighting/Starter/ScreenSpaceReflectionLab.hlsl
+@@ -1,11 +1,15 @@
+-// Chapter 29 checkpoint 1: the reconstruction-capable skeleton and the reflection ray inputs.
++// Chapter 29 checkpoint 2: clip the reflection ray, project it into a screen segment, and type the misses that
++// need no marching.
+ //
+-// The shaded result is still the honest deferred baseline: direct outgoing radiance plus a mirror-direction
+-// environment term with the split-sum weight applied exactly once. What changes is that the mirror direction is no
+-// longer a bare vector. It is carried by an explicit ReflectionRay that also owns the quantities screen-space
+-// traversal will need: an origin displaced off the surface along the normal, the view-facing cosine that decides
+-// whether the surface can reflect anything toward the eye at all, and the maximum distance the ray may travel.
+-// Nothing is traced yet, so no screen evidence exists and the record's miss reason stays InvalidInput.
++// The ray built in the previous checkpoint is clipped against the six view-frustum half-spaces and then projected
++// into the screen domain the depth buffer actually covers. Clipping first is what makes the projection safe: a
++// segment that crosses the near plane has no screen image, and a segment that leaves the unit square has no depth
++// to compare against. The projected segment stores both endpoints in UV and in reciprocal view depth, because
++// 1/viewDepth is linear in the same parameter as UV, so interpolating the pair together is exact perspective-correct
++// traversal rather than an approximation. Three outcomes are already decided without sampling any depth: a
++// back-facing surface, a segment that survives no frustum plane, and a segment that cannot be projected at all.
++// Nothing marches along the segment yet, so a ray that gets this far honestly reports that none of the steps it
++// needs have been taken, and the shaded colour is unchanged.
+ #include "../Common/ScreenSpaceReflectionShared.hlsli"
+
+ struct ReflectionRay
+@@ -37,6 +41,185 @@ ReflectionRay BuildReflectionRay(float3 viewPosition, float3 normal, float3 dire
+     return ray;
+ }
+
++struct ClippedSegment
++{
++    bool intersectsFrustum;
++    float enterDistance;
++    float exitDistance;
++    float3 enterPosition;
++    float3 exitPosition;
++    uint enterLimit;
++    uint exitLimit;
++    uint rejectionLimit;
++};
++
++struct FrustumPlane
++{
++    float3 normal;
++    float offset;
++    uint limit;
++};
++
++// Clips [0, maximumDistance] against the six view-frustum half-spaces in the fixed order near, far, left, right,
++// bottom, top. The screen domain and the frustum are the same region: a point inside the frustum has UV inside the
++// unit square and a representable device depth.
++ClippedSegment ClipRayToFrustum(ReflectionRay ray)
++{
++    FrustumPlane planes[6];
++    planes[0].normal = float3(0.0f, 0.0f, 1.0f);
++    planes[0].offset = -NearPlane;
++    planes[0].limit = ClipNearPlane;
++    planes[1].normal = float3(0.0f, 0.0f, -1.0f);
++    planes[1].offset = FarPlane;
++    planes[1].limit = ClipFarPlane;
++    planes[2].normal = float3(1.0f, 0.0f, TanHalfHorizontalFov);
++    planes[2].offset = 0.0f;
++    planes[2].limit = ClipLeftPlane;
++    planes[3].normal = float3(-1.0f, 0.0f, TanHalfHorizontalFov);
++    planes[3].offset = 0.0f;
++    planes[3].limit = ClipRightPlane;
++    planes[4].normal = float3(0.0f, 1.0f, TanHalfVerticalFov);
++    planes[4].offset = 0.0f;
++    planes[4].limit = ClipBottomPlane;
++    planes[5].normal = float3(0.0f, -1.0f, TanHalfVerticalFov);
++    planes[5].offset = 0.0f;
++    planes[5].limit = ClipTopPlane;
++
++    ClippedSegment segment;
++    segment.intersectsFrustum = true;
++    segment.enterDistance = 0.0f;
++    segment.exitDistance = ray.maximumDistance;
++    segment.enterLimit = ClipRayStart;
++    segment.exitLimit = ClipRayEnd;
++    segment.rejectionLimit = ClipRayStart;
++
++    [unroll] for (uint planeIndex = 0u; planeIndex < 6u; ++planeIndex)
++    {
++        if (!segment.intersectsFrustum)
++        {
++            continue;
++        }
++        float distanceAtOrigin = dot(planes[planeIndex].normal, ray.origin) + planes[planeIndex].offset;
++        float rate = dot(planes[planeIndex].normal, ray.direction);
++        if (rate == 0.0f)
++        {
++            if (distanceAtOrigin < 0.0f)
++            {
++                segment.intersectsFrustum = false;
++                segment.rejectionLimit = planes[planeIndex].limit;
++            }
++            continue;
++        }
++        float crossing = -distanceAtOrigin / rate;
++        if (rate > 0.0f)
++        {
++            if (crossing > segment.enterDistance)
++            {
++                segment.enterDistance = crossing;
++                segment.enterLimit = planes[planeIndex].limit;
++            }
++        }
++        else if (crossing < segment.exitDistance)
++        {
++            segment.exitDistance = crossing;
++            segment.exitLimit = planes[planeIndex].limit;
++        }
++        if (segment.enterDistance > segment.exitDistance)
++        {
++            segment.intersectsFrustum = false;
++            segment.rejectionLimit = planes[planeIndex].limit;
++        }
++    }
++
++    segment.enterPosition = ray.origin + ray.direction * segment.enterDistance;
++    segment.exitPosition = ray.origin + ray.direction * segment.exitDistance;
++    return segment;
++}
++
++struct ScreenSegment
++{
++    float2 startUv;
++    float2 endUv;
++    float startReciprocalViewDepth;
++    float endReciprocalViewDepth;
++    float screenLengthTexels;
++    bool valid;
++};
++
++// A straight view-space segment is not linear in screen space, but 1/viewDepth is. Storing both endpoints in UV and
++// in reciprocal view depth and interpolating both in the same parameter is exact perspective-correct traversal.
++ScreenSegment ProjectRaySegment(ClippedSegment clipped)
++{
++    ScreenSegment segment;
++    float2 startUv;
++    float2 endUv;
++    bool startValid = ProjectViewPosition(clipped.enterPosition, startUv);
++    bool endValid = ProjectViewPosition(clipped.exitPosition, endUv);
++    // Clipping guarantees both endpoints lie in the closed unit square, so saturating only removes the last
++    // rounding bit at the boundary.
++    segment.startUv = saturate(startUv);
++    segment.endUv = saturate(endUv);
++    segment.startReciprocalViewDepth = 1.0f / max(clipped.enterPosition.z, NearPlane);
++    segment.endReciprocalViewDepth = 1.0f / max(clipped.exitPosition.z, NearPlane);
++    float2 texels = (segment.endUv - segment.startUv) * float2(Width, Height);
++    segment.screenLengthTexels = length(texels);
++    segment.valid = startValid && endValid && clipped.intersectsFrustum;
++    return segment;
++}
++
++struct TraceResult
++{
++    bool hit;
++    uint missReason;
++    uint requiredStepCount;
++    bool stepBudgetExhausted;
++    ScreenSegment segment;
++    float segmentExitDistance;
++};
++
++TraceResult MakeTraceMiss(uint missReason)
++{
++    TraceResult result = (TraceResult)0;
++    result.hit = false;
++    result.missReason = missReason;
++    return result;
++}
++
++// The order in which the mutually exclusive miss reasons are decided matches TraceScreenSpaceRay in the CPU
++// contracts. The three decided here need no depth sample at all: they are properties of the ray and the frustum.
++TraceResult TraceScreenSpaceRay(ReflectionRay ray, uint maximumStepCount)
++{
++    if (!ray.facingValid)
++    {
++        return MakeTraceMiss(MissBackFacing);
++    }
++    ClippedSegment clipped = ClipRayToFrustum(ray);
++    if (!clipped.intersectsFrustum)
++    {
++        return MakeTraceMiss(clipped.rejectionLimit == ClipNearPlane ? MissBehindCamera : MissOffScreen);
++    }
++    ScreenSegment segment = ProjectRaySegment(clipped);
++    if (!segment.valid)
++    {
++        return MakeTraceMiss(MissBehindCamera);
++    }
++
++    float required =
++        segment.screenLengthTexels > 0.0f ? ceil(segment.screenLengthTexels / StepLengthTexels) : 1.0f;
++    uint requiredStepCount = uint(clamp(required, 1.0f, 257.0f));
++
++    TraceResult result = (TraceResult)0;
++    result.requiredStepCount = requiredStepCount;
++    result.stepBudgetExhausted = requiredStepCount > maximumStepCount;
++    result.segment = segment;
++    result.segmentExitDistance = clipped.exitDistance;
++
++    // Marching arrives in the next checkpoint. Until it does, none of the requiredStepCount steps this segment needs
++    // has been taken, so the ray honestly reports the step budget as the reason it has no screen answer yet.
++    result.missReason = MissMaximumSteps;
++    return result;
++}
++
+ [numthreads(8, 8, 1)] void ScreenSpaceCS(uint3 dispatchThreadId : SV_DispatchThreadID)
+ {
+     if (dispatchThreadId.x >= Width || dispatchThreadId.y >= Height)
+@@ -109,6 +292,23 @@ ReflectionRay BuildReflectionRay(float3 viewPosition, float3 normal, float3 dire
+     record.towardCameraCosine = ray.towardCameraCosine;
+     record.status |= StatusRay;
+
++    TraceResult trace = MakeTraceMiss(MissInvalidInput);
++    if ((Flags & FlagScreenTracing) != 0u)
++    {
++        trace = TraceScreenSpaceRay(ray, MaximumStepCount);
++    }
++    record.missReason = trace.missReason;
++    record.requiredStepCount = trace.requiredStepCount;
++    record.segmentStartUvX = trace.segment.startUv.x;
++    record.segmentStartUvY = trace.segment.startUv.y;
++    record.segmentEndUvX = trace.segment.endUv.x;
++    record.segmentEndUvY = trace.segment.endUv.y;
++    record.segmentScreenLengthTexels = trace.segment.screenLengthTexels;
++    record.segmentExitDistance = trace.segmentExitDistance;
++    record.flags |= trace.stepBudgetExhausted ? RecordStepBudgetExhausted : 0u;
++    record.flags |= trace.segment.valid ? RecordSegmentValid : 0u;
++    record.status |= StatusTraversal;
++
+     float3 environmentRadiance = EvaluateEnvironment(ray.direction);
+     float2 splitSum = IntegrateSplitSum(nDotV, surface.roughness, SplitSumSampleCount);
+     float3 normalIncidenceReflectance = float3(0.04f, 0.04f, 0.04f);
