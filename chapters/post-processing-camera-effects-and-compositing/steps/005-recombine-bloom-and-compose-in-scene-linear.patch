@@ -1,0 +1,73 @@
+diff --git a/chapters/post-processing-camera-effects-and-compositing/Starter/PostProcessingLab.hlsl b/chapters/post-processing-camera-effects-and-compositing/Starter/PostProcessingLab.hlsl
+--- a/chapters/post-processing-camera-effects-and-compositing/Starter/PostProcessingLab.hlsl
++++ b/chapters/post-processing-camera-effects-and-compositing/Starter/PostProcessingLab.hlsl
+@@ -1,10 +1,10 @@
+-// Chapter 30 checkpoint 4: bloom extraction and the odd-extent pyramid replace their pass-throughs.
++// Chapter 30 Solution: an explicit, bounded post chain over a scene-linear resolved baseline.
+ //
+-// Extraction now thresholds the pre-exposure-free luminance with a soft knee and writes the extracted excess -
+-// never the whole image - into level zero, and the reduction resamples each level over the exact integer area
+-// footprint of the next, so a ceiling-halved odd extent never drops a column and a constant field survives
+-// unchanged. The progressive combine is still a pass-through that zeroes the accumulator, so the extracted
+-// highlights are visible in the bloom evidence but contribute nothing to the displayed image yet.
++// The chain is a sequence of separate dispatches whose order the renderer submits from a validated pipeline plan:
++// the camera effects run in the declared order, bloom extracts from whichever image the declared policy names, the
++// pyramid is built and progressively recombined on exact area footprints, and the output path composes, exposes
++// once, tone maps, encodes, and composites the UI. Every stage reads the previous chain half and writes the other,
++// so no pass ever aliases its own input.
+ #include "../Common/PostProcessingShared.hlsli"
+
+ [numthreads(8, 8, 1)] void SceneCS(uint3 dispatchThreadId : SV_DispatchThreadID)
+@@ -368,8 +368,9 @@ void EvaluateMotionBlurPass(uint2 pixel)
+     Bloom[DestinationOffset + (pixel.y * DestinationWidth) + pixel.x] = float4(accumulated, 0.0f);
+ }
+
+-// A pass-through stand-in for the progressive combine. Every accumulator level the plan dispatches is zeroed,
+-// including level zero, which is the level the output pass reads once composition starts consuming it.
++// Progressive combine from the smallest level down to level zero. The accumulator holds the partial sum at the
++// level currently being processed, so nothing is resampled twice and the result carries the bloom contribution
++// only: the base image is never duplicated into it.
+ [numthreads(8, 8, 1)] void BloomUpsampleCS(uint3 dispatchThreadId : SV_DispatchThreadID)
+ {
+     if (dispatchThreadId.x >= DestinationWidth || dispatchThreadId.y >= DestinationHeight)
+@@ -377,7 +378,26 @@ void EvaluateMotionBlurPass(uint2 pixel)
+         return;
+     }
+     uint2 pixel = dispatchThreadId.xy;
+-    Bloom[DestinationOffset + (pixel.y * DestinationWidth) + pixel.x] = float4(0.0f, 0.0f, 0.0f, 0.0f);
++    uint destinationIndex = (pixel.y * DestinationWidth) + pixel.x;
++    float3 weighted = Bloom[BloomLevelOffset + destinationIndex].rgb * BloomLevelWeight;
++    if ((Flags & FlagBloomTopLevel) != 0u)
++    {
++        Bloom[DestinationOffset + destinationIndex] = float4(weighted, 0.0f);
++        return;
++    }
++
++    UpsampleFootprint1D horizontal = BloomUpsampleFootprint(pixel.x, SourceWidth, DestinationWidth);
++    UpsampleFootprint1D vertical = BloomUpsampleFootprint(pixel.y, SourceHeight, DestinationHeight);
++    float3 accumulated = float3(0.0f, 0.0f, 0.0f);
++    accumulated += Bloom[SourceOffset + (vertical.lowIndex * SourceWidth) + horizontal.lowIndex].rgb *
++                   (horizontal.lowWeight * vertical.lowWeight);
++    accumulated += Bloom[SourceOffset + (vertical.lowIndex * SourceWidth) + horizontal.highIndex].rgb *
++                   (horizontal.highWeight * vertical.lowWeight);
++    accumulated += Bloom[SourceOffset + (vertical.highIndex * SourceWidth) + horizontal.lowIndex].rgb *
++                   (horizontal.lowWeight * vertical.highWeight);
++    accumulated += Bloom[SourceOffset + (vertical.highIndex * SourceWidth) + horizontal.highIndex].rgb *
++                   (horizontal.highWeight * vertical.highWeight);
++    Bloom[DestinationOffset + destinationIndex] = float4(accumulated + weighted, 0.0f);
+ }
+
+ [numthreads(8, 8, 1)] void ComposeCS(uint3 dispatchThreadId : SV_DispatchThreadID)
+@@ -389,7 +409,9 @@ void EvaluateMotionBlurPass(uint2 pixel)
+     uint2 pixel = dispatchThreadId.xy;
+     uint index = TexelIndex(uint2(DisplayWidth, DisplayHeight), pixel);
+     float3 base = Chain[SourceOffset + index].rgb;
+-    // The accumulator carries no reconstruction yet, so this contributes no bloom radiance rather than one it
+-    // would have to invent.
+-    FinishFrame(pixel, base, float3(0.0f, 0.0f, 0.0f));
++    // The bloom accumulator holds the extracted excess only, so composing it adds the light the lens scattered out
++    // of the highlights without counting the scene's radiance a second time.
++    float3 bloom = (Flags & FlagBloomEnabled) != 0u ? Bloom[BloomLevelOffset + index].rgb * BloomGain
++                                                    : float3(0.0f, 0.0f, 0.0f);
++    FinishFrame(pixel, base, bloom);
+ }

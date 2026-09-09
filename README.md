@@ -1,10 +1,10 @@
 # Learn Graphics Programming
 
-Published learner version: `course-v2026.09.08.3`
+Published learner version: `course-v2026.09.09.1`
 
 This is a complete standalone learner repository. It contains the framework,
 Starter and Solution projects, assets, and cumulative teaching patches for every
-chapter available in `course-v2026.09.08.3`. It does not require a checkout of the private
+chapter available in `course-v2026.09.09.1`. It does not require a checkout of the private
 authoring repository.
 
 ## Requirements
@@ -58,7 +58,8 @@ not included in this learner distribution.
 - [Spherical Harmonics for Lighting](chapters/spherical-harmonics-for-lighting)
 - [Environment Lighting and Image-Based Lighting](chapters/environment-lighting-and-image-based-lighting)
 - [Temporal Anti-Aliasing and Upscaling](chapters/temporal-aa-and-upscaling)
+- [Post-Processing Camera Effects and Final Compositing](chapters/post-processing-camera-effects-and-compositing)
 - [Screen-Space Reflections and Indirect Lighting](chapters/screen-space-reflections-and-indirect-lighting)
 
-The matching course site and tagged source archive use the same `course-v2026.09.08.3`
+The matching course site and tagged source archive use the same `course-v2026.09.09.1`
 identifier. Report learner-facing problems in this repository's Issues page.

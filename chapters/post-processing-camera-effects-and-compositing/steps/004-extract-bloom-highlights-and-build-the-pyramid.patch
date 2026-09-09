@@ -1,0 +1,85 @@
+diff --git a/chapters/post-processing-camera-effects-and-compositing/Starter/PostProcessingLab.hlsl b/chapters/post-processing-camera-effects-and-compositing/Starter/PostProcessingLab.hlsl
+--- a/chapters/post-processing-camera-effects-and-compositing/Starter/PostProcessingLab.hlsl
++++ b/chapters/post-processing-camera-effects-and-compositing/Starter/PostProcessingLab.hlsl
+@@ -1,11 +1,10 @@
+-// Chapter 30 checkpoint 3: the centred shutter gather replaces its pass-through.
++// Chapter 30 checkpoint 4: bloom extraction and the odd-extent pyramid replace their pass-throughs.
+ //
+-// Motion blur now takes the scene pass's previousUV - currentUV motion through MotionToDisplayPixels exactly once,
+-// builds a centred shutter schedule whose mean parameter is zero, decides which taps its trajectory owns by depth,
+-// and renormalises the accepted weights so a partially rejected trajectory darkens nothing. Both camera effects
+-// are real from here, and CameraEffectCS keeps dispatching whichever one PassKind names, so the declared
+-// defocus-then-shutter or shutter-then-defocus order reaches the GPU without the shader choosing an order of its
+-// own. Bloom is still a zero pyramid and a zero accumulator, so the chain still contributes no bloom radiance.
++// Extraction now thresholds the pre-exposure-free luminance with a soft knee and writes the extracted excess -
++// never the whole image - into level zero, and the reduction resamples each level over the exact integer area
++// footprint of the next, so a ceiling-halved odd extent never drops a column and a constant field survives
++// unchanged. The progressive combine is still a pass-through that zeroes the accumulator, so the extracted
++// highlights are visible in the bloom evidence but contribute nothing to the displayed image yet.
+ #include "../Common/PostProcessingShared.hlsli"
+
+ [numthreads(8, 8, 1)] void SceneCS(uint3 dispatchThreadId : SV_DispatchThreadID)
+@@ -318,11 +317,6 @@ void EvaluateMotionBlurPass(uint2 pixel)
+     }
+ }
+
+-// A pass-through stand-in for highlight extraction. The reduction and the recombination are dispatched over level
+-// zero whether or not anything was extracted into it, so this writes an explicit zero over the level the renderer
+-// bound instead of leaving whatever the previous frame left there. Nothing is thresholded, so BloomEvaluated stays
+-// clear and the luminance, excess, threshold-weight, and extracted-colour fields keep their zeros; the level count
+-// is published because it is the pyramid plan's evidence rather than the extraction's.
+ [numthreads(8, 8, 1)] void BloomExtractCS(uint3 dispatchThreadId : SV_DispatchThreadID)
+ {
+     if (dispatchThreadId.x >= DisplayWidth || dispatchThreadId.y >= DisplayHeight)
+@@ -331,16 +325,27 @@ void EvaluateMotionBlurPass(uint2 pixel)
+     }
+     uint2 pixel = dispatchThreadId.xy;
+     uint index = TexelIndex(uint2(DisplayWidth, DisplayHeight), pixel);
+-    Bloom[DestinationOffset + index] = float4(0.0f, 0.0f, 0.0f, 0.0f);
++    float3 preExposed = Chain[SourceOffset + index].rgb;
++    BloomExtraction extraction =
++        ExtractBloomHighlights(preExposed, PreExposure, BloomThresholdLuminance, BloomSoftKneeLuminance);
++    Bloom[DestinationOffset + index] = float4(extraction.extractedPreExposed, 0.0f);
+
+     PixelRecord record = Records[index];
++    record.bloomPreExposedLuminance = extraction.preExposedLuminance;
++    record.bloomAbsoluteLuminance = extraction.absoluteLuminance;
++    record.bloomExcessLuminance = extraction.excessLuminance;
++    record.bloomThresholdWeight = extraction.thresholdWeight;
++    record.bloomExtractedR = extraction.extractedPreExposed.r;
++    record.bloomExtractedG = extraction.extractedPreExposed.g;
++    record.bloomExtractedB = extraction.extractedPreExposed.b;
++    record.bloomFlags = extraction.flags;
+     record.bloomLevelCount = BloomLevelCount;
+     record.status |= StatusBloom;
+     Records[index] = record;
+ }
+
+-// A pass-through stand-in for the area reduction. It writes zero over exactly the destination level extent the
+-// renderer bound, so every level the pyramid plan dispatches is written in bounds and stays finite.
++// Each axis halves with a ceiling, so a five-texel axis becomes three and then two and no column is ever dropped.
++// The area footprint keeps the weights summing to one, so a constant field survives the whole chain unchanged.
+ [numthreads(8, 8, 1)] void BloomDownsampleCS(uint3 dispatchThreadId : SV_DispatchThreadID)
+ {
+     if (dispatchThreadId.x >= DestinationWidth || dispatchThreadId.y >= DestinationHeight)
+@@ -348,7 +353,19 @@ void EvaluateMotionBlurPass(uint2 pixel)
+         return;
+     }
+     uint2 pixel = dispatchThreadId.xy;
+-    Bloom[DestinationOffset + (pixel.y * DestinationWidth) + pixel.x] = float4(0.0f, 0.0f, 0.0f, 0.0f);
++    DownsampleFootprint1D horizontal = BloomDownsampleFootprint(pixel.x, SourceWidth, DestinationWidth);
++    DownsampleFootprint1D vertical = BloomDownsampleFootprint(pixel.y, SourceHeight, DestinationHeight);
++
++    float3 accumulated = float3(0.0f, 0.0f, 0.0f);
++    for (uint row = 0u; row < vertical.tapCount; ++row)
++    {
++        for (uint column = 0u; column < horizontal.tapCount; ++column)
++        {
++            uint sourceIndex = (vertical.indices[row] * SourceWidth) + horizontal.indices[column];
++            accumulated += Bloom[SourceOffset + sourceIndex].rgb * (horizontal.weights[column] * vertical.weights[row]);
++        }
++    }
++    Bloom[DestinationOffset + (pixel.y * DestinationWidth) + pixel.x] = float4(accumulated, 0.0f);
+ }
+
+ // A pass-through stand-in for the progressive combine. Every accumulator level the plan dispatches is zeroed,

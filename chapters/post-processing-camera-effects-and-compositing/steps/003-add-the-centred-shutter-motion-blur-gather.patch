@@ -1,0 +1,160 @@
+diff --git a/chapters/post-processing-camera-effects-and-compositing/Starter/PostProcessingLab.hlsl b/chapters/post-processing-camera-effects-and-compositing/Starter/PostProcessingLab.hlsl
+--- a/chapters/post-processing-camera-effects-and-compositing/Starter/PostProcessingLab.hlsl
++++ b/chapters/post-processing-camera-effects-and-compositing/Starter/PostProcessingLab.hlsl
+@@ -1,11 +1,11 @@
+-// Chapter 30 checkpoint 2: depth of field replaces its pass-through with a signed circle of confusion.
++// Chapter 30 checkpoint 3: the centred shutter gather replaces its pass-through.
+ //
+-// The defocus stage now turns the centre pixel's linear view depth into a signed circle of confusion, gathers the
+-// aperture as a scatter, keeps the unbounded near field separate from the far field, and publishes the lens,
+-// coverage, and rejection evidence that DofEvaluated finally stands for. It is the same dispatch in the same
+-// position of the same chain: it reads Chain[SourceOffset + index], writes Chain[DestinationOffset + index], and
+-// hands the defocused image to the shutter stage, which is still a pass-through, as the bloom stages still are.
+-// The displayed image changes here for the first time, wherever the circle of confusion exceeds a pixel.
++// Motion blur now takes the scene pass's previousUV - currentUV motion through MotionToDisplayPixels exactly once,
++// builds a centred shutter schedule whose mean parameter is zero, decides which taps its trajectory owns by depth,
++// and renormalises the accepted weights so a partially rejected trajectory darkens nothing. Both camera effects
++// are real from here, and CameraEffectCS keeps dispatching whichever one PassKind names, so the declared
++// defocus-then-shutter or shutter-then-defocus order reaches the GPU without the shader choosing an order of its
++// own. Bloom is still a zero pyramid and a zero accumulator, so the chain still contributes no bloom radiance.
+ #include "../Common/PostProcessingShared.hlsli"
+
+ [numthreads(8, 8, 1)] void SceneCS(uint3 dispatchThreadId : SV_DispatchThreadID)
+@@ -174,20 +174,130 @@ void EvaluateDepthOfFieldPass(uint2 pixel)
+     Records[centerIndex] = record;
+ }
+
+-// A pass-through stand-in for the shutter gather, on the same terms. No shutter schedule is built and no tap is
+-// tested for ownership, so MotionEvaluated stays clear and every displacement, applied scale, shutter parameter,
+-// weight sum, and per-reason rejection count keeps its zero.
++// A centred gather along this pixel's own shutter trajectory. Rejected taps are removed from the average and the
++// remaining weights are renormalised, so a partially rejected trajectory darkens nothing.
+ void EvaluateMotionBlurPass(uint2 pixel)
+ {
+     uint2 extent = uint2(DisplayWidth, DisplayHeight);
+     uint centerIndex = TexelIndex(extent, pixel);
++    SceneRecord centerScene = Scene[centerIndex];
+     float3 centerColor = Chain[SourceOffset + centerIndex].rgb;
+-    Chain[DestinationOffset + centerIndex] = float4(centerColor, 0.0f);
++    float centerDepth = centerScene.viewDepthMetres;
++    ShutterSchedule schedule = BuildShutterSchedule(float2(centerScene.motionX, centerScene.motionY), extent);
++    float depthTolerance = MotionDepthCompareAbsoluteMetres + (MotionDepthCompareRelative * centerDepth);
++
++    float3 accumulated = float3(0.0f, 0.0f, 0.0f);
++    float weightSum = 0.0f;
++    uint acceptedCount = 0u;
++    uint rejectedOutOfBounds = 0u;
++    uint rejectedForeground = 0u;
++    uint rejectedBackground = 0u;
++    uint flags = schedule.flags | MotionEvaluated;
++    float firstParameter = 0.0f;
++    float lastParameter = 0.0f;
++    float parameterSum = 0.0f;
++
++    for (uint sample = 0u; sample < MotionSampleCount; ++sample)
++    {
++        float parameter = ShutterParameter(sample, MotionSampleCount);
++        parameterSum += parameter;
++        if (sample == 0u)
++        {
++            firstParameter = parameter;
++        }
++        if ((sample + 1u) == MotionSampleCount)
++        {
++            lastParameter = parameter;
++        }
++        if (parameter == 0.0f)
++        {
++            flags |= MotionIncludesCenterSample;
++        }
++
++        float2 offset = schedule.shutterDisplacementPixels * parameter;
++        uint2 texel;
++        if (!OffsetTexel(extent, pixel, offset, texel))
++        {
++            ++rejectedOutOfBounds;
++            continue;
++        }
++        uint tapIndex = TexelIndex(extent, texel);
++        SceneRecord tapScene = Scene[tapIndex];
++        bool accepted = false;
++        if (parameter == 0.0f)
++        {
++            accepted = true;
++        }
++        else if (abs(tapScene.viewDepthMetres - centerDepth) <= depthTolerance)
++        {
++            accepted = true;
++        }
++        else if (tapScene.viewDepthMetres < centerDepth)
++        {
++            // The tap is in front of the centre, so it may only contribute if its own shutter trajectory was long
++            // enough to have covered this pixel while the shutter was open.
++            float2 tapDisplacement = MotionToDisplayPixels(float2(tapScene.motionX, tapScene.motionY), extent);
++            float tapShutterLength = length(tapDisplacement) * ExposureTimeFraction;
++            if ((Flags & FlagClampShutterToBudget) != 0u)
++            {
++                tapShutterLength = min(tapShutterLength, MaximumShutterDisplacementPixels);
++            }
++            if ((0.5f * tapShutterLength) >= length(offset))
++            {
++                accepted = true;
++            }
++            else
++            {
++                ++rejectedForeground;
++            }
++        }
++        else
++        {
++            // The background it exposes was never in front of the moving object, so accepting it would invent a
++            // trail across the disocclusion.
++            ++rejectedBackground;
++        }
++
++        if (accepted)
++        {
++            ++acceptedCount;
++            weightSum += 1.0f;
++            accumulated += Chain[SourceOffset + tapIndex].rgb;
++        }
++    }
++
++    float3 output;
++    if (weightSum > 0.0f)
++    {
++        output = accumulated / weightSum;
++    }
++    else
++    {
++        output = centerColor;
++        flags |= MotionFellBackToCenter;
++    }
++    Chain[DestinationOffset + centerIndex] = float4(output, 0.0f);
+
+     PixelRecord record = Records[centerIndex];
+-    record.motionBlurR = centerColor.r;
+-    record.motionBlurG = centerColor.g;
+-    record.motionBlurB = centerColor.b;
++    record.frameDisplacementX = schedule.frameDisplacementPixels.x;
++    record.frameDisplacementY = schedule.frameDisplacementPixels.y;
++    record.shutterDisplacementX = schedule.shutterDisplacementPixels.x;
++    record.shutterDisplacementY = schedule.shutterDisplacementPixels.y;
++    record.shutterAppliedScale = schedule.appliedScale;
++    record.shutterGatherRadiusPixels = schedule.gatherRadiusPixels;
++    record.shutterCentroidParameter = parameterSum / float(MotionSampleCount);
++    record.shutterFirstParameter = firstParameter;
++    record.shutterLastParameter = lastParameter;
++    record.motionWeightSum = weightSum;
++    record.motionBlurR = output.r;
++    record.motionBlurG = output.g;
++    record.motionBlurB = output.b;
++    record.motionSampleCount = MotionSampleCount;
++    record.motionAcceptedCount = acceptedCount;
++    record.motionRejectedOutOfBounds = rejectedOutOfBounds;
++    record.motionRejectedForeground = rejectedForeground;
++    record.motionRejectedBackground = rejectedBackground;
++    record.motionFlags = flags;
+     record.status |= StatusMotionBlur;
+     Records[centerIndex] = record;
+ }

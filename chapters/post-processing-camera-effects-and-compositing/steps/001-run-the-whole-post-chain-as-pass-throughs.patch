@@ -1,0 +1,198 @@
+diff --git a/chapters/post-processing-camera-effects-and-compositing/Starter/Main.cpp b/chapters/post-processing-camera-effects-and-compositing/Starter/Main.cpp
+--- a/chapters/post-processing-camera-effects-and-compositing/Starter/Main.cpp
++++ b/chapters/post-processing-camera-effects-and-compositing/Starter/Main.cpp
+@@ -4,12 +4,13 @@
+
+ int wmain(int argc, wchar_t **argv)
+ {
+-    std::puts("Ch30 Starter: a scene-linear, temporally resolved baseline and the honest output path only.");
+-    std::puts("Exposure is applied exactly once, then a tone curve, the display encoding, and the UI composite.");
+-    std::puts("Checkpoint: display=320x180 bloom=off depth-of-field=off motion-blur=off transfer=sRGB ui=after.");
+-    ch30::post_processing::starter::Renderer renderer{};
++    std::puts("Ch30 Solution: a bounded post chain submitted from a validated pipeline plan.");
++    std::puts("Depth of field with a signed circle of confusion, a centred gather shutter, a soft-knee bloom");
++    std::puts("pyramid, scene-linear composition, one exposure, a tone curve, display encoding, and the UI.");
++    std::puts("Keys: V view, O camera order, P bloom source, I UI placement, D/M/B stages, U UI, R reset.");
++    ch30::post_processing::solution::Renderer renderer{};
+     lgp::framework::ApplicationConfiguration configuration{};
+-    configuration.title = L"Ch30 Post-Processing Starter (output path baseline)";
++    configuration.title = L"Ch30 Post-Processing Camera Effects and Compositing Solution";
+     configuration.width = 320U;
+     configuration.height = 180U;
+     auto result = lgp::framework::RunApplication(configuration, argc, argv, renderer);
+diff --git a/chapters/post-processing-camera-effects-and-compositing/Starter/PostProcessingLab.hlsl b/chapters/post-processing-camera-effects-and-compositing/Starter/PostProcessingLab.hlsl
+--- a/chapters/post-processing-camera-effects-and-compositing/Starter/PostProcessingLab.hlsl
++++ b/chapters/post-processing-camera-effects-and-compositing/Starter/PostProcessingLab.hlsl
+@@ -1,10 +1,17 @@
+-// Chapter 30 Starter: the honest output path and nothing else.
++// Chapter 30 checkpoint 1: the whole post chain runs, and every stage in it is honest about running empty.
+ //
+-// The scene pass publishes a scene-linear, temporally resolved display-extent baseline together with the linear
+-// view depth and the Chapter 11 motion convention that the camera effects would need. The output pass then does
+-// exactly one job: remove the pre-exposure, apply the camera exposure once, tone map, encode for the display, and
+-// composite the UI in the domain the policy chose. There is no bloom, no motion blur, and no depth of field here,
+-// and none of the helpers this file calls performs one.
++// The lab becomes the Solution variant here, so the renderer compiles and creates the camera-effect and bloom
++// pipelines and submits the stage list its validated plan declares: the scene pass, depth of field, motion blur,
++// bloom extraction, the pyramid reduction, its progressive recombination, and the output path. Every stage below
++// is a separate dispatch that reads Chain[SourceOffset + index] and writes Chain[DestinationOffset + index], so no
++// pass ever aliases its own input, publishes its own per-pixel evidence into Records, and sets its own status bit
++// only once that evidence is finite and in domain. Each one is still a pass-through: the camera effects hand the
++// radiance on unchanged and record the colour they published, the bloom stages publish an explicit zero pyramid
++// and a zero accumulator, and the output path composes, removes the pre-exposure, applies the camera exposure
++// exactly once, tone maps, encodes for the display, and composites the UI. The DofEvaluated, MotionEvaluated, and
++// BloomEvaluated flags stay clear, so no record claims an effect it did not evaluate. The displayed image is
++// therefore still the baseline, while the stage count, the stage-order word, and the status bits show the whole
++// chain executing. Each patch that follows replaces one pass-through with the algorithm it stands in for.
+ #include "../Common/PostProcessingShared.hlsli"
+
+ [numthreads(8, 8, 1)] void SceneCS(uint3 dispatchThreadId : SV_DispatchThreadID)
+@@ -16,6 +23,105 @@
+     WriteSceneRecord(dispatchThreadId.xy);
+ }
+
++// A pass-through stand-in for the defocus gather. It obeys the ping-pong contract - it reads the source chain half
++// and writes the destination half - and records the colour it published, but it computes no circle of confusion,
++// gathers no aperture samples, and estimates no coverage. DofEvaluated therefore stays clear and every lens,
++// gather-radius, coverage, weight-sum, and rejection field keeps the zero the scene pass wrote, so the record says
++// the stage ran and evaluated nothing rather than implying a defocus that never happened.
++void EvaluateDepthOfFieldPass(uint2 pixel)
++{
++    uint2 extent = uint2(DisplayWidth, DisplayHeight);
++    uint centerIndex = TexelIndex(extent, pixel);
++    float3 centerColor = Chain[SourceOffset + centerIndex].rgb;
++    Chain[DestinationOffset + centerIndex] = float4(centerColor, 0.0f);
++
++    PixelRecord record = Records[centerIndex];
++    record.dofOutR = centerColor.r;
++    record.dofOutG = centerColor.g;
++    record.dofOutB = centerColor.b;
++    record.status |= StatusDepthOfField;
++    Records[centerIndex] = record;
++}
++
++// A pass-through stand-in for the shutter gather, on the same terms. No shutter schedule is built and no tap is
++// tested for ownership, so MotionEvaluated stays clear and every displacement, applied scale, shutter parameter,
++// weight sum, and per-reason rejection count keeps its zero.
++void EvaluateMotionBlurPass(uint2 pixel)
++{
++    uint2 extent = uint2(DisplayWidth, DisplayHeight);
++    uint centerIndex = TexelIndex(extent, pixel);
++    float3 centerColor = Chain[SourceOffset + centerIndex].rgb;
++    Chain[DestinationOffset + centerIndex] = float4(centerColor, 0.0f);
++
++    PixelRecord record = Records[centerIndex];
++    record.motionBlurR = centerColor.r;
++    record.motionBlurG = centerColor.g;
++    record.motionBlurB = centerColor.b;
++    record.status |= StatusMotionBlur;
++    Records[centerIndex] = record;
++}
++
++[numthreads(8, 8, 1)] void CameraEffectCS(uint3 dispatchThreadId : SV_DispatchThreadID)
++{
++    if (dispatchThreadId.x >= DisplayWidth || dispatchThreadId.y >= DisplayHeight)
++    {
++        return;
++    }
++    if (PassKind == PassDepthOfField)
++    {
++        EvaluateDepthOfFieldPass(dispatchThreadId.xy);
++    }
++    else
++    {
++        EvaluateMotionBlurPass(dispatchThreadId.xy);
++    }
++}
++
++// A pass-through stand-in for highlight extraction. The reduction and the recombination are dispatched over level
++// zero whether or not anything was extracted into it, so this writes an explicit zero over the level the renderer
++// bound instead of leaving whatever the previous frame left there. Nothing is thresholded, so BloomEvaluated stays
++// clear and the luminance, excess, threshold-weight, and extracted-colour fields keep their zeros; the level count
++// is published because it is the pyramid plan's evidence rather than the extraction's.
++[numthreads(8, 8, 1)] void BloomExtractCS(uint3 dispatchThreadId : SV_DispatchThreadID)
++{
++    if (dispatchThreadId.x >= DisplayWidth || dispatchThreadId.y >= DisplayHeight)
++    {
++        return;
++    }
++    uint2 pixel = dispatchThreadId.xy;
++    uint index = TexelIndex(uint2(DisplayWidth, DisplayHeight), pixel);
++    Bloom[DestinationOffset + index] = float4(0.0f, 0.0f, 0.0f, 0.0f);
++
++    PixelRecord record = Records[index];
++    record.bloomLevelCount = BloomLevelCount;
++    record.status |= StatusBloom;
++    Records[index] = record;
++}
++
++// A pass-through stand-in for the area reduction. It writes zero over exactly the destination level extent the
++// renderer bound, so every level the pyramid plan dispatches is written in bounds and stays finite.
++[numthreads(8, 8, 1)] void BloomDownsampleCS(uint3 dispatchThreadId : SV_DispatchThreadID)
++{
++    if (dispatchThreadId.x >= DestinationWidth || dispatchThreadId.y >= DestinationHeight)
++    {
++        return;
++    }
++    uint2 pixel = dispatchThreadId.xy;
++    Bloom[DestinationOffset + (pixel.y * DestinationWidth) + pixel.x] = float4(0.0f, 0.0f, 0.0f, 0.0f);
++}
++
++// A pass-through stand-in for the progressive combine. Every accumulator level the plan dispatches is zeroed,
++// including level zero, which is the level the output pass reads once composition starts consuming it.
++[numthreads(8, 8, 1)] void BloomUpsampleCS(uint3 dispatchThreadId : SV_DispatchThreadID)
++{
++    if (dispatchThreadId.x >= DestinationWidth || dispatchThreadId.y >= DestinationHeight)
++    {
++        return;
++    }
++    uint2 pixel = dispatchThreadId.xy;
++    Bloom[DestinationOffset + (pixel.y * DestinationWidth) + pixel.x] = float4(0.0f, 0.0f, 0.0f, 0.0f);
++}
++
+ [numthreads(8, 8, 1)] void ComposeCS(uint3 dispatchThreadId : SV_DispatchThreadID)
+ {
+     if (dispatchThreadId.x >= DisplayWidth || dispatchThreadId.y >= DisplayHeight)
+@@ -25,6 +131,7 @@
+     uint2 pixel = dispatchThreadId.xy;
+     uint index = TexelIndex(uint2(DisplayWidth, DisplayHeight), pixel);
+     float3 base = Chain[SourceOffset + index].rgb;
+-    // The Starter owns no bloom pyramid, so it contributes no bloom radiance rather than approximating one.
++    // The accumulator carries no reconstruction yet, so this contributes no bloom radiance rather than one it
++    // would have to invent.
+     FinishFrame(pixel, base, float3(0.0f, 0.0f, 0.0f));
+ }
+diff --git a/chapters/post-processing-camera-effects-and-compositing/Starter/Renderer.cpp b/chapters/post-processing-camera-effects-and-compositing/Starter/Renderer.cpp
+--- a/chapters/post-processing-camera-effects-and-compositing/Starter/Renderer.cpp
++++ b/chapters/post-processing-camera-effects-and-compositing/Starter/Renderer.cpp
+@@ -1,9 +1,9 @@
+ #include "Renderer.hpp"
+
+-namespace ch30::post_processing::starter
++namespace ch30::post_processing::solution
+ {
+ Renderer::Renderer()
+-    : RendererCore(std::filesystem::path{__FILE__}.parent_path() / "PostProcessingLab.hlsl", gpu::LabVariant::Starter)
++    : RendererCore(std::filesystem::path{__FILE__}.parent_path() / "PostProcessingLab.hlsl", gpu::LabVariant::Solution)
+ {
+ }
+-} // namespace ch30::post_processing::starter
++} // namespace ch30::post_processing::solution
+diff --git a/chapters/post-processing-camera-effects-and-compositing/Starter/Renderer.hpp b/chapters/post-processing-camera-effects-and-compositing/Starter/Renderer.hpp
+--- a/chapters/post-processing-camera-effects-and-compositing/Starter/Renderer.hpp
++++ b/chapters/post-processing-camera-effects-and-compositing/Starter/Renderer.hpp
+@@ -1,7 +1,7 @@
+ #pragma once
+ #include "../Common/GpuLabSupport.hpp"
+
+-namespace ch30::post_processing::starter
++namespace ch30::post_processing::solution
+ {
+ using HeadlessTestConfiguration = gpu::LabConfiguration;
+ class Renderer final : public gpu::RendererCore
+@@ -9,4 +9,4 @@ class Renderer final : public gpu::RendererCore
+   public:
+     Renderer();
+ };
+-} // namespace ch30::post_processing::starter
++} // namespace ch30::post_processing::solution
