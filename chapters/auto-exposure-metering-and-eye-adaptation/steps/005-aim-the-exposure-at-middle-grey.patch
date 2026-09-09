@@ -1,0 +1,129 @@
+diff --git a/chapters/auto-exposure-metering-and-eye-adaptation/Starter/AutoExposureLab.hlsl b/chapters/auto-exposure-metering-and-eye-adaptation/Starter/AutoExposureLab.hlsl
+--- a/chapters/auto-exposure-metering-and-eye-adaptation/Starter/AutoExposureLab.hlsl
++++ b/chapters/auto-exposure-metering-and-eye-adaptation/Starter/AutoExposureLab.hlsl
+@@ -1,13 +1,12 @@
+-// Chapter 31 checkpoint 4: the distribution becomes one number under a declared policy.
++// Chapter 31 checkpoint 5: the metered luminance becomes a target exposure.
+ //
+-// MeterCS now refuses a frame with no accepted sample and a frame in which no accepted sample carried a positive
+-// luminance, and otherwise answers the requested policy: the arithmetic mean and the log average from the exact
+-// sufficient statistics the reduction accumulated, and the percentile window from the histogram, whose boundaries
+-// are exact integer positions inside the accumulated weight. Every answer is published beside the bin-centre
+-// reconstruction it did *not* use, so a quantized estimate can never be mistaken for the exact one.
++// ExposureCS now turns the metered luminance into the exposure that puts it on middle grey, in stops, as a
++// difference of logarithms rather than the logarithm of a ratio, with the authored compensation added and the
++// authored bounds applied and reported. A refused measurement still has nothing to aim at, so it falls back to
++// the declared seed and says so.
+ //
+-// The measurement still does not reach the picture. ExposureCS publishes the same declared exposure it has
+-// published since checkpoint 1, so the metered luminance is visible in the meter record and nowhere else.
++// There is no adaptation yet: the frame applies the target it computed on the same frame, so the picture snaps
++// rather than settles, and the stored history slot is still written and never reused. That is the last stand-in.
+
+ #include "../Common/AutoExposureShared.hlsli"
+
+@@ -763,7 +762,7 @@ uint PercentilePosition(uint totalWeight, uint percentileFixed)
+ }
+
+ // ---------------------------------------------------------------------------------------------------------------
+-// Exposure
++// Target exposure
+ // ---------------------------------------------------------------------------------------------------------------
+
+ [numthreads(1, 1, 1)] void ExposureCS(uint3 dispatchThreadId : SV_DispatchThreadID)
+@@ -801,43 +800,69 @@ uint PercentilePosition(uint totalWeight, uint percentileFixed)
+     {
+         record.status |= ExposureManualMode;
+     }
+-    if (!measurementValid)
++
++    // What this frame's measurement asks for. Until the adaptation step exists it is also what this frame
++    // applies, which is exactly the shortcut the next patch removes.
++    float unclampedTargetStops = 0.0f;
++    float meteredLuminance = 0.0f;
++    if (manual)
+     {
+-        // The meter published no evaluated measurement, so there is nothing to act on and the stage holds. Holding
+-        // is a decision, and it is published rather than disguised as a measurement that happened to agree.
+-        record.status |= ExposureHeldOnRefusedMeasurement;
++        unclampedTargetStops = ManualExposureStops;
++    }
++    else if (measurementValid)
++    {
++        meteredLuminance = meter.meteredLuminance;
++        // The difference of logarithms, not the logarithm of the ratio: middleGrey / metered can underflow or
++        // overflow for a legitimate metered value, and its logarithm would then be infinite for a configuration
++        // that is perfectly representable in stops.
++        unclampedTargetStops = (log2(MiddleGreyLuminance) - log2(meteredLuminance)) + ExposureCompensationStops;
++        if (!isfinite(unclampedTargetStops))
++        {
++            measurementValid = false;
++            unclampedTargetStops = 0.0f;
++            meteredLuminance = 0.0f;
++        }
+     }
+
+-    // A declared exposure, because this stage owns no rule that turns a luminance into one: the authored manual
+-    // stops, or the authored reset seed for an automatic frame. Either way it is a number the configuration wrote
+-    // down, clamped to the authored bounds, and the clamp is reported.
+-    float declaredStops = manual ? ManualExposureStops : ResetSeedStops;
+-    float currentStops = clamp(declaredStops, MinimumExposureStops, MaximumExposureStops);
+-    // What the next frame will find in the history slot. It is the number this frame displays, because no stage
+-    // here commits a different one.
+-    float committedStops = currentStops;
+-    record.status |= ExposureSeededFromDeclaredStops;
++    float targetStops = clamp(unclampedTargetStops, MinimumExposureStops, MaximumExposureStops);
++    record.targetClampedToMinimum = (measurementValid && unclampedTargetStops < MinimumExposureStops) ? 1u : 0u;
++    record.targetClampedToMaximum = (measurementValid && unclampedTargetStops > MaximumExposureStops) ? 1u : 0u;
+
++    float currentStops;
++    if (measurementValid)
++    {
++        currentStops = targetStops;
++        record.status |= ExposureSeededFromTarget;
++    }
++    else
++    {
++        // A refused measurement has nothing to aim at, so the declared seed is adopted rather than a luminance
++        // that was never observed.
++        currentStops = clamp(ResetSeedStops, MinimumExposureStops, MaximumExposureStops);
++        targetStops = currentStops;
++        unclampedTargetStops = currentStops;
++        record.status |= ExposureHeldOnRefusedMeasurement | ExposureSeededFromDeclaredStops;
++    }
++
++    // The target and the applied exposure are the same value at this checkpoint, so the direction is steady by
++    // construction and the whole step is taken at once. Both become real quantities when the exposure is allowed
++    // to lag behind its target.
++    float committedStops = currentStops;
+     record.direction = DirectionSteady;
+-    // The declared value is adopted outright. There is no smoothing to report a fraction of, so this is the whole
+-    // step rather than a plausible-looking blend weight.
+     record.alpha = 1.0f;
+     record.currentStops = currentStops;
+     record.displayedStops = currentStops;
+     record.displayedScale = exp2(currentStops);
+-    record.targetStops = currentStops;
+-    record.targetUnclampedStops = declaredStops;
+-    record.targetScale = exp2(currentStops);
++    record.targetStops = targetStops;
++    record.targetUnclampedStops = unclampedTargetStops;
++    record.targetScale = exp2(targetStops);
++    record.meteredLuminance = meteredLuminance;
++    record.exposedMeteredLuminance = meteredLuminance * exp2(targetStops);
+     record.committedStops = committedStops;
+     record.committedScale = exp2(committedStops);
+-    // Nothing was measured into this exposure. Publishing a zero rather than a plausible luminance is what makes
+-    // the stand-in checkable: a metered luminance of zero is not a measurement, and no test can mistake it for one.
+-    record.meteredLuminance = 0.0f;
+-    record.exposedMeteredLuminance = 0.0f;
+-    record.clampedToMinimum = declaredStops < MinimumExposureStops ? 1u : 0u;
+-    record.clampedToMaximum = declaredStops > MaximumExposureStops ? 1u : 0u;
+-    record.targetClampedToMinimum = record.clampedToMinimum;
+-    record.targetClampedToMaximum = record.clampedToMaximum;
++    // The applied value is the clamped target, so the commit clamp reports exactly what the target clamp did.
++    record.clampedToMinimum = record.targetClampedToMinimum;
++    record.clampedToMaximum = record.targetClampedToMaximum;
+     record.netScaleFromStored = record.displayedScale / preExposure;
+
+     // The next frame's pre-exposure. Note the direction: the stored value is radiance times the exposure the frame

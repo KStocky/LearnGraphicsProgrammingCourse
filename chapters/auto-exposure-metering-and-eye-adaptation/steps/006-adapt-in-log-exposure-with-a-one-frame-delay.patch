@@ -1,0 +1,259 @@
+diff --git a/chapters/auto-exposure-metering-and-eye-adaptation/Starter/AutoExposureLab.hlsl b/chapters/auto-exposure-metering-and-eye-adaptation/Starter/AutoExposureLab.hlsl
+--- a/chapters/auto-exposure-metering-and-eye-adaptation/Starter/AutoExposureLab.hlsl
++++ b/chapters/auto-exposure-metering-and-eye-adaptation/Starter/AutoExposureLab.hlsl
+@@ -1,12 +1,22 @@
+-// Chapter 31 checkpoint 5: the metered luminance becomes a target exposure.
++// Chapter 31 Solution: the auto-exposure feedback loop, written out as five explicit stages.
+ //
+-// ExposureCS now turns the metered luminance into the exposure that puts it on middle grey, in stops, as a
+-// difference of logarithms rather than the logarithm of a ratio, with the authored compensation added and the
+-// authored bounds applied and reported. A refused measurement still has nothing to aim at, so it falls back to
+-// the declared seed and says so.
++// The loop this file implements is deliberately not hidden behind a helper, because every one of its steps is a
++// place where a plausible-looking shortcut produces a plausible-looking wrong number:
+ //
+-// There is no adaptation yet: the frame applies the target it computed on the same frame, so the picture snaps
+-// rather than settles, and the stored history slot is still written and never reused. That is the last stand-in.
++//   1. HistogramCS turns each stored sample into an absolute luminance, weights it in integer fixed point, and adds
++//      it into a bounded log2 histogram. Every accumulator is an integer, so the answer does not depend on which
++//      wave got there first. Alongside the bins it accumulates the two real-valued sufficient statistics that the
++//      bins cannot reproduce, in a declared order, in group-shared memory, never through a floating-point atomic.
++//   2. ReduceCS sums the per-tile partials in tile-index order. One declared order, one answer.
++//   3. MeterCS reduces the distribution to a single luminance under the requested policy, and publishes both the
++//      exact statistic it used and the bin-centre reconstruction it did *not* use, so the two can be told apart.
++//   4. ExposureCS turns that luminance into a target exposure, decides whether the stored adaptation state may be
++//      reused, smooths in the log exposure domain, and commits a value for the *next* frame.
++//   5. ComposeCS applies the exposure the *previous* frame committed, exactly once.
++//
++// The one-frame delay is therefore a property of which resource each stage reads, not of a comment. ComposeCS never
++// reads the meter; it reads the displayed exposure, and the displayed exposure is the history value ExposureCS
++// found in the slot the previous frame wrote. A reset is the single exception, and it is always published.
+
+ #include "../Common/AutoExposureShared.hlsli"
+
+@@ -762,9 +772,22 @@ uint PercentilePosition(uint totalWeight, uint percentileFixed)
+ }
+
+ // ---------------------------------------------------------------------------------------------------------------
+-// Target exposure
++// Target exposure and temporal adaptation
+ // ---------------------------------------------------------------------------------------------------------------
+
++// alpha = 1 - exp(-speed * dt). Zero dt gives exactly zero, so a paused frame changes nothing; a large dt approaches
++// but never reaches one. Because the residual after dt is exp(-speed * dt), splitting a step into two halves
++// multiplies the residuals and lands in the same place: the smoothing is frame-rate independent by construction.
++//
++// The CPU reference writes this as -expm1(-x) to avoid the cancellation that eats the leading digits of 1 - exp(-x)
++// for the small products a high frame rate produces. HLSL has no expm1, so this evaluates the subtraction directly
++// and loses a few low bits of a value that is already only used to blend two stop values; the chapter says so here
++// rather than implying the two are bit-identical.
++float SmoothingAlpha(float speedPerSecond, float deltaSeconds)
++{
++    return saturate(1.0f - exp2(-(speedPerSecond * deltaSeconds) * 1.44269504f));
++}
++
+ [numthreads(1, 1, 1)] void ExposureCS(uint3 dispatchThreadId : SV_DispatchThreadID)
+ {
+     if (dispatchThreadId.x != 0u)
+@@ -786,13 +809,9 @@ uint PercentilePosition(uint totalWeight, uint percentileFixed)
+     record.preExposure = preExposure;
+     record.status = ExposureEvaluated;
+
+-    // The stored slot is read, and its identity is published, so the resource the adaptation step will reason
+-    // about is already the resource this stage reads. Nothing here reuses it: reusedHistory stays zero rather
+-    // than claiming a continuity this stage does not have.
+     bool historyValid = (Flags & FlagResetHistory) == 0u && history.valid != 0u;
+     record.historyValid = historyValid ? 1u : 0u;
+     record.producerFrameIndex = historyValid ? history.producerFrameIndex : FrameIndex;
+-    record.reusedHistory = 0u;
+
+     bool manual = ExposureModeId == ModeManual;
+     bool measurementValid = manual || (meter.status & MeterEvaluated) != 0u;
+@@ -801,8 +820,8 @@ uint PercentilePosition(uint totalWeight, uint percentileFixed)
+         record.status |= ExposureManualMode;
+     }
+
+-    // What this frame's measurement asks for. Until the adaptation step exists it is also what this frame
+-    // applies, which is exactly the shortcut the next patch removes.
++    // What this frame's measurement asks for. It is never the exposure applied to this frame; only the blend below
++    // may turn it into a committed exposure, and only the *previous* frame's committed exposure is displayed.
+     float unclampedTargetStops = 0.0f;
+     float meteredLuminance = 0.0f;
+     if (manual)
+@@ -824,32 +843,113 @@ uint PercentilePosition(uint totalWeight, uint percentileFixed)
+         }
+     }
+
++    uint resets = 0u;
++    if (!historyValid)
++    {
++        resets |= ResetNoHistory;
++    }
++    if (FrameIndex == 0u)
++    {
++        resets |= ResetFirstFrame;
++    }
++    if ((Flags & FlagCameraCut) != 0u)
++    {
++        resets |= ResetCameraCut;
++    }
++    if (historyValid)
++    {
++        bool sequential = FrameIndex != 0u && (FrameIndex - 1u) == history.producerFrameIndex;
++        if (!sequential)
++        {
++            // A stale value fed through a dt-based smoother produces an adaptation that silently depends on how long
++            // the stall was, so the stored value is discarded instead of reused.
++            resets |= ResetNonSequentialProducerFrame;
++        }
++        if (history.configurationIdentityLow != ConfigurationIdentityLow ||
++            history.configurationIdentityHigh != ConfigurationIdentityHigh)
++        {
++            resets |= ResetConfigurationChanged;
++        }
++        if (history.mode != ExposureModeId)
++        {
++            resets |= ResetExposureModeChanged;
++        }
++        if (!isfinite(history.committedStops) || abs(history.committedStops) > ExposureStopsLimit)
++        {
++            resets |= ResetInvalidHistoryValue;
++        }
++    }
++    bool reset = resets != 0u;
++    record.resets = resets;
++    record.reusedHistory = reset ? 0u : 1u;
++    if (!reset)
++    {
++        record.status |= ExposureReusedHistory;
++    }
++
+     float targetStops = clamp(unclampedTargetStops, MinimumExposureStops, MaximumExposureStops);
+     record.targetClampedToMinimum = (measurementValid && unclampedTargetStops < MinimumExposureStops) ? 1u : 0u;
+     record.targetClampedToMaximum = (measurementValid && unclampedTargetStops > MaximumExposureStops) ? 1u : 0u;
+
++    // The exposure applied to the image the viewer sees now. On a reused-history frame it is exactly what the
++    // previous frame committed and owes nothing to this frame's measurement.
+     float currentStops;
+-    if (measurementValid)
++    if (!reset)
++    {
++        currentStops = history.committedStops;
++    }
++    else if (measurementValid)
+     {
+         currentStops = targetStops;
+         record.status |= ExposureSeededFromTarget;
+     }
+     else
+     {
+-        // A refused measurement has nothing to aim at, so the declared seed is adopted rather than a luminance
+-        // that was never observed.
++        // A reset frame whose measurement was refused has nothing to seed from, so it adopts the declared seed
++        // rather than inventing a luminance that was never observed.
+         currentStops = clamp(ResetSeedStops, MinimumExposureStops, MaximumExposureStops);
++        record.status |= ExposureSeededFromDeclaredStops;
++    }
++
++    float alpha;
++    if (!measurementValid)
++    {
++        // Nothing was measured, so the loop holds. Holding is a decision, and it is published rather than disguised
++        // as a measurement that happened to agree with the previous frame.
+         targetStops = currentStops;
+         unclampedTargetStops = currentStops;
+-        record.status |= ExposureHeldOnRefusedMeasurement | ExposureSeededFromDeclaredStops;
++        alpha = reset ? 1.0f : 0.0f;
++        record.status |= ExposureHeldOnRefusedMeasurement;
++    }
++    else
++    {
++        alpha = 1.0f;
++    }
++
++    uint direction = DirectionSteady;
++    if (targetStops > currentStops)
++    {
++        direction = DirectionExposureIncreasing;
+     }
++    else if (targetStops < currentStops)
++    {
++        direction = DirectionExposureDecreasing;
++    }
++    // Named from what the exposure does, not from what the scene does: a scene going dark makes the exposure go up.
++    float speed = (direction == DirectionExposureDecreasing) ? ExposureDecreaseSpeed : ExposureIncreaseSpeed;
++    if (!reset && measurementValid)
++    {
++        alpha = SmoothingAlpha(speed, FrameDeltaSeconds);
++    }
++
++    // Adaptation happens in stops, so moving one stop takes the same time whether the scene is a candle or a desert.
++    // Smoothing the linear scale instead would make the two directions take wildly different times for the same
++    // perceptual distance.
++    float blended = currentStops + (alpha * (targetStops - currentStops));
++    float committedStops = clamp(blended, MinimumExposureStops, MaximumExposureStops);
+
+-    // The target and the applied exposure are the same value at this checkpoint, so the direction is steady by
+-    // construction and the whole step is taken at once. Both become real quantities when the exposure is allowed
+-    // to lag behind its target.
+-    float committedStops = currentStops;
+-    record.direction = DirectionSteady;
+-    record.alpha = 1.0f;
++    record.direction = direction;
++    record.alpha = alpha;
+     record.currentStops = currentStops;
+     record.displayedStops = currentStops;
+     record.displayedScale = exp2(currentStops);
+@@ -860,9 +960,8 @@ uint PercentilePosition(uint totalWeight, uint percentileFixed)
+     record.exposedMeteredLuminance = meteredLuminance * exp2(targetStops);
+     record.committedStops = committedStops;
+     record.committedScale = exp2(committedStops);
+-    // The applied value is the clamped target, so the commit clamp reports exactly what the target clamp did.
+-    record.clampedToMinimum = record.targetClampedToMinimum;
+-    record.clampedToMaximum = record.targetClampedToMaximum;
++    record.clampedToMinimum = blended < MinimumExposureStops ? 1u : 0u;
++    record.clampedToMaximum = blended > MaximumExposureStops ? 1u : 0u;
+     record.netScaleFromStored = record.displayedScale / preExposure;
+
+     // The next frame's pre-exposure. Note the direction: the stored value is radiance times the exposure the frame
+@@ -878,8 +977,8 @@ uint PercentilePosition(uint totalWeight, uint percentileFixed)
+
+     ExposureHistorySlot next;
+     next.valid = 1u;
+-    // The frame that produced this state. Nothing reads it back yet, and it is written anyway, because the
+-    // resource the adaptation step will read has to be the resource this stage already writes.
++    // The frame that produced this state. The exposure it holds is applied to frame producerFrameIndex + 1, which is
++    // the whole of the one-frame delay written down.
+     next.producerFrameIndex = FrameIndex;
+     next.configurationIdentityLow = ConfigurationIdentityLow;
+     next.configurationIdentityHigh = ConfigurationIdentityHigh;
+@@ -894,9 +993,9 @@ uint PercentilePosition(uint totalWeight, uint percentileFixed)
+ // Display
+ // ---------------------------------------------------------------------------------------------------------------
+
+-// Identical to the Starter's compose stage, and deliberately so: growing a measurement in front of it must not
+-// change what "apply the exposure" means. The exposure it reads is the displayed exposure, which is whatever the
+-// exposure stage published for this frame.
++// Identical to the Starter's compose stage, and deliberately so: adding a feedback loop must not change what
++// "apply the exposure" means. The exposure it reads is the displayed exposure, which is the value the previous
++// frame committed; this frame's measurement is not in this function at all.
+ [numthreads(8, 8, 1)] void ComposeCS(uint3 dispatchThreadId : SV_DispatchThreadID)
+ {
+     if (dispatchThreadId.x >= DisplayWidth || dispatchThreadId.y >= DisplayHeight)
+diff --git a/chapters/auto-exposure-metering-and-eye-adaptation/Starter/Main.cpp b/chapters/auto-exposure-metering-and-eye-adaptation/Starter/Main.cpp
+--- a/chapters/auto-exposure-metering-and-eye-adaptation/Starter/Main.cpp
++++ b/chapters/auto-exposure-metering-and-eye-adaptation/Starter/Main.cpp
+@@ -4,9 +4,10 @@
+
+ int wmain(int argc, wchar_t **argv)
+ {
+-    std::puts("Ch31 Solution in progress: every stage the Solution dispatches runs, and each one publishes only");
+-    std::puts("what it has actually computed. The meter status and the exposure record say which parts of the");
+-    std::puts("loop exist yet; the chapter's remaining patches replace the stand-ins one at a time.");
++    std::puts("Ch31 Solution: an auto-exposure loop written out as five explicit stages.");
++    std::puts("A fixed-point log2 histogram with integer atomics, a fixed-order reduction of the exact sufficient");
++    std::puts("statistics, a metering policy, a target from middle grey, and adaptation in log exposure. The frame");
++    std::puts("displays what the previous frame committed; this frame's measurement reaches the next frame only.");
+     std::puts("Keys: V view, S scene, P policy, W centre weighting, K mask, M mode, C camera cut, U UI, R reset.");
+     ch31::auto_exposure::solution::Renderer renderer{};
+     lgp::framework::ApplicationConfiguration configuration{};

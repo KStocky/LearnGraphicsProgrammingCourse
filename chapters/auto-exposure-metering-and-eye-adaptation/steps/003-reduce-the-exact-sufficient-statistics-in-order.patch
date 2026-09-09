@@ -1,0 +1,141 @@
+diff --git a/chapters/auto-exposure-metering-and-eye-adaptation/Starter/AutoExposureLab.hlsl b/chapters/auto-exposure-metering-and-eye-adaptation/Starter/AutoExposureLab.hlsl
+--- a/chapters/auto-exposure-metering-and-eye-adaptation/Starter/AutoExposureLab.hlsl
++++ b/chapters/auto-exposure-metering-and-eye-adaptation/Starter/AutoExposureLab.hlsl
+@@ -1,14 +1,14 @@
+-// Chapter 31 checkpoint 2: the classified samples become a log2 histogram.
++// Chapter 31 checkpoint 3: the exact sufficient statistics, accumulated in a declared order.
+ //
+-// HistogramCS now accumulates. Each group clears a tile histogram in group-shared memory, adds every accepted
+-// sample's integer weight into the bin it was classified into, tallies the black, below-range, above-range, and
+-// rejected samples the classifier already distinguished, and merges the tile into the frame histogram with
+-// integer atomics, so the merged distribution is identical whatever order the tiles complete in. The overflow
+-// flags are checked rather than assumed.
++// A histogram cannot answer an arithmetic mean or a log average: a bin records how much weight fell inside it,
++// not where inside it. HistogramCS therefore also accumulates the two real-valued sums those estimators need,
++// into per-thread group-shared slots that one thread folds together in thread-index order, and writes the result
++// as this tile's partial. ReduceCS - which has been folding empty partials in tile-index order since checkpoint 1
++// - now has real ones to fold, so the frame statistics finally carry the accepted weight and sample count, the
++// weight that contributed a logarithm, the observed luminance range, and the two sums.
+ //
+-// Everything downstream is still a stand-in. The tile partials are untouched, so the accepted weight, the two
+-// real-valued sums, and the observed luminance range are all still zero; MeterCS still publishes no policy; and
+-// ExposureCS still publishes a declared exposure. The frame now has a distribution and nothing that reads it.
++// No floating-point atomic appears anywhere in the chapter, because its result would depend on arrival order.
++// MeterCS still publishes no policy and ExposureCS still publishes a declared exposure.
+
+ #include "../Common/AutoExposureShared.hlsli"
+
+@@ -218,6 +218,16 @@ SampleClassification ClassifySample(float3 storedSceneLinear, float preExposure,
+
+ groupshared uint gsBinWeight[MaximumBinCount];
+ groupshared uint gsBinSampleCount[MaximumBinCount];
++// Per-thread slots rather than a group-shared accumulator, because these two sums are real-valued and a
++// group-shared float atomic does not exist for a reason: its result would depend on arrival order.
++groupshared float gsWeightedLuminance[HistogramGroupThreads];
++groupshared float gsWeightedLog2Luminance[HistogramGroupThreads];
++groupshared float gsMinimumLuminance[HistogramGroupThreads];
++groupshared float gsMaximumLuminance[HistogramGroupThreads];
++groupshared uint gsHasAccepted[HistogramGroupThreads];
++groupshared uint gsLog2Weight[HistogramGroupThreads];
++groupshared uint gsAcceptedWeight[HistogramGroupThreads];
++groupshared uint gsAcceptedCount[HistogramGroupThreads];
+ // Integer tallies. Addition is associative and commutative, so a group-shared atomic is exactly reproducible here
+ // no matter which thread arrives first.
+ groupshared uint gsRejectedByReason[8];
+@@ -231,7 +241,8 @@ groupshared uint gsZeroLuminanceCount;
+ groupshared uint gsZeroLuminanceWeight;
+ groupshared uint gsOverflow;
+
+-[numthreads(8, 8, 1)] void HistogramCS(uint3 dispatchThreadId : SV_DispatchThreadID, uint groupIndex : SV_GroupIndex)
++[numthreads(8, 8, 1)] void HistogramCS(uint3 dispatchThreadId : SV_DispatchThreadID, uint3 groupId : SV_GroupID,
++                                       uint groupIndex : SV_GroupIndex)
+ {
+     uint2 extent = uint2(DisplayWidth, DisplayHeight);
+
+@@ -240,6 +251,14 @@ groupshared uint gsOverflow;
+         gsBinWeight[clearBin] = 0u;
+         gsBinSampleCount[clearBin] = 0u;
+     }
++    gsWeightedLuminance[groupIndex] = 0.0f;
++    gsWeightedLog2Luminance[groupIndex] = 0.0f;
++    gsMinimumLuminance[groupIndex] = 0.0f;
++    gsMaximumLuminance[groupIndex] = 0.0f;
++    gsHasAccepted[groupIndex] = 0u;
++    gsLog2Weight[groupIndex] = 0u;
++    gsAcceptedWeight[groupIndex] = 0u;
++    gsAcceptedCount[groupIndex] = 0u;
+     if (groupIndex < 8u)
+     {
+         gsRejectedByReason[groupIndex] = 0u;
+@@ -317,6 +336,19 @@ groupshared uint gsOverflow;
+                 InterlockedOr(gsOverflow, OverflowTileWeight);
+             }
+
++            float unitWeight = float(weight) / float(WeightOne);
++            gsAcceptedWeight[groupIndex] = weight;
++            gsAcceptedCount[groupIndex] = 1u;
++            gsWeightedLuminance[groupIndex] = unitWeight * sample.absoluteLuminance;
++            gsMinimumLuminance[groupIndex] = sample.absoluteLuminance;
++            gsMaximumLuminance[groupIndex] = sample.absoluteLuminance;
++            gsHasAccepted[groupIndex] = 1u;
++            if (sample.hasLog2Luminance != 0u)
++            {
++                gsWeightedLog2Luminance[groupIndex] = unitWeight * sample.log2Luminance;
++                gsLog2Weight[groupIndex] = weight;
++            }
++
+             if (sample.classification == BinClassZero)
+             {
+                 InterlockedAdd(gsZeroLuminanceCount, 1u);
+@@ -342,11 +374,48 @@ groupshared uint gsOverflow;
+     }
+     GroupMemoryBarrierWithGroupSync();
+
+-    // One thread publishes the tile's integer tallies into the frame statistics. Nothing real-valued is summed
+-    // here yet, so the accepted weight, the observed range, and the two sums the estimators need stay at the zero
+-    // the clear stage wrote.
++    // One thread folds the tile's real-valued contributions together in thread-index order. That order is the whole
++    // guarantee: a wave-wide shuffle reduction would be faster and would give a different sum on a different wave
++    // width, and a floating-point atomic would give a different sum on every run.
+     if (groupIndex == 0u)
+     {
++        TilePartial partial;
++        partial.weightedLuminanceSum = 0.0f;
++        partial.weightedLog2LuminanceSum = 0.0f;
++        partial.minimumObservedLuminance = 0.0f;
++        partial.maximumObservedLuminance = 0.0f;
++        partial.hasAcceptedSample = 0u;
++        partial.log2AccumulatedWeight = 0u;
++        partial.acceptedWeight = 0u;
++        partial.acceptedSampleCount = 0u;
++        for (uint slot = 0u; slot < HistogramGroupThreads; ++slot)
++        {
++            partial.weightedLuminanceSum += gsWeightedLuminance[slot];
++            partial.weightedLog2LuminanceSum += gsWeightedLog2Luminance[slot];
++            partial.log2AccumulatedWeight += gsLog2Weight[slot];
++            partial.acceptedWeight += gsAcceptedWeight[slot];
++            partial.acceptedSampleCount += gsAcceptedCount[slot];
++            if (gsHasAccepted[slot] != 0u)
++            {
++                if (partial.hasAcceptedSample == 0u)
++                {
++                    partial.hasAcceptedSample = 1u;
++                    partial.minimumObservedLuminance = gsMinimumLuminance[slot];
++                    partial.maximumObservedLuminance = gsMaximumLuminance[slot];
++                }
++                else
++                {
++                    partial.minimumObservedLuminance = min(partial.minimumObservedLuminance, gsMinimumLuminance[slot]);
++                    partial.maximumObservedLuminance = max(partial.maximumObservedLuminance, gsMaximumLuminance[slot]);
++                }
++            }
++        }
++        uint tileIndex = (groupId.y * TileCountX) + groupId.x;
++        if (tileIndex < TileCount)
++        {
++            Partials[tileIndex] = partial;
++        }
++
+         InterlockedAdd(Statistics[0].rejectedSampleCount, gsRejectedCount);
+         InterlockedAdd(Statistics[0].rejectedWeight, gsRejectedWeight);
+         InterlockedAdd(Statistics[0].belowRangeSampleCount, gsBelowRangeCount);

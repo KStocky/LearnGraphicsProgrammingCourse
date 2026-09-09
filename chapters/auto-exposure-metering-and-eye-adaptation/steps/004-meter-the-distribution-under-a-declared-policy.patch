@@ -1,0 +1,246 @@
+diff --git a/chapters/auto-exposure-metering-and-eye-adaptation/Starter/AutoExposureLab.hlsl b/chapters/auto-exposure-metering-and-eye-adaptation/Starter/AutoExposureLab.hlsl
+--- a/chapters/auto-exposure-metering-and-eye-adaptation/Starter/AutoExposureLab.hlsl
++++ b/chapters/auto-exposure-metering-and-eye-adaptation/Starter/AutoExposureLab.hlsl
+@@ -1,14 +1,13 @@
+-// Chapter 31 checkpoint 3: the exact sufficient statistics, accumulated in a declared order.
++// Chapter 31 checkpoint 4: the distribution becomes one number under a declared policy.
+ //
+-// A histogram cannot answer an arithmetic mean or a log average: a bin records how much weight fell inside it,
+-// not where inside it. HistogramCS therefore also accumulates the two real-valued sums those estimators need,
+-// into per-thread group-shared slots that one thread folds together in thread-index order, and writes the result
+-// as this tile's partial. ReduceCS - which has been folding empty partials in tile-index order since checkpoint 1
+-// - now has real ones to fold, so the frame statistics finally carry the accepted weight and sample count, the
+-// weight that contributed a logarithm, the observed luminance range, and the two sums.
++// MeterCS now refuses a frame with no accepted sample and a frame in which no accepted sample carried a positive
++// luminance, and otherwise answers the requested policy: the arithmetic mean and the log average from the exact
++// sufficient statistics the reduction accumulated, and the percentile window from the histogram, whose boundaries
++// are exact integer positions inside the accumulated weight. Every answer is published beside the bin-centre
++// reconstruction it did *not* use, so a quantized estimate can never be mistaken for the exact one.
+ //
+-// No floating-point atomic appears anywhere in the chapter, because its result would depend on arrival order.
+-// MeterCS still publishes no policy and ExposureCS still publishes a declared exposure.
++// The measurement still does not reach the picture. ExposureCS publishes the same declared exposure it has
++// published since checkpoint 1, so the metered luminance is visible in the meter record and nowhere else.
+
+ #include "../Common/AutoExposureShared.hlsli"
+
+@@ -77,6 +76,12 @@ float BinLowerLog2Luminance(uint binEdge)
+     return MinimumLog2Luminance + ((Log2LuminanceSpan() * float(binEdge)) / float(BinCount));
+ }
+
++float BinCentreLog2Luminance(uint bin)
++{
++    float numerator = Log2LuminanceSpan() * ((2.0f * float(bin)) + 1.0f);
++    return MinimumLog2Luminance + (numerator / (2.0f * float(BinCount)));
++}
++
+ struct SampleClassification
+ {
+     uint accepted;
+@@ -523,6 +528,25 @@ groupshared uint gsOverflow;
+ // Metering
+ // ---------------------------------------------------------------------------------------------------------------
+
++// floor(totalWeight * percentileFixed / PercentileOne), exactly, in 32-bit arithmetic.
++//
++// This is the one multiply in the chapter that can leave the width of its accumulator: the lab's total weight
++// reaches 2^26 and a percentile reaches 10^6, so the naive product needs 46 bits. Doing it in floats instead would
++// move a boundary that lands exactly on a bin edge to whichever side the last mantissa bit fell, which is precisely
++// the reproducibility the integer weights were chosen to protect.
++//
++// W = 10^6 * q + r, so W * P / 10^6 = q * P + r * P / 10^6, and the second term is split again by writing
++// P = 1000 * a + b, which keeps every intermediate below 2^30.
++uint PercentilePosition(uint totalWeight, uint percentileFixed)
++{
++    uint q = totalWeight / PercentileOne;
++    uint r = totalWeight % PercentileOne;
++    uint a = percentileFixed / 1000u;
++    uint b = percentileFixed % 1000u;
++    uint high = (a * r) + ((b * r) / 1000u);
++    return (q * percentileFixed) + (high / 1000u);
++}
++
+ [numthreads(1, 1, 1)] void MeterCS(uint3 dispatchThreadId : SV_DispatchThreadID)
+ {
+     if (dispatchThreadId.x != 0u)
+@@ -564,9 +588,176 @@ groupshared uint gsOverflow;
+     meter.highestOccupiedBin = highest;
+     meter.hasOccupiedBin = hasOccupied;
+
+-    // No metering policy has been written yet, so the status word stays exactly zero: not MeterEvaluated, because
+-    // nothing was metered, and not one of the refusal reasons either, because this stage tested for none of them.
+-    // The exposure stage reads that absence and holds its declared exposure rather than acting on a number this
+-    // stage did not produce.
++    if (statistics.hasAcceptedSample == 0u || statistics.acceptedWeight == 0u)
++    {
++        meter.status = MeterNoAcceptedSamples;
++        Meter[0] = meter;
++        return;
++    }
++    // No accepted sample carried a positive luminance, which under the CountInLowestBin policy is exactly what an
++    // all-black frame looks like: accepted samples, accepted weight, and an occupied lowest bin. It is refused here,
++    // before any estimator can report the lowest bin's centre as though a measurement had happened. The test is
++    // exact and takes no logarithm of zero.
++    if (statistics.log2AccumulatedWeight == 0u)
++    {
++        meter.status = MeterNoPositiveLuminance;
++        Meter[0] = meter;
++        return;
++    }
++
++    // Every accepted sample lies within half a bin of its recorded bin centre unless it was black or was saturated
++    // into an end bin. Either fact breaks the bound, so it is published as invalid rather than quietly quoted.
++    bool bounded = statistics.zeroLuminanceWeight == 0u && statistics.belowRangeWeight == 0u &&
++                   statistics.aboveRangeWeight == 0u;
++    meter.status = MeterEvaluated | (bounded ? MeterBinCentreBounded : 0u);
++
++    float totalRealWeight = float(statistics.acceptedWeight) / float(WeightOne);
++
++    if (MeteringPolicyId == PolicyPercentileWindow)
++    {
++        // A percentile boundary is an integer position inside the accumulated weight, so it is exactly reproducible
++        // for a given histogram. It is not independent of how much weight the frame accumulated, and this is the one
++        // policy that cannot be exact: the distribution is only known to bin resolution.
++        uint lowerTarget = PercentilePosition(statistics.acceptedWeight, LowerPercentileFixed);
++        uint upperTarget = PercentilePosition(statistics.acceptedWeight, UpperPercentileFixed);
++        meter.lowerTargetWeight = lowerTarget;
++        meter.upperTargetWeight = upperTarget;
++
++        uint firstBin = 0u;
++        uint lastBin = 0u;
++        uint windowWeight = 0u;
++        float log2Luminance = 0.0f;
++
++        if (upperTarget == lowerTarget)
++        {
++            // The two boundaries quantized onto the same position. That happens when the percentiles are equal, and
++            // also for two distinct percentiles separated by less than one unit of weight. Reporting the bin that
++            // owns that position is how a plain median is requested, so it is answered rather than refused.
++            uint position = min(lowerTarget, statistics.acceptedWeight - 1u);
++            uint cumulative = 0u;
++            bool found = false;
++            for (uint bin = 0u; bin < BinCount; ++bin)
++            {
++                cumulative += Histogram[bin].weight;
++                if (!found && cumulative > position)
++                {
++                    found = true;
++                    firstBin = bin;
++                    lastBin = bin;
++                    windowWeight = Histogram[bin].weight;
++                    log2Luminance = BinCentreLog2Luminance(bin);
++                }
++            }
++            if (!found)
++            {
++                meter.status = MeterNoAcceptedSamples;
++                Meter[0] = meter;
++                return;
++            }
++            meter.status |= MeterDegenerateWindow;
++        }
++        else
++        {
++            float weightedLog2Sum = 0.0f;
++            uint cumulative = 0u;
++            bool hasFirst = false;
++            for (uint bin = 0u; bin < BinCount; ++bin)
++            {
++                uint binStart = cumulative;
++                cumulative += Histogram[bin].weight;
++                uint overlapLow = max(binStart, lowerTarget);
++                uint overlapHigh = min(cumulative, upperTarget);
++                if (overlapHigh <= overlapLow)
++                {
++                    continue;
++                }
++                uint overlap = overlapHigh - overlapLow;
++                if (!hasFirst)
++                {
++                    hasFirst = true;
++                    firstBin = bin;
++                }
++                lastBin = bin;
++                windowWeight += overlap;
++                weightedLog2Sum += float(overlap) * BinCentreLog2Luminance(bin);
++            }
++            if (!hasFirst || windowWeight == 0u)
++            {
++                meter.status = MeterNoAcceptedSamples;
++                Meter[0] = meter;
++                return;
++            }
++            log2Luminance = weightedLog2Sum / float(windowWeight);
++        }
++
++        meter.firstWindowBin = firstBin;
++        meter.lastWindowBin = lastBin;
++        meter.windowWeight = windowWeight;
++        meter.windowLowerLog2Luminance = BinLowerLog2Luminance(firstBin);
++        meter.windowUpperLog2Luminance = BinLowerLog2Luminance(lastBin + 1u);
++        meter.meteredLog2Luminance = log2Luminance;
++        meter.meteredLuminance = exp2(log2Luminance);
++        // The percentile answer *is* a bin-centre reconstruction by definition, so it is published as such rather
++        // than being flagged as an exact statistic.
++        meter.binCentreLog2Luminance = log2Luminance;
++        Meter[0] = meter;
++        return;
++    }
++
++    meter.status |= MeterUsedExactStatistic;
++    if (MeteringPolicyId == PolicyArithmeticMean)
++    {
++        float binCentreSum = 0.0f;
++        for (uint bin = 0u; bin < BinCount; ++bin)
++        {
++            uint binWeight = Histogram[bin].weight;
++            if (binWeight == 0u)
++            {
++                continue;
++            }
++            binCentreSum += (float(binWeight) / float(WeightOne)) * exp2(BinCentreLog2Luminance(bin));
++        }
++        float binCentreMean = binCentreSum / totalRealWeight;
++        meter.binCentreLog2Luminance = binCentreMean > 0.0f ? log2(binCentreMean) : 0.0f;
++
++        // The exact statistic, not a reconstruction: a bin records how much weight fell inside it, not where inside
++        // it, so any mean recovered from bin centres is quantized and this one is not.
++        float mean = statistics.weightedLuminanceSum / totalRealWeight;
++        if (!isfinite(mean) || mean <= 0.0f)
++        {
++            meter.status = MeterNoPositiveLuminance;
++            Meter[0] = meter;
++            return;
++        }
++        meter.meteredLuminance = mean;
++        meter.meteredLog2Luminance = log2(mean);
++        Meter[0] = meter;
++        return;
++    }
++
++    float binCentreLog2Sum = 0.0f;
++    for (uint bin = 0u; bin < BinCount; ++bin)
++    {
++        uint binWeight = Histogram[bin].weight;
++        if (binWeight == 0u)
++        {
++            continue;
++        }
++        binCentreLog2Sum += (float(binWeight) / float(WeightOne)) * BinCentreLog2Luminance(bin);
++    }
++    meter.binCentreLog2Luminance = binCentreLog2Sum / totalRealWeight;
++
++    // The log average is normalized by the weight that actually contributed a logarithm, which is smaller than the
++    // accepted weight exactly when black samples were accepted into the lowest bin.
++    float logWeight = float(statistics.log2AccumulatedWeight) / float(WeightOne);
++    float logAverage = statistics.weightedLog2LuminanceSum / logWeight;
++    if (!isfinite(logAverage))
++    {
++        meter.status = MeterNoPositiveLuminance;
++        Meter[0] = meter;
++        return;
++    }
++    meter.meteredLog2Luminance = logAverage;
++    meter.meteredLuminance = exp2(logAverage);
+     Meter[0] = meter;
+ }

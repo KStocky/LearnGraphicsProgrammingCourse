@@ -1,0 +1,183 @@
+diff --git a/chapters/auto-exposure-metering-and-eye-adaptation/Starter/AutoExposureLab.hlsl b/chapters/auto-exposure-metering-and-eye-adaptation/Starter/AutoExposureLab.hlsl
+--- a/chapters/auto-exposure-metering-and-eye-adaptation/Starter/AutoExposureLab.hlsl
++++ b/chapters/auto-exposure-metering-and-eye-adaptation/Starter/AutoExposureLab.hlsl
+@@ -1,25 +1,14 @@
+-// Chapter 31 checkpoint 1: the whole exposure graph runs, and every stage in it is honest about what it has not
+-// measured.
++// Chapter 31 checkpoint 2: the classified samples become a log2 histogram.
+ //
+-// The lab becomes the Solution variant here, so the renderer compiles HistogramCS, ReduceCS, and MeterCS as well
+-// as the four entry points the Starter owned, creates a pipeline state for each of them, and submits the stage
+-// list BuildExecutedStages declares for the Solution: Clear, Scene, Histogram, Reduce, Meter, Adapt, Compose.
+-// Every one of those stages therefore has to exist before any of them can be an algorithm, and each does only the
+-// part of its job that needs nothing accumulated:
++// HistogramCS now accumulates. Each group clears a tile histogram in group-shared memory, adds every accepted
++// sample's integer weight into the bin it was classified into, tallies the black, below-range, above-range, and
++// rejected samples the classifier already distinguished, and merges the tile into the frame histogram with
++// integer atomics, so the merged distribution is identical whatever order the tiles complete in. The overflow
++// flags are checked rather than assumed.
+ //
+-//   * HistogramCS weights each sample in integer fixed point, classifies it against the published bin edges, and
+-//     writes the weight, the bin, the classification, and the rejection reason into that pixel's record. It adds
+-//     nothing into the histogram, the tile partials, or the frame statistics, so no bin carries a count yet.
+-//   * ReduceCS folds the tile partials in tile-index order. Nothing writes a partial yet, so it folds zeros and
+-//     publishes an empty frame's statistics; the order is declared now because the answer must never be allowed
+-//     to depend on which tile finished first.
+-//   * MeterCS publishes the distribution evidence it can read and no metering policy at all, so its status word
+-//     stays zero: not evaluated, and not refused either, because it tested nothing.
+-//   * ExposureCS publishes a declared exposure - the manual stops, or the reset seed when an automatic frame has
+-//     no measurement to work from - and writes it into the history slot the adaptation step will read.
+-//
+-// The one-frame delay, the metering policies, the target, and the adaptation are not here. Each patch that
+-// follows replaces one of these stand-ins with the thing it stands in for.
++// Everything downstream is still a stand-in. The tile partials are untouched, so the accepted weight, the two
++// real-valued sums, and the observed luminance range are all still zero; MeterCS still publishes no policy; and
++// ExposureCS still publishes a declared exposure. The frame now has a distribution and nothing that reads it.
+
+ #include "../Common/AutoExposureShared.hlsli"
+
+@@ -224,16 +213,51 @@ SampleClassification ClassifySample(float3 storedSceneLinear, float preExposure,
+ }
+
+ // ---------------------------------------------------------------------------------------------------------------
+-// Sample weighting and classification. One thread's decision about one sample, and nothing that accumulates.
++// Histogram construction
+ // ---------------------------------------------------------------------------------------------------------------
+
+-[numthreads(8, 8, 1)] void HistogramCS(uint3 dispatchThreadId : SV_DispatchThreadID)
++groupshared uint gsBinWeight[MaximumBinCount];
++groupshared uint gsBinSampleCount[MaximumBinCount];
++// Integer tallies. Addition is associative and commutative, so a group-shared atomic is exactly reproducible here
++// no matter which thread arrives first.
++groupshared uint gsRejectedByReason[8];
++groupshared uint gsRejectedCount;
++groupshared uint gsRejectedWeight;
++groupshared uint gsBelowRangeCount;
++groupshared uint gsBelowRangeWeight;
++groupshared uint gsAboveRangeCount;
++groupshared uint gsAboveRangeWeight;
++groupshared uint gsZeroLuminanceCount;
++groupshared uint gsZeroLuminanceWeight;
++groupshared uint gsOverflow;
++
++[numthreads(8, 8, 1)] void HistogramCS(uint3 dispatchThreadId : SV_DispatchThreadID, uint groupIndex : SV_GroupIndex)
+ {
+     uint2 extent = uint2(DisplayWidth, DisplayHeight);
+
+-    // The per-sample work is guarded rather than returned from, because the group-wide accumulation this stage
+-    // grows in the next step has to be reached by every thread in the group, including the threads whose pixel
+-    // lies outside the frame.
++    for (uint clearBin = groupIndex; clearBin < MaximumBinCount; clearBin += HistogramGroupThreads)
++    {
++        gsBinWeight[clearBin] = 0u;
++        gsBinSampleCount[clearBin] = 0u;
++    }
++    if (groupIndex < 8u)
++    {
++        gsRejectedByReason[groupIndex] = 0u;
++    }
++    if (groupIndex == 0u)
++    {
++        gsRejectedCount = 0u;
++        gsRejectedWeight = 0u;
++        gsBelowRangeCount = 0u;
++        gsBelowRangeWeight = 0u;
++        gsAboveRangeCount = 0u;
++        gsAboveRangeWeight = 0u;
++        gsZeroLuminanceCount = 0u;
++        gsZeroLuminanceWeight = 0u;
++        gsOverflow = 0u;
++    }
++    GroupMemoryBarrierWithGroupSync();
++
+     bool inside = dispatchThreadId.x < DisplayWidth && dispatchThreadId.y < DisplayHeight;
+     if (inside)
+     {
+@@ -280,5 +304,87 @@ SampleClassification ClassifySample(float3 storedSceneLinear, float preExposure,
+         record.accepted = sample.accepted;
+         record.status |= StatusWeighted | StatusClassified;
+         Records[index] = record;
++
++        if (sample.accepted != 0u)
++        {
++            uint priorTileWeight;
++            InterlockedAdd(gsBinWeight[sample.bin], weight, priorTileWeight);
++            InterlockedAdd(gsBinSampleCount[sample.bin], 1u);
++            if ((MaximumTileWeight - priorTileWeight) < weight)
++            {
++                // Structurally unreachable for a group of HistogramGroupThreads samples at WeightOne each, and
++                // checked anyway: a wrapped tile histogram is indistinguishable from a correct one downstream.
++                InterlockedOr(gsOverflow, OverflowTileWeight);
++            }
++
++            if (sample.classification == BinClassZero)
++            {
++                InterlockedAdd(gsZeroLuminanceCount, 1u);
++                InterlockedAdd(gsZeroLuminanceWeight, weight);
++            }
++            else if (sample.classification == BinClassBelowRange)
++            {
++                InterlockedAdd(gsBelowRangeCount, 1u);
++                InterlockedAdd(gsBelowRangeWeight, weight);
++            }
++            else if (sample.classification == BinClassAboveRange)
++            {
++                InterlockedAdd(gsAboveRangeCount, 1u);
++                InterlockedAdd(gsAboveRangeWeight, weight);
++            }
++        }
++        else
++        {
++            InterlockedAdd(gsRejectedCount, 1u);
++            InterlockedAdd(gsRejectedWeight, weight);
++            InterlockedAdd(gsRejectedByReason[sample.rejection], 1u);
++        }
++    }
++    GroupMemoryBarrierWithGroupSync();
++
++    // One thread publishes the tile's integer tallies into the frame statistics. Nothing real-valued is summed
++    // here yet, so the accepted weight, the observed range, and the two sums the estimators need stay at the zero
++    // the clear stage wrote.
++    if (groupIndex == 0u)
++    {
++        InterlockedAdd(Statistics[0].rejectedSampleCount, gsRejectedCount);
++        InterlockedAdd(Statistics[0].rejectedWeight, gsRejectedWeight);
++        InterlockedAdd(Statistics[0].belowRangeSampleCount, gsBelowRangeCount);
++        InterlockedAdd(Statistics[0].belowRangeWeight, gsBelowRangeWeight);
++        InterlockedAdd(Statistics[0].aboveRangeSampleCount, gsAboveRangeCount);
++        InterlockedAdd(Statistics[0].aboveRangeWeight, gsAboveRangeWeight);
++        InterlockedAdd(Statistics[0].zeroLuminanceSampleCount, gsZeroLuminanceCount);
++        InterlockedAdd(Statistics[0].zeroLuminanceWeight, gsZeroLuminanceWeight);
++        InterlockedAdd(Statistics[0].rejectedNone, gsRejectedByReason[RejectNone]);
++        InterlockedAdd(Statistics[0].rejectedNonFiniteChannel, gsRejectedByReason[RejectNonFiniteChannel]);
++        InterlockedAdd(Statistics[0].rejectedNegativeChannel, gsRejectedByReason[RejectNegativeChannel]);
++        InterlockedAdd(Statistics[0].rejectedLuminanceOutOfDomain, gsRejectedByReason[RejectLuminanceOutOfDomain]);
++        InterlockedAdd(Statistics[0].rejectedZeroWeight, gsRejectedByReason[RejectZeroWeight]);
++        InterlockedAdd(Statistics[0].rejectedZeroLuminance, gsRejectedByReason[RejectZeroLuminance]);
++        InterlockedAdd(Statistics[0].rejectedBelowRange, gsRejectedByReason[RejectBelowRange]);
++        InterlockedAdd(Statistics[0].rejectedAboveRange, gsRejectedByReason[RejectAboveRange]);
++        if (gsOverflow != 0u)
++        {
++            InterlockedOr(Statistics[0].overflowFlags, gsOverflow);
++        }
++    }
++
++    // Every thread merges part of the tile histogram into the frame histogram. These are integer atomics, so the
++    // merged result is identical whatever order the tiles complete in, which is exactly why the weights are
++    // integers in the first place.
++    for (uint mergeBin = groupIndex; mergeBin < BinCount; mergeBin += HistogramGroupThreads)
++    {
++        uint tileWeight = gsBinWeight[mergeBin];
++        if (tileWeight == 0u && gsBinSampleCount[mergeBin] == 0u)
++        {
++            continue;
++        }
++        uint priorWeight;
++        InterlockedAdd(Histogram[mergeBin].weight, tileWeight, priorWeight);
++        InterlockedAdd(Histogram[mergeBin].sampleCount, gsBinSampleCount[mergeBin]);
++        if ((0xFFFFFFFFu - priorWeight) < tileWeight)
++        {
++            InterlockedOr(Statistics[0].overflowFlags, OverflowBinWeight);
++        }
+     }
+ }
