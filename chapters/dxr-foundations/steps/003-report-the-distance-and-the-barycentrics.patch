@@ -1,0 +1,44 @@
+diff --git a/chapters/dxr-foundations/Starter/DxrLab.hlsl b/chapters/dxr-foundations/Starter/DxrLab.hlsl
+--- a/chapters/dxr-foundations/Starter/DxrLab.hlsl
++++ b/chapters/dxr-foundations/Starter/DxrLab.hlsl
+@@ -1,20 +1,16 @@
+-// Chapter 33 checkpoint 2: the closest-hit shader reports the identity the traversal resolved.
++// Chapter 33 checkpoint 3: the closest-hit shader reports the geometry of the hit.
+ //
+-// A hit is not a boolean. The traversal that found it already knows which instance of the top-level structure it
+-// belongs to, which identifier that instance carries, which triangle of the bottom-level geometry it is, and
+-// which side of that triangle the ray arrived from, and DXR exposes each of those to the closest-hit shader as an
+-// intrinsic rather than as something the shader searches for.
++// `RayTCurrent()` is the parametric distance of the committed hit along the ray. Every ray in this lab has a
++// unit-length direction, so it is a distance in metres, and every surface in the scene is a plane perpendicular
++// to the ray, so the values it is allowed to take are known before the frame runs.
+ //
+-//   * `InstanceIndex()` is the instance's position in the top-level structure and `InstanceID()` is the 24-bit
+-//     value its instance description carries. This lab deliberately gives the two different values, so a record
+-//     that reports both proves which of them a reader is looking at.
+-//   * `PrimitiveIndex()` is the triangle's index inside its geometry, which is the only way to see that one
+-//     bottom-level structure holds more than one triangle.
+-//   * `HitKind()` is the object-space winding test D3D12 specifies: `HIT_KIND_TRIANGLE_FRONT_FACE` for a triangle
+-//     whose vertices wind clockwise as seen from the ray, and `HIT_KIND_TRIANGLE_BACK_FACE` otherwise. It is
+-//     decided from object-space vertices and the transformed ray; this scene's x mirror therefore preserves it.
++// The barycentric attributes are where inside the triangle the intersection landed. DXR hands a triangle
++// closest-hit shader a `BuiltInTriangleIntersectionAttributes` whose two floats are the pair (b1, b2) that
++// weights the vertices as v0 * (1 - b1 - b2) + v1 * b1 + v2 * b2. Only two of the three weights are stored
++// because the third is implied, which is why the attribute size the state object declares is eight bytes rather
++// than twelve.
+ //
+-// The distance, the barycentrics, the record the traversal selected and the colour it carries are still missing.
++// The record the traversal selected and the colour it carries are still missing, so every hit is still black.
+
+ #include "../Common/DxrShared.hlsli"
+
+@@ -101,6 +97,9 @@ struct LabPayload
+     payload.primitiveIndex = PrimitiveIndex();
+     payload.hitKind = HitKind();
+     payload.missShaderIndex = InvalidIndex;
++    payload.tHit = RayTCurrent();
++    payload.barycentricB1 = attributes.barycentrics.x;
++    payload.barycentricB2 = attributes.barycentrics.y;
+ }
+
+ // Miss record 0. It reports the index of the record it occupies, which is how a readback proves that

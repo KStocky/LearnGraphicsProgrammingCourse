@@ -1,0 +1,54 @@
+diff --git a/chapters/dxr-foundations/Starter/DxrLab.hlsl b/chapters/dxr-foundations/Starter/DxrLab.hlsl
+--- a/chapters/dxr-foundations/Starter/DxrLab.hlsl
++++ b/chapters/dxr-foundations/Starter/DxrLab.hlsl
+@@ -1,20 +1,21 @@
+-// Chapter 33 checkpoint 4: the material comes from the record the traversal selected.
++// Chapter 33 checkpoint 5: the trace call takes the terms the configuration owns.
+ //
+-// This is the mechanism the chapter exists for. The shader table's hit-group section holds four records that all
+-// name the same hit group and differ only in the five 32-bit values stored after their 32-byte shader
+-// identifiers. Those values are the hit group's *local* root arguments: the state object associates a local root
+-// signature with the hit group and with nothing else, so the runtime binds them from the record the traversal
+-// selected rather than from the command list, and two records that name the same code are two different
+-// materials.
++// `TraceRay` has eight arguments and four of them are policy this checkpoint hands over.
+ //
+-// The selection is D3D12's and the shader cannot influence it. The record index is the sum of four terms - the
+-// ray contribution, the geometry multiplier times the geometry's index inside its bottom-level structure, and the
+-// instance's own contribution - and none of them is visible to the shader that ends up running. A closest-hit
+-// shader that reports the index baked into its own record therefore reports which record the traversal chose,
+-// which no amount of shader arithmetic could prove on its own.
++//   * The ray flags decide which triangles the traversal may accept at all.
++//     `RAY_FLAG_CULL_BACK_FACING_TRIANGLES` and `RAY_FLAG_CULL_FRONT_FACING_TRIANGLES` reject by the same
++//     object-space winding `HitKind()` reports, before any shader runs.
++//   * The 8-bit instance inclusion mask is ANDed with each instance's own mask, and an instance whose bits do not
++//     intersect it is skipped by the traversal rather than by the shader.
++//   * The ray contribution and the geometry multiplier are two of the four terms that select a hit-group record.
+ //
+-// The terms the configuration owns are still fixed at the trace call, so the frame answers only the default
+-// selection.
++// None of these is a shader decision: they are arguments a caller supplies to a fixed-function traversal, which
++// is exactly what makes each of them measurable from the readback. An excluded instance leaves the instance hit
++// counts, a culled facing leaves the front- and back-face counts, and a shifted ray contribution moves every hit
++// one record along without moving any hit.
++//
++// The interval is not on that list because `TMin` and `TMax` have been the configuration's since checkpoint 1:
++// they are fields of the `RayDesc` rather than arguments of the call.
+
+ #include "../Common/DxrShared.hlsli"
+
+@@ -79,10 +80,10 @@ cbuffer HitGroupConstants : register(b1)
+     payload.colorG = 0.0f;
+     payload.colorB = 0.0f;
+
+-    // Every term but the miss record is fixed for now: no ray flags, an inclusion mask that accepts every
+-    // instance, and the first hit-group record with one geometry between records. Passing the configured miss
+-    // index keeps both miss records reachable, and the configured interval is already in the ray itself.
+-    TraceRay(Scene, RAY_FLAG_NONE, 0xffu, 0u, 1u, MissShaderIndex, ray, payload);
++    // The three record-selection terms are passed exactly as the configuration supplies them, so the record the
++    // traversal picks is the record the chapter's own arithmetic predicts.
++    TraceRay(Scene, ConfiguredRayFlags, InstanceInclusionMask, RayContributionToHitGroupIndex,
++             MultiplierForGeometryContribution, MissShaderIndex, ray, payload);
+
+     RayRecord record = LabMakeMissRecord();
+     record.status = payload.status;

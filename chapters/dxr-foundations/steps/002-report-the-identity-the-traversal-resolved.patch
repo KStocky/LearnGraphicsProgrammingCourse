@@ -1,0 +1,58 @@
+diff --git a/chapters/dxr-foundations/Starter/DxrLab.hlsl b/chapters/dxr-foundations/Starter/DxrLab.hlsl
+--- a/chapters/dxr-foundations/Starter/DxrLab.hlsl
++++ b/chapters/dxr-foundations/Starter/DxrLab.hlsl
+@@ -1,25 +1,20 @@
+-// Chapter 33 checkpoint 1: the traversal answers the ray, and the library reports only that.
++// Chapter 33 checkpoint 2: the closest-hit shader reports the identity the traversal resolved.
+ //
+-// The lab becomes the Solution variant here, so the renderer stops compiling this file as a `cs_6_0` compute
+-// shader and starts compiling it at runtime as a `lib_6_3` DXIL library. Around that library it now builds a
+-// one-geometry bottom-level structure, packs three row-major 3x4 instances and builds a top-level structure over
+-// them, resolves the library into a raytracing state object with a global root signature and a hit-group-local
+-// root signature, records a shader table of one ray generation record, two miss records and four hit-group
+-// records, and submits `SetPipelineState1` and `DispatchRays`. Nine ordered stages replace the Starter's three,
+-// and the stage list, the ledger, the recorded barriers and the prebuild report in the readback are the frame's
+-// own account of that.
++// A hit is not a boolean. The traversal that found it already knows which instance of the top-level structure it
++// belongs to, which identifier that instance carries, which triangle of the bottom-level geometry it is, and
++// which side of that triangle the ray arrived from, and DXR exposes each of those to the closest-hit shader as an
++// intrinsic rather than as something the shader searches for.
+ //
+-// The library is deliberately at its beginning. It declares the payload the state object sizes, forms the same
+-// primary ray the Starter formed, hands it to a single `TraceRay`, and publishes what came back:
++//   * `InstanceIndex()` is the instance's position in the top-level structure and `InstanceID()` is the 24-bit
++//     value its instance description carries. This lab deliberately gives the two different values, so a record
++//     that reports both proves which of them a reader is looking at.
++//   * `PrimitiveIndex()` is the triangle's index inside its geometry, which is the only way to see that one
++//     bottom-level structure holds more than one triangle.
++//   * `HitKind()` is the object-space winding test D3D12 specifies: `HIT_KIND_TRIANGLE_FRONT_FACE` for a triangle
++//     whose vertices wind clockwise as seen from the ray, and `HIT_KIND_TRIANGLE_BACK_FACE` otherwise. It is
++//     decided from object-space vertices and the transformed ray; this scene's x mirror therefore preserves it.
+ //
+-//   * `ClosestHitMain` reports that it ran and that the ray hit a triangle. It reports nothing else yet, so every
+-//     hit still publishes an invalid instance, primitive and record index, a distance of zero and no colour.
+-//   * `MissBackground` and `MissVoid` are complete. Each reports the index of the record it occupies, which is
+-//     what separates "a miss shader ran" from "the miss record this dispatch selected ran".
+-//
+-// The identity the traversal resolved, the geometry of the hit, the record it selected and the terms the
+-// configuration owns each arrive in a later checkpoint, and every field none of them has written yet reads back
+-// as the invalid value the ray generation shader put there.
++// The distance, the barycentrics, the record the traversal selected and the colour it carries are still missing.
+
+ #include "../Common/DxrShared.hlsli"
+
+@@ -99,7 +94,13 @@ struct LabPayload
+ [shader("closesthit")] void ClosestHitMain(inout LabPayload payload,
+                                            in BuiltInTriangleIntersectionAttributes attributes)
+ {
+-    payload.status |= StatusHit | StatusClosestHitRan;
++    bool frontFace = HitKind() == HIT_KIND_TRIANGLE_FRONT_FACE;
++    payload.status |= StatusHit | StatusClosestHitRan | (frontFace ? StatusFrontFace : StatusBackFace);
++    payload.instanceIndex = InstanceIndex();
++    payload.instanceId = InstanceID();
++    payload.primitiveIndex = PrimitiveIndex();
++    payload.hitKind = HitKind();
++    payload.missShaderIndex = InvalidIndex;
+ }
+
+ // Miss record 0. It reports the index of the record it occupies, which is how a readback proves that

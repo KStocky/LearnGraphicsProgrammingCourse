@@ -126,3 +126,7 @@ lgp_chapter_is_selected("screen-space-reflections-and-indirect-lighting" selecte
 if(selected)
     add_subdirectory("screen-space-reflections-and-indirect-lighting")
 endif()
+lgp_chapter_is_selected("dxr-foundations" selected)
+if(selected)
+    add_subdirectory("dxr-foundations")
+endif()

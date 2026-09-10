@@ -1,0 +1,79 @@
+diff --git a/chapters/dxr-foundations/Starter/DxrLab.hlsl b/chapters/dxr-foundations/Starter/DxrLab.hlsl
+--- a/chapters/dxr-foundations/Starter/DxrLab.hlsl
++++ b/chapters/dxr-foundations/Starter/DxrLab.hlsl
+@@ -1,16 +1,20 @@
+-// Chapter 33 checkpoint 3: the closest-hit shader reports the geometry of the hit.
++// Chapter 33 checkpoint 4: the material comes from the record the traversal selected.
+ //
+-// `RayTCurrent()` is the parametric distance of the committed hit along the ray. Every ray in this lab has a
+-// unit-length direction, so it is a distance in metres, and every surface in the scene is a plane perpendicular
+-// to the ray, so the values it is allowed to take are known before the frame runs.
++// This is the mechanism the chapter exists for. The shader table's hit-group section holds four records that all
++// name the same hit group and differ only in the five 32-bit values stored after their 32-byte shader
++// identifiers. Those values are the hit group's *local* root arguments: the state object associates a local root
++// signature with the hit group and with nothing else, so the runtime binds them from the record the traversal
++// selected rather than from the command list, and two records that name the same code are two different
++// materials.
+ //
+-// The barycentric attributes are where inside the triangle the intersection landed. DXR hands a triangle
+-// closest-hit shader a `BuiltInTriangleIntersectionAttributes` whose two floats are the pair (b1, b2) that
+-// weights the vertices as v0 * (1 - b1 - b2) + v1 * b1 + v2 * b2. Only two of the three weights are stored
+-// because the third is implied, which is why the attribute size the state object declares is eight bytes rather
+-// than twelve.
++// The selection is D3D12's and the shader cannot influence it. The record index is the sum of four terms - the
++// ray contribution, the geometry multiplier times the geometry's index inside its bottom-level structure, and the
++// instance's own contribution - and none of them is visible to the shader that ends up running. A closest-hit
++// shader that reports the index baked into its own record therefore reports which record the traversal chose,
++// which no amount of shader arithmetic could prove on its own.
+ //
+-// The record the traversal selected and the colour it carries are still missing, so every hit is still black.
++// The terms the configuration owns are still fixed at the trace call, so the frame answers only the default
++// selection.
+
+ #include "../Common/DxrShared.hlsli"
+
+@@ -37,6 +41,18 @@ struct LabPayload
+     float colorB;
+ };
+
++// The hit group's local root signature. These five 32-bit values are stored inside each hit-group shader-table
++// record, immediately after its 32-byte shader identifier. Two records that name the same hit group and carry
++// different values here are two different materials, and that is the whole mechanism.
++cbuffer HitGroupConstants : register(b1)
++{
++    uint HitGroupMaterialId;
++    uint HitGroupRecordIndex;
++    float HitGroupColorR;
++    float HitGroupColorG;
++    float HitGroupColorB;
++};
++
+ [shader("raygeneration")] void RayGenerationMain()
+ {
+     uint2 pixel = DispatchRaysIndex().xy;
+@@ -91,15 +107,24 @@ struct LabPayload
+                                            in BuiltInTriangleIntersectionAttributes attributes)
+ {
+     bool frontFace = HitKind() == HIT_KIND_TRIANGLE_FRONT_FACE;
+-    payload.status |= StatusHit | StatusClosestHitRan | (frontFace ? StatusFrontFace : StatusBackFace);
++    payload.status |= StatusHit | StatusClosestHitRan | StatusLocalRootArgumentsRead |
++                      (frontFace ? StatusFrontFace : StatusBackFace);
+     payload.instanceIndex = InstanceIndex();
+     payload.instanceId = InstanceID();
+     payload.primitiveIndex = PrimitiveIndex();
+     payload.hitKind = HitKind();
++    payload.hitGroupRecordIndex = HitGroupRecordIndex;
++    payload.materialId = HitGroupMaterialId;
+     payload.missShaderIndex = InvalidIndex;
+     payload.tHit = RayTCurrent();
+     payload.barycentricB1 = attributes.barycentrics.x;
+     payload.barycentricB2 = attributes.barycentrics.y;
++
++    float3 shaded = LabShadeHit(float3(HitGroupColorR, HitGroupColorG, HitGroupColorB), attributes.barycentrics.x,
++                                attributes.barycentrics.y, frontFace);
++    payload.colorR = shaded.r;
++    payload.colorG = shaded.g;
++    payload.colorB = shaded.b;
+ }
+
+ // Miss record 0. It reports the index of the record it occupies, which is how a readback proves that

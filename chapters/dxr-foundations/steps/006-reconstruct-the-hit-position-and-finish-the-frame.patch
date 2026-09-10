@@ -1,0 +1,72 @@
+diff --git a/chapters/dxr-foundations/Starter/DxrLab.hlsl b/chapters/dxr-foundations/Starter/DxrLab.hlsl
+--- a/chapters/dxr-foundations/Starter/DxrLab.hlsl
++++ b/chapters/dxr-foundations/Starter/DxrLab.hlsl
+@@ -1,21 +1,19 @@
+-// Chapter 33 checkpoint 5: the trace call takes the terms the configuration owns.
++// Chapter 33 Solution: the DXR 1.0 raytracing pipeline itself.
+ //
+-// `TraceRay` has eight arguments and four of them are policy this checkpoint hands over.
++// This library is compiled at runtime as `lib_6_3` and linked into a raytracing state object with one triangle hit
++// group, two miss shaders, a global root signature and a hit-group-local root signature. Everything the Starter
++// had to do by hand happens here in fixed-function traversal:
+ //
+-//   * The ray flags decide which triangles the traversal may accept at all.
+-//     `RAY_FLAG_CULL_BACK_FACING_TRIANGLES` and `RAY_FLAG_CULL_FRONT_FACING_TRIANGLES` reject by the same
+-//     object-space winding `HitKind()` reports, before any shader runs.
+-//   * The 8-bit instance inclusion mask is ANDed with each instance's own mask, and an instance whose bits do not
+-//     intersect it is skipped by the traversal rather than by the shader.
+-//   * The ray contribution and the geometry multiplier are two of the four terms that select a hit-group record.
++//   * The instance inclusion mask, the strict `TMin < t < TMax` interval, the nearest-hit search and the
++//     object-space facing test are all arguments to a single `TraceRay`, not a loop.
++//   * The identity the closest-hit shader reports - `InstanceIndex`, `InstanceID`, `PrimitiveIndex`, `HitKind`,
++//     `RayTCurrent` and the barycentric attributes - comes from the traversal, not from the shader's own search.
++//   * The material comes from the *record the traversal selected*. `HitGroupRecordIndex` and the colour below are
++//     local root arguments living inside a shader-table record; the shader cannot compute which record it is in,
++//     so a record that reports its own index is direct evidence of the shader-table indexing arithmetic.
+ //
+-// None of these is a shader decision: they are arguments a caller supplies to a fixed-function traversal, which
+-// is exactly what makes each of them measurable from the readback. An excluded instance leaves the instance hit
+-// counts, a culled facing leaves the front- and back-face counts, and a shifted ray contribution moves every hit
+-// one record along without moving any hit.
+-//
+-// The interval is not on that list because `TMin` and `TMax` have been the configuration's since checkpoint 1:
+-// they are fields of the `RayDesc` rather than arguments of the call.
++// Recursion depth is one and there is exactly one `TraceRay` in the library, so the pipeline config the state
++// object declares is the pipeline the shaders actually need.
+
+ #include "../Common/DxrShared.hlsli"
+
+@@ -100,6 +98,13 @@ cbuffer HitGroupConstants : register(b1)
+     record.colorR = payload.colorR;
+     record.colorG = payload.colorG;
+     record.colorB = payload.colorB;
++    if ((payload.status & StatusHit) != 0u)
++    {
++        float3 position = ray.Origin + payload.tHit * ray.Direction;
++        record.worldPositionX = position.x;
++        record.worldPositionY = position.y;
++        record.worldPositionZ = position.z;
++    }
+
+     LabStoreRecord(pixel, record);
+ }
+diff --git a/chapters/dxr-foundations/Starter/Main.cpp b/chapters/dxr-foundations/Starter/Main.cpp
+--- a/chapters/dxr-foundations/Starter/Main.cpp
++++ b/chapters/dxr-foundations/Starter/Main.cpp
+@@ -4,11 +4,11 @@
+
+ int wmain(int argc, wchar_t **argv)
+ {
+-    std::puts("Ch33 Solution in progress: the frame builds a bottom-level and a top-level acceleration structure,");
+-    std::puts("resolves a runtime lib_6_3 library into a raytracing state object, records a shader table and");
+-    std::puts("dispatches rays into it. The library answers each ray with only the evidence it has been given the");
+-    std::puts("code to publish, so the per-pixel records, the stage list and the frame counters say which parts of");
+-    std::puts("the DXR frame exist yet, and the remaining patches fill the rest in one at a time.");
++    std::puts("Ch33 Solution: the DXR 1.0 frame as nine ordered stages, each publishing its own evidence. A one-");
++    std::puts("geometry triangle bottom-level build, the barrier the top-level build needs, a top-level build or");
++    std::puts("refit of three instances, the barrier the dispatch needs, a runtime lib_6_3 library resolved into a");
++    std::puts("raytracing state object with a hit-group-local root signature, a shader table whose four hit-group");
++    std::puts("records report the index the traversal selected, SetPipelineState1, DispatchRays, and the readback.");
+     std::puts("Keys: V view, S scene, M miss record, R ray contribution, 1/2/3 instance mask, F face culling,");
+     std::puts("      T ray interval, B rebuild/refit.");
+     ch33::dxr::solution::Renderer renderer{};

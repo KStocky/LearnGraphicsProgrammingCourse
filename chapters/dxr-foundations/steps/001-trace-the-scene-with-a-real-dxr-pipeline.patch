@@ -1,0 +1,392 @@
+diff --git a/chapters/dxr-foundations/Starter/DxrLab.hlsl b/chapters/dxr-foundations/Starter/DxrLab.hlsl
+--- a/chapters/dxr-foundations/Starter/DxrLab.hlsl
++++ b/chapters/dxr-foundations/Starter/DxrLab.hlsl
+@@ -1,217 +1,129 @@
+-// Chapter 33 Starter: the same question, answered without a raytracing pipeline.
++// Chapter 33 checkpoint 1: the traversal answers the ray, and the library reports only that.
+ //
+-// This shader is the honest baseline the chapter starts from. It generates the same primary ray as the Solution,
+-// walks the instance array itself, transforms the ray into each instance's object space, intersects the two
+-// triangles with Moller-Trumbore, applies the same instance inclusion mask, the same strict `TMin < t < TMax`
+-// interval and the same object-space facing rule, computes the same hit-group record index with the same three
+-// terms, and writes the same per-pixel record. It is everything a learner can already do with a compute shader.
++// The lab becomes the Solution variant here, so the renderer stops compiling this file as a `cs_6_0` compute
++// shader and starts compiling it at runtime as a `lib_6_3` DXIL library. Around that library it now builds a
++// one-geometry bottom-level structure, packs three row-major 3x4 instances and builds a top-level structure over
++// them, resolves the library into a raytracing state object with a global root signature and a hit-group-local
++// root signature, records a shader table of one ray generation record, two miss records and four hit-group
++// records, and submits `SetPipelineState1` and `DispatchRays`. Nine ordered stages replace the Starter's three,
++// and the stage list, the ledger, the recorded barriers and the prebuild report in the readback are the frame's
++// own account of that.
+ //
+-// What it cannot do, and does not pretend to:
++// The library is deliberately at its beginning. It declares the payload the state object sizes, forms the same
++// primary ray the Starter formed, hands it to a single `TraceRay`, and publishes what came back:
+ //
+-//   * It builds no acceleration structure. The traversal below is a linear scan over three instances and two
+-//     triangles, which is exactly why it is a baseline and not a renderer: its cost is the scene's size.
+-//   * It has no shader table. It reads a material out of a structured buffer with an index it computed itself,
+-//     and it never sets `StatusLocalRootArgumentsRead`, because nothing selected a record for it.
+-//   * It runs no closest-hit or miss shader, so it never sets `StatusClosestHitRan` or `StatusMissShaderRan`.
+-//     Those bits are the Solution's to set, and a test reads them to prove that neither variant is quietly
+-//     running the other's mechanism.
++//   * `ClosestHitMain` reports that it ran and that the ray hit a triangle. It reports nothing else yet, so every
++//     hit still publishes an invalid instance, primitive and record index, a distance of zero and no colour.
++//   * `MissBackground` and `MissVoid` are complete. Each reports the index of the record it occupies, which is
++//     what separates "a miss shader ran" from "the miss record this dispatch selected ran".
+ //
+-// Everything it does publish - the identity, the distance, the barycentrics, the facing and the record index - is
+-// the same ABI the Solution publishes, so the two can be compared record for record.
++// The identity the traversal resolved, the geometry of the hit, the record it selected and the terms the
++// configuration owns each arrive in a later checkpoint, and every field none of them has written yet reads back
++// as the invalid value the ray generation shader put there.
+
+ #include "../Common/DxrShared.hlsli"
+
+-#ifdef LGP_CH33_ANALYTIC
++#ifdef LGP_CH33_RAYTRACING
+
+-// Mirrors the HLSL RAY_FLAG bits the configuration can set. The Starter reads them from the constant buffer
+-// because the analytic traversal has to apply them itself; the Solution passes the same bits to `TraceRay`.
+-static const uint LabRayFlagCullBackFacing = 0x10u;
+-static const uint LabRayFlagCullFrontFacing = 0x20u;
+-
+-// The magnitude below which the ray is treated as parallel to the triangle's plane. It is a rejection threshold,
+-// not a fudge factor added to a hit: a candidate this close to parallel has no usable barycentrics.
+-static const float LabParallelDeterminantEpsilon = 1e-12f;
+-
+-float3 LabTransformPoint(float4 row0, float4 row1, float4 row2, float3 position)
+-{
+-    return float3(dot(row0.xyz, position) + row0.w, dot(row1.xyz, position) + row1.w,
+-                  dot(row2.xyz, position) + row2.w);
+-}
+-
+-float3 LabTransformDirection(float4 row0, float4 row1, float4 row2, float3 direction)
+-{
+-    return float3(dot(row0.xyz, direction), dot(row1.xyz, direction), dot(row2.xyz, direction));
+-}
+-
+-struct TriangleCandidate
++// The payload, declared as scalars so that its 56 bytes are unambiguous and match the `MaxPayloadSizeInBytes` the
++// state object declares. It carries facts, not shading state: what was hit, which record answered, how far away it
++// was, and which stages ran.
++struct LabPayload
+ {
+-    bool accepted;
+-    float t;
+-    float b1;
+-    float b2;
+-    bool frontFace;
++    uint status;
++    uint instanceIndex;
++    uint instanceId;
++    uint primitiveIndex;
++    uint hitKind;
++    uint hitGroupRecordIndex;
++    uint materialId;
++    uint missShaderIndex;
++    float tHit;
++    float barycentricB1;
++    float barycentricB2;
++    float colorR;
++    float colorG;
++    float colorB;
+ };
+
+-// Moller-Trumbore, with the two decisions this chapter cares about spelled out rather than folded into the
+-// arithmetic: the interval is strict at both ends, and facing is the sign of the determinant, which is the
+-// object-space winding test D3D12 specifies.
+-TriangleCandidate LabIntersectTriangle(float3 origin, float3 direction, float3 v0, float3 v1, float3 v2, float tMin,
+-                                       float tMax)
++[shader("raygeneration")] void RayGenerationMain()
+ {
+-    TriangleCandidate candidate;
+-    candidate.accepted = false;
+-    candidate.t = 0.0f;
+-    candidate.b1 = 0.0f;
+-    candidate.b2 = 0.0f;
+-    candidate.frontFace = true;
+-
+-    float3 edge1 = v1 - v0;
+-    float3 edge2 = v2 - v0;
+-    float3 pvec = cross(direction, edge2);
+-    float determinant = dot(edge1, pvec);
+-    if (abs(determinant) < LabParallelDeterminantEpsilon)
+-    {
+-        return candidate;
+-    }
+-
+-    float inverseDeterminant = 1.0f / determinant;
+-    float3 tvec = origin - v0;
+-    float b1 = dot(tvec, pvec) * inverseDeterminant;
+-    if (b1 < 0.0f || b1 > 1.0f)
+-    {
+-        return candidate;
+-    }
+-
+-    float3 qvec = cross(tvec, edge1);
+-    float b2 = dot(direction, qvec) * inverseDeterminant;
+-    if (b2 < 0.0f || b1 + b2 > 1.0f)
+-    {
+-        return candidate;
+-    }
++    uint2 pixel = DispatchRaysIndex().xy;
++
++    RayDesc ray;
++    ray.Origin = LabRayOrigin(pixel);
++    ray.Direction = LabRayDirection();
++    ray.TMin = RayTMin;
++    ray.TMax = RayTMax;
++
++    LabPayload payload;
++    payload.status = StatusTraversalRan | StatusFixedFunctionTraversal;
++    payload.instanceIndex = InvalidIndex;
++    payload.instanceId = InvalidIndex;
++    payload.primitiveIndex = InvalidIndex;
++    payload.hitKind = 0u;
++    payload.hitGroupRecordIndex = InvalidIndex;
++    payload.materialId = InvalidIndex;
++    payload.missShaderIndex = InvalidIndex;
++    payload.tHit = 0.0f;
++    payload.barycentricB1 = 0.0f;
++    payload.barycentricB2 = 0.0f;
++    payload.colorR = 0.0f;
++    payload.colorG = 0.0f;
++    payload.colorB = 0.0f;
++
++    // Every term but the miss record is fixed for now: no ray flags, an inclusion mask that accepts every
++    // instance, and the first hit-group record with one geometry between records. Passing the configured miss
++    // index keeps both miss records reachable, and the configured interval is already in the ray itself.
++    TraceRay(Scene, RAY_FLAG_NONE, 0xffu, 0u, 1u, MissShaderIndex, ray, payload);
+
+-    float t = dot(edge2, qvec) * inverseDeterminant;
+-    if (!(t > tMin && t < tMax))
+-    {
+-        return candidate;
+-    }
++    RayRecord record = LabMakeMissRecord();
++    record.status = payload.status;
++    record.instanceIndex = payload.instanceIndex;
++    record.instanceId = payload.instanceId;
++    record.primitiveIndex = payload.primitiveIndex;
++    record.hitKind = payload.hitKind;
++    record.hitGroupRecordIndex = payload.hitGroupRecordIndex;
++    record.materialId = payload.materialId;
++    record.missShaderIndex = payload.missShaderIndex;
++    record.tHit = payload.tHit;
++    record.barycentricB1 = payload.barycentricB1;
++    record.barycentricB2 = payload.barycentricB2;
++    record.colorR = payload.colorR;
++    record.colorG = payload.colorG;
++    record.colorB = payload.colorB;
+
+-    candidate.accepted = true;
+-    candidate.t = t;
+-    candidate.b1 = b1;
+-    candidate.b2 = b2;
+-    // The determinant is the negated triple product of the direction with the winding normal, so a positive
+-    // determinant is a triangle whose vertices appear clockwise from the ray origin: front facing, in D3D12's
+-    // terms. It is computed on object-space vertices with an object-space ray. The instance transform carries the
+-    // ray into that space but never rewinds the vertices; this scene's x mirror therefore preserves facing.
+-    candidate.frontFace = determinant > 0.0f;
+-    return candidate;
++    LabStoreRecord(pixel, record);
+ }
+
+-[numthreads(8, 8, 1)]
+-void AnalyticTraceCS(uint3 dispatchThreadId : SV_DispatchThreadID)
++[shader("closesthit")] void ClosestHitMain(inout LabPayload payload,
++                                           in BuiltInTriangleIntersectionAttributes attributes)
+ {
+-    uint2 pixel = dispatchThreadId.xy;
+-    if (pixel.x >= Width || pixel.y >= Height)
+-    {
+-        return;
+-    }
+-
+-    float3 worldOrigin = LabRayOrigin(pixel);
+-    float3 worldDirection = LabRayDirection();
+-
+-    RayRecord record = LabMakeMissRecord();
+-    record.status = StatusTraversalRan | StatusAnalyticTraversal | StatusMiss;
+-
+-    bool cullBackFacing = (ConfiguredRayFlags & LabRayFlagCullBackFacing) != 0u;
+-    bool cullFrontFacing = (ConfiguredRayFlags & LabRayFlagCullFrontFacing) != 0u;
+-
+-    float nearest = RayTMax;
+-    bool found = false;
+-    uint bestInstance = InvalidIndex;
+-    uint bestPrimitive = InvalidIndex;
+-    float bestT = 0.0f;
+-    float bestB1 = 0.0f;
+-    float bestB2 = 0.0f;
+-    bool bestFrontFace = true;
+-
+-    for (uint instanceIndex = 0u; instanceIndex < InstanceCount; ++instanceIndex)
+-    {
+-        InstanceRecord instance = Instances[instanceIndex];
+-        if ((instance.instanceMask & InstanceInclusionMask) == 0u)
+-        {
+-            continue;
+-        }
+-
+-        float3 objectOrigin = LabTransformPoint(instance.worldToObjectRow0, instance.worldToObjectRow1,
+-                                                instance.worldToObjectRow2, worldOrigin);
+-        float3 objectDirection = LabTransformDirection(instance.worldToObjectRow0, instance.worldToObjectRow1,
+-                                                       instance.worldToObjectRow2, worldDirection);
+-
+-        for (uint primitiveIndex = 0u; primitiveIndex < 2u; ++primitiveIndex)
+-        {
+-            float3 v0 = Vertices[primitiveIndex * 3u + 0u];
+-            float3 v1 = Vertices[primitiveIndex * 3u + 1u];
+-            float3 v2 = Vertices[primitiveIndex * 3u + 2u];
+-            TriangleCandidate candidate =
+-                LabIntersectTriangle(objectOrigin, objectDirection, v0, v1, v2, RayTMin, nearest);
+-            if (!candidate.accepted)
+-            {
+-                continue;
+-            }
+-            if ((candidate.frontFace && cullFrontFacing) || (!candidate.frontFace && cullBackFacing))
+-            {
+-                continue;
+-            }
+-
+-            found = true;
+-            nearest = candidate.t;
+-            bestInstance = instanceIndex;
+-            bestPrimitive = primitiveIndex;
+-            bestT = candidate.t;
+-            bestB1 = candidate.b1;
+-            bestB2 = candidate.b2;
+-            bestFrontFace = candidate.frontFace;
+-        }
+-    }
+-
+-    if (found)
+-    {
+-        InstanceRecord instance = Instances[bestInstance];
+-        uint recordIndex = LabHitGroupRecordIndex(0u, instance.instanceContributionToHitGroupIndex);
+-        uint clampedRecord = min(recordIndex, MaterialCount - 1u);
+-        MaterialRecord material = Materials[clampedRecord];
+-        float3 materialColor = float3(material.colorR, material.colorG, material.colorB);
++    payload.status |= StatusHit | StatusClosestHitRan;
++}
+
+-        record.status = StatusTraversalRan | StatusAnalyticTraversal | StatusHit |
+-                        (bestFrontFace ? StatusFrontFace : StatusBackFace);
+-        record.instanceIndex = bestInstance;
+-        record.instanceId = instance.instanceId;
+-        record.primitiveIndex = bestPrimitive;
+-        record.hitKind = bestFrontFace ? HitKindFrontFace : HitKindBackFace;
+-        record.hitGroupRecordIndex = recordIndex;
+-        record.materialId = material.materialId;
+-        record.missShaderIndex = InvalidIndex;
+-        record.tHit = bestT;
+-        record.barycentricB1 = bestB1;
+-        record.barycentricB2 = bestB2;
+-        float3 position = worldOrigin + bestT * worldDirection;
+-        record.worldPositionX = position.x;
+-        record.worldPositionY = position.y;
+-        record.worldPositionZ = position.z;
+-        float3 shaded = LabShadeHit(materialColor, bestB1, bestB2, bestFrontFace);
+-        record.colorR = shaded.r;
+-        record.colorG = shaded.g;
+-        record.colorB = shaded.b;
+-    }
+-    else
+-    {
+-        float3 background = LabMissColor(MissShaderIndex, pixel);
+-        record.colorR = background.r;
+-        record.colorG = background.g;
+-        record.colorB = background.b;
+-    }
++// Miss record 0. It reports the index of the record it occupies, which is how a readback proves that
++// `MissShaderIndex` selected a record rather than that "some miss shader ran".
++[shader("miss")] void MissBackground(inout LabPayload payload)
++{
++    payload.status |= StatusMiss | StatusMissShaderRan;
++    payload.missShaderIndex = 0u;
++    float3 background = LabMissColor(0u, DispatchRaysIndex().xy);
++    payload.colorR = background.r;
++    payload.colorG = background.g;
++    payload.colorB = background.b;
++}
+
+-    LabStoreRecord(pixel, record);
++// Miss record 1. Deliberately black, so that switching miss records is visible in the picture and not only in the
++// records buffer.
++[shader("miss")] void MissVoid(inout LabPayload payload)
++{
++    payload.status |= StatusMiss | StatusMissShaderRan;
++    payload.missShaderIndex = 1u;
++    float3 background = LabMissColor(1u, DispatchRaysIndex().xy);
++    payload.colorR = background.r;
++    payload.colorG = background.g;
++    payload.colorB = background.b;
+ }
+
+-#endif // LGP_CH33_ANALYTIC
++#endif // LGP_CH33_RAYTRACING
+diff --git a/chapters/dxr-foundations/Starter/Main.cpp b/chapters/dxr-foundations/Starter/Main.cpp
+--- a/chapters/dxr-foundations/Starter/Main.cpp
++++ b/chapters/dxr-foundations/Starter/Main.cpp
+@@ -4,17 +4,16 @@
+
+ int wmain(int argc, wchar_t **argv)
+ {
+-    std::puts("Ch33 Starter: the same scene, traced without a raytracing pipeline. A compute shader transforms each");
+-    std::puts("ray into every instance's object space, intersects two triangles with Moller-Trumbore, applies the");
+-    std::puts("instance mask, the strict TMin < t < TMax interval and the object-space facing rule, and computes the");
+-    std::puts("hit-group record index itself. It builds no acceleration structure, creates no state object and");
+-    std::puts("uploads no shader table, and the stage ledger says exactly that.");
+-    std::puts("Checkpoint: grid=96x64 scene=paired instances=3 mask=0xFF miss=0 view=final.");
++    std::puts("Ch33 Solution in progress: the frame builds a bottom-level and a top-level acceleration structure,");
++    std::puts("resolves a runtime lib_6_3 library into a raytracing state object, records a shader table and");
++    std::puts("dispatches rays into it. The library answers each ray with only the evidence it has been given the");
++    std::puts("code to publish, so the per-pixel records, the stage list and the frame counters say which parts of");
++    std::puts("the DXR frame exist yet, and the remaining patches fill the rest in one at a time.");
+     std::puts("Keys: V view, S scene, M miss record, R ray contribution, 1/2/3 instance mask, F face culling,");
+-    std::puts("      T ray interval.");
+-    ch33::dxr::starter::Renderer renderer{};
++    std::puts("      T ray interval, B rebuild/refit.");
++    ch33::dxr::solution::Renderer renderer{};
+     lgp::framework::ApplicationConfiguration configuration{};
+-    configuration.title = L"Ch33 DXR Foundations Starter (analytic ray/triangle baseline)";
++    configuration.title = L"Ch33 DXR Foundations Solution (acceleration structures, state object, shader table)";
+     configuration.width = 384U;
+     configuration.height = 256U;
+     auto result = lgp::framework::RunApplication(configuration, argc, argv, renderer);
+diff --git a/chapters/dxr-foundations/Starter/Renderer.cpp b/chapters/dxr-foundations/Starter/Renderer.cpp
+--- a/chapters/dxr-foundations/Starter/Renderer.cpp
++++ b/chapters/dxr-foundations/Starter/Renderer.cpp
+@@ -1,9 +1,9 @@
+ #include "Renderer.hpp"
+
+-namespace ch33::dxr::starter
++namespace ch33::dxr::solution
+ {
+ Renderer::Renderer()
+-    : RendererCore(std::filesystem::path{__FILE__}.parent_path() / "DxrLab.hlsl", gpu::LabVariant::Starter)
++    : RendererCore(std::filesystem::path{__FILE__}.parent_path() / "DxrLab.hlsl", gpu::LabVariant::Solution)
+ {
+ }
+-} // namespace ch33::dxr::starter
++} // namespace ch33::dxr::solution
+diff --git a/chapters/dxr-foundations/Starter/Renderer.hpp b/chapters/dxr-foundations/Starter/Renderer.hpp
+--- a/chapters/dxr-foundations/Starter/Renderer.hpp
++++ b/chapters/dxr-foundations/Starter/Renderer.hpp
+@@ -1,7 +1,7 @@
+ #pragma once
+ #include "../Common/GpuLabSupport.hpp"
+
+-namespace ch33::dxr::starter
++namespace ch33::dxr::solution
+ {
+ using HeadlessTestConfiguration = gpu::LabConfiguration;
+ class Renderer final : public gpu::RendererCore
+@@ -9,4 +9,4 @@ class Renderer final : public gpu::RendererCore
+   public:
+     Renderer();
+ };
+-} // namespace ch33::dxr::starter
++} // namespace ch33::dxr::solution
