@@ -1,0 +1,111 @@
+diff --git a/chapters/transparency-alpha-and-order-independent-compositing/Starter/TransparencyLab.hlsl b/chapters/transparency-alpha-and-order-independent-compositing/Starter/TransparencyLab.hlsl
+--- a/chapters/transparency-alpha-and-order-independent-compositing/Starter/TransparencyLab.hlsl
++++ b/chapters/transparency-alpha-and-order-independent-compositing/Starter/TransparencyLab.hlsl
+@@ -1,15 +1,14 @@
+-// Chapter 32 checkpoint 3: coverage decisions, which are not blends.
++// Chapter 32 checkpoint 4: the weight, and the colour half of the order-independent accumulation.
+ //
+-// FragmentsCS now answers "is this sample present at all" for the panes that asked for it. An alpha test is a hard
+-// threshold on fixed-point alpha: stable in every frame, and destructive of every gradation the alpha carried. A
+-// stochastic decision keeps a set of present-or-absent samples whose expected fraction is the requested alpha:
+-// unbiased, and noisy. Both resolve a fragment's alpha to exactly zero or exactly one, so a decided fragment needs
+-// no ordering to be correct and may write depth, and ForwardCompositeCS writes the depth of the nearest surviving
+-// decided fragment when the policy asks it to.
++// A weighted blended fragment carries a confidence, not a second opacity, which is why the weight is a function of
++// depth alone and why the fragment's alpha enters the accumulation separately and exactly once. The weight is
++// clamped: an unbounded weight would let one fragment win the average outright and turn the technique into an
++// expensive, order-independent way of drawing the nearest fragment.
+ //
+-// The frame stops claiming StatusBlendOnly, because it is no longer true, and the reactive mask gains its
+-// stochastic term. The alpha a pane requested and the alpha a decision resolved are published side by side, which
+-// is what makes the difference between the two decisions and a blend checkable per fragment.
++// OitAccumulateCS now adds each fragment's weighted premultiplied colour and its weighted alpha into whichever
++// accumulator it is visiting, so the resolve finally has a colour to average and its epsilon guard stops firing
++// wherever the layer is present. The revealage the stage has accumulated since checkpoint 2 does not change, which
++// is the point: the coverage was already exact, and it is the colour that is the approximation.
+
+ #include "../Common/TransparencyShared.hlsli"
+
+@@ -85,6 +84,26 @@ void EvaluateStochasticCoverage(uint alphaFixed, uint2 pixel, out uint maskLow,
+     }
+ }
+
++// ---------------------------------------------------------------------------------------------------------------
++// The lesson: the weighted blended weight function. It is a confidence in a fragment, not a second opacity, which
++// is why it is a function of depth alone and why alpha enters the accumulation separately and exactly once. An
++// unbounded weight would make one fragment win the average outright and turn the technique into an expensive,
++// order-independent way of drawing the nearest fragment, which is why the clamp is not optional.
++// ---------------------------------------------------------------------------------------------------------------
++
++float OitFragmentWeight(float viewDepthMetres)
++{
++    if (OitWeightFunctionId == WeightUniform)
++    {
++        return UniformOitWeight;
++    }
++    float nearRatio = viewDepthMetres / OitNearScaleMetres;
++    float farRatio = viewDepthMetres / OitFarScaleMetres;
++    float farSquared = farRatio * farRatio;
++    float denominator = OitDepthWeightBias + (nearRatio * nearRatio) + (farSquared * farSquared * farSquared);
++    return clamp(OitDepthWeightNumerator / denominator, OitMinimumWeight, OitMaximumWeight);
++}
++
+ // The temporal reactive mask reports risk, not policy: this pixel's history is likely to describe something else.
+ // What a resolve should do about it belongs to Chapter 28.
+ float ProbabilisticOr(float left, float right)
+@@ -483,7 +502,7 @@ bool EarlierSubmitted(uint leftDrawOrder, uint leftSlot, uint rightDrawOrder, ui
+         fragment.alpha = alpha;
+         fragment.requestedAlpha = float(paneRequestedAlpha[slot]) / float(FixedOne);
+         fragment.viewDepthMetres = depth;
+-        fragment.oitWeight = 0.0f;
++        fragment.oitWeight = OitFragmentWeight(depth);
+         fragment.fogTransmittance = 1.0f;
+         fragment.refractionOffsetLengthUv = 0.0f;
+         fragment.revealageBefore = 1.0f;
+@@ -708,7 +727,11 @@ bool EarlierSubmitted(uint leftDrawOrder, uint leftSlot, uint rightDrawOrder, ui
+     uint base = index * LabFragmentCapacity;
+     uint count = min(record.storedFragmentCount, LabFragmentCapacity);
+
++    float3 colorSumA = float3(0.0f, 0.0f, 0.0f);
++    float alphaSumA = 0.0f;
+     float revealageA = 1.0f;
++    float3 colorSumB = float3(0.0f, 0.0f, 0.0f);
++    float alphaSumB = 0.0f;
+     float revealageB = 1.0f;
+     uint accumulated = 0u;
+
+@@ -732,21 +755,33 @@ bool EarlierSubmitted(uint leftDrawOrder, uint leftSlot, uint rightDrawOrder, ui
+         }
+
+         FragmentRecord fragment = Fragments[base + position];
++        float weight = fragment.oitWeight;
++        float3 weighted = float3(fragment.premultipliedR, fragment.premultipliedG, fragment.premultipliedB) * weight;
+         if (secondAccumulator)
+         {
++            colorSumB += weighted;
++            alphaSumB += fragment.alpha * weight;
+             revealageB *= 1.0f - fragment.alpha;
+         }
+         else
+         {
++            colorSumA += weighted;
++            alphaSumA += fragment.alpha * weight;
+             revealageA *= 1.0f - fragment.alpha;
+         }
+         ++accumulated;
+     }
+
+     // Merging two partial accumulators is exactly what independent GPU threads writing the same pixel through
+-    // multiplicative blending do, so the merge is written out rather than hidden inside the loop.
++    // additive and multiplicative blending do, so the merge is written out rather than hidden inside the loop.
++    float3 colorSum = colorSumA + colorSumB;
++    float alphaSum = alphaSumA + alphaSumB;
+     float revealage = revealageA * revealageB;
+
++    record.weightedColorSumR = colorSum.r;
++    record.weightedColorSumG = colorSum.g;
++    record.weightedColorSumB = colorSum.b;
++    record.weightedAlphaSum = alphaSum;
+     record.oitRevealage = revealage;
+     record.oitFragmentCount = accumulated;
+     record.status |= StatusOitAccumulated;

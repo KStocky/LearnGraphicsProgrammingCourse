@@ -1,0 +1,242 @@
+diff --git a/chapters/transparency-alpha-and-order-independent-compositing/Starter/TransparencyLab.hlsl b/chapters/transparency-alpha-and-order-independent-compositing/Starter/TransparencyLab.hlsl
+--- a/chapters/transparency-alpha-and-order-independent-compositing/Starter/TransparencyLab.hlsl
++++ b/chapters/transparency-alpha-and-order-independent-compositing/Starter/TransparencyLab.hlsl
+@@ -1,15 +1,15 @@
+-// Chapter 32 checkpoint 5: the frame measures how wrong each approximation is.
++// Chapter 32 checkpoint 6: a bounded screen-space refraction, and the fallback it declares when it cannot have one.
+ //
+-// Three composites have existed since checkpoint 1 and none of them has said anything about the others. ComposeCS
+-// now publishes the four numbers that let a reader rank them: the largest per-channel difference between the
+-// order-independent composite and the sorted reference, the difference in scene luminance between them, the
+-// difference in layer alpha between them - which is where the claim that weighted blended coverage is exact stops
+-// being a claim - and the largest per-channel difference between the per-draw composite and the sorted reference.
++// A refracting pane now displaces its sample of the copy RefractionSourceCS has been taking since checkpoint 1. The
++// whole limitation of the technique is in that sentence: the copy was taken before any transparency was
++// composited, so whatever is not in it cannot be refracted. The requested offset is clamped to a declared maximum,
++// a sample that leaves the frame and a sample that lands on an opaque surface in front of the glass are both
++// refused, and a refused sample degrades to the surface's own texel - clear glass - rather than to a wrong part of
++// the scene.
+ //
+-// The frame also stops assuming its accumulators are safe. A pixel whose candidate count exceeds the authored pane
+-// table or whose weighted alpha sum exceeds the declared bound raises an overflow flag, and the frame publishes the
+-// maximum of every error, of the reactive mask and of the weighted alpha sum as float bit patterns, which order
+-// identically to the non-negative floats themselves.
++// The reactive mask gains its refraction term, because a refracted background moves with the background rather than
++// with the glass, and a fallback counts as fully reactive because the sample position jumps between two texels as
++// the surface moves.
+
+ #include "../Common/TransparencyShared.hlsli"
+
+@@ -431,7 +431,12 @@ bool EarlierSubmitted(uint leftDrawOrder, uint leftSlot, uint rightDrawOrder, ui
+         }
+     }
+
++    uint2 sourceExtent = uint2(DisplayWidth, DisplayHeight);
++    float2 surfaceUv = (float2(pixel) + 0.5f) / float2(sourceExtent);
+     uint fragmentBase = index * LabFragmentCapacity;
++    uint refractionUsed = 0u;
++    uint refractionFallback = RefractionFallbackNone;
++    uint refractionClamped = 0u;
+     uint clusterIndex = 0u;
+     uint clusterSlice = 0u;
+     uint clusterLightOffset = 0u;
+@@ -478,12 +483,107 @@ bool EarlierSubmitted(uint leftDrawOrder, uint leftSlot, uint rightDrawOrder, ui
+         uint lightOffset;
+         uint lightCount;
+         float3 lightScale = ClusterLightScale(fragmentCluster, lightOffset, lightCount);
+-        float3 straight =
++        float3 tint =
+             (float3(float(pane.colorFixedR), float(pane.colorFixedG), float(pane.colorFixedB)) / float(FixedOne)) *
+             lightScale;
+
++        float2 requestedOffset = float2(0.0f, 0.0f);
++        float2 appliedOffset = float2(0.0f, 0.0f);
++        float2 sampledUv = surfaceUv;
++        uint2 candidateTexel = pixel;
++        uint fallback = RefractionFallbackNone;
++        float requestedLength = 0.0f;
++        float3 straight = tint;
++        bool refracts = (pane.flags & PaneRefracts) != 0u && (Flags & FlagEnableRefraction) != 0u;
++        if (refracts)
++        {
++            // The sign of the offset flips on a coarse checker so that one configuration reaches a sample that stays
++            // inside the frame, a sample that leaves it, and a sample that lands on the near block in front of the
++            // glass. The offset is declared in whole texels, so an unclamped sample always lands on a texel centre.
++            int signX = ((pixel.x >> 4u) & 1u) != 0u ? 1 : -1;
++            int signY = ((pixel.y >> 4u) & 1u) != 0u ? 1 : -1;
++            float2 offsetTexels =
++                float2(float(RefractionOffsetTexelsX * signX), float(RefractionOffsetTexelsY * signY));
++            requestedOffset = offsetTexels / float2(sourceExtent);
++            appliedOffset = requestedOffset;
++            requestedLength = length(requestedOffset);
++            if (requestedLength > RefractionMaximumOffsetUv)
++            {
++                appliedOffset = requestedOffset * (RefractionMaximumOffsetUv / requestedLength);
++                refractionClamped = 1u;
++            }
++            float2 candidateUv = surfaceUv + appliedOffset;
++            bool outOfBounds =
++                candidateUv.x < 0.0f || candidateUv.x > 1.0f || candidateUv.y < 0.0f || candidateUv.y > 1.0f;
++            if (!outOfBounds)
++            {
++                candidateTexel = uint2(min((uint)floor(candidateUv.x * float(sourceExtent.x)), sourceExtent.x - 1u),
++                                       min((uint)floor(candidateUv.y * float(sourceExtent.y)), sourceExtent.y - 1u));
++            }
++            uint candidateIndex = (candidateTexel.y * DisplayWidth) + candidateTexel.x;
++            PixelRecord candidateRecord = Records[candidateIndex];
++            // The opaque surface at the offset location is in front of the refracting surface, so it is not behind
++            // the glass at all. Sampling it would drag a foreground object into the refraction and smear it across
++            // the glass, which is the artefact every screen-space refraction implementation is judged on.
++            bool foregroundOccluder = (Flags & FlagRejectForegroundOccluders) != 0u &&
++                                      candidateRecord.hasOpaqueSurface != 0u &&
++                                      candidateRecord.opaqueViewDepthMetres < depth;
++            if (outOfBounds)
++            {
++                fallback = RefractionFallbackOutOfBounds;
++            }
++            else if (foregroundOccluder)
++            {
++                fallback = RefractionFallbackForegroundOccluder;
++            }
++            if (fallback != RefractionFallbackNone)
++            {
++                // The fallback is always the surface's own UV, so a refraction that fails degrades to clear glass
++                // rather than to a wrong part of the scene.
++                appliedOffset = float2(0.0f, 0.0f);
++                sampledUv = surfaceUv;
++            }
++            else
++            {
++                sampledUv = candidateUv;
++            }
++            uint2 sampledTexel = uint2(min((uint)floor(sampledUv.x * float(sourceExtent.x)), sourceExtent.x - 1u),
++                                       min((uint)floor(sampledUv.y * float(sourceExtent.y)), sourceExtent.y - 1u));
++            uint sampledIndex = (sampledTexel.y * DisplayWidth) + sampledTexel.x;
++            float3 refracted = RefractionSource[sampledIndex].rgb;
++            // The glass carries its own shaded radiance plus the background radiance it transmits from the refracted
++            // direction. The transmitted term is a plausible screen-space distortion of a copy of the opaque scene,
++            // not transported light, and nothing here models dispersion, total internal reflection or absorption.
++            straight = tint + refracted;
++            refractionUsed = 1u;
++            refractionFallback = fallback;
++            record.refractionSurfaceU = surfaceUv.x;
++            record.refractionSurfaceV = surfaceUv.y;
++            record.refractionRequestedU = requestedOffset.x;
++            record.refractionRequestedV = requestedOffset.y;
++            record.refractionAppliedU = appliedOffset.x;
++            record.refractionAppliedV = appliedOffset.y;
++            record.refractionSampledU = sampledUv.x;
++            record.refractionSampledV = sampledUv.y;
++            record.refractionRequestedLengthUv = requestedLength;
++            record.refractionAppliedLengthUv = length(appliedOffset);
++            record.refractionSampledTexelX = sampledTexel.x;
++            record.refractionSampledTexelY = sampledTexel.y;
++            record.refractionCandidateTexelX = candidateTexel.x;
++            record.refractionCandidateTexelY = candidateTexel.y;
++            record.refractionCandidateInBounds = outOfBounds ? 0u : 1u;
++        }
++
+         float3 premultiplied = Premultiply(straight, alpha);
+         uint fragmentFlags = FragmentStored;
++        if (refracts)
++        {
++            fragmentFlags |= FragmentRefracted;
++            if (fallback != RefractionFallbackNone)
++            {
++                fragmentFlags |= FragmentRefractionFallback;
++            }
++        }
+         if (pane.coverageMode == CoverageAlphaTest)
+         {
+             fragmentFlags |= FragmentAlphaTested;
+@@ -505,7 +605,7 @@ bool EarlierSubmitted(uint leftDrawOrder, uint leftSlot, uint rightDrawOrder, ui
+         fragment.viewDepthMetres = depth;
+         fragment.oitWeight = OitFragmentWeight(depth);
+         fragment.fogTransmittance = 1.0f;
+-        fragment.refractionOffsetLengthUv = 0.0f;
++        fragment.refractionOffsetLengthUv = length(appliedOffset);
+         fragment.revealageBefore = 1.0f;
+         fragment.revealageAfter = 1.0f;
+         fragment.transmittanceInFront = 1.0f;
+@@ -555,6 +655,9 @@ bool EarlierSubmitted(uint leftDrawOrder, uint leftSlot, uint rightDrawOrder, ui
+     record.stochasticPixelAccepted = stochasticPixelAccepted;
+     record.hasStochasticFragment = hasStochastic;
+     record.overflowed = droppedCount > 0u ? 1u : 0u;
++    record.refractionUsed = refractionUsed;
++    record.refractionFallback = refractionFallback;
++    record.refractionClamped = refractionClamped;
+     record.fragmentSliceIndex = clusterSlice;
+     record.clusterIndex = clusterIndex;
+     record.lightOffset = clusterLightOffset;
+@@ -575,6 +678,14 @@ bool EarlierSubmitted(uint leftDrawOrder, uint leftSlot, uint rightDrawOrder, ui
+     {
+         record.status |= StatusDepthRejected;
+     }
++    if (refractionUsed != 0u)
++    {
++        record.status |= StatusRefractionApplied;
++    }
++    if (refractionFallback != RefractionFallbackNone)
++    {
++        record.status |= StatusRefractionFallback;
++    }
+     Records[index] = record;
+ }
+
+@@ -884,10 +995,11 @@ bool EarlierSubmitted(uint leftDrawOrder, uint leftSlot, uint rightDrawOrder, ui
+     record.foggedG = fogged.g;
+     record.foggedB = fogged.b;
+
+-    // The reactive mask reports risk, not policy. The terms are combined as a probabilistic union so that the
+-    // result is monotonic in every term, never leaves the unit interval, and never double counts a pixel that more
+-    // than one of them describes.
++    // The reactive mask reports risk, not policy. The three terms are combined as a probabilistic union so that the
++    // result is monotonic in every term, never leaves the unit interval, and never double counts a pixel that is
++    // both refractive and stochastic.
+     float alphaTerm = 0.0f;
++    float refractionTerm = 0.0f;
+     float stochasticTerm = 0.0f;
+     if ((Flags & FlagEnableReactiveMask) != 0u)
+     {
+@@ -896,14 +1008,25 @@ bool EarlierSubmitted(uint leftDrawOrder, uint leftSlot, uint rightDrawOrder, ui
+         {
+             alphaTerm = ReactiveAlphaWeight * transparentAlpha;
+         }
++        if (record.refractionUsed != 0u)
++        {
++            // Refraction contributes even when the surface wrote a motion vector, because the refracted background
++            // moves with the background rather than with the glass. A fallback counts as fully reactive: the sample
++            // position jumps between the refracted and the unrefracted texel as the surface moves.
++            float normalized = record.refractionFallback != RefractionFallbackNone
++                                   ? 1.0f
++                                   : min(1.0f, record.refractionAppliedLengthUv / ReactiveReferenceOffsetUv);
++            refractionTerm = ReactiveRefractionWeight * normalized;
++        }
+         if (record.hasStochasticFragment != 0u && (Flags & FlagAnimateStochastic) != 0u)
+         {
+             stochasticTerm = ReactiveStochasticWeight;
+         }
+         record.status |= StatusReactiveMask;
+     }
+-    float combined = ProbabilisticOr(alphaTerm, stochasticTerm);
++    float combined = ProbabilisticOr(ProbabilisticOr(alphaTerm, refractionTerm), stochasticTerm);
+     record.reactiveAlphaTerm = alphaTerm;
++    record.reactiveRefractionTerm = refractionTerm;
+     record.reactiveStochasticTerm = stochasticTerm;
+     record.reactiveMask = min(combined, ReactiveMaximumMask);
+
+@@ -960,6 +1083,14 @@ bool EarlierSubmitted(uint leftDrawOrder, uint leftSlot, uint rightDrawOrder, ui
+     {
+         InterlockedOr(Frame[0].overflowFlags, OverflowWeightedAccumulation);
+     }
++    if (record.refractionUsed != 0u)
++    {
++        InterlockedAdd(Frame[0].refractionPixelCount, 1u);
++        if (record.refractionFallback != RefractionFallbackNone)
++        {
++            InterlockedAdd(Frame[0].refractionFallbackPixelCount, 1u);
++        }
++    }
+     if (record.hasClusterBinding != 0u)
+     {
+         InterlockedAdd(Frame[0].clusterPixelCount, 1u);

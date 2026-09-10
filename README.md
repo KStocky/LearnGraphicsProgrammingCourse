@@ -1,10 +1,10 @@
 # Learn Graphics Programming
 
-Published learner version: `course-v2026.09.09.2`
+Published learner version: `course-v2026.09.10.1`
 
 This is a complete standalone learner repository. It contains the framework,
 Starter and Solution projects, assets, and cumulative teaching patches for every
-chapter available in `course-v2026.09.09.2`. It does not require a checkout of the private
+chapter available in `course-v2026.09.10.1`. It does not require a checkout of the private
 authoring repository.
 
 ## Requirements
@@ -51,6 +51,7 @@ not included in this learner distribution.
 - [Cascaded Shadow Maps](chapters/cascaded-shadow-maps)
 - [G-Buffers and Deferred Shading](chapters/gbuffer-and-deferred-shading)
 - [Tiled, Forward+, and Clustered Lighting](chapters/tiled-forward-plus-and-clustered-lighting)
+- [Transparency, Alpha, and Order-Independent Compositing](chapters/transparency-alpha-and-order-independent-compositing)
 - [Visibility Buffers and Deferred Material Evaluation](chapters/visibility-buffers-and-material-evaluation)
 - [Monte Carlo Sampling Fundamentals](chapters/monte-carlo-sampling-fundamentals)
 - [Importance Sampling and Multiple Importance Sampling](chapters/importance-sampling-and-multiple-importance-sampling)
@@ -62,5 +63,5 @@ not included in this learner distribution.
 - [Auto-Exposure Metering and Eye Adaptation](chapters/auto-exposure-metering-and-eye-adaptation)
 - [Screen-Space Reflections and Indirect Lighting](chapters/screen-space-reflections-and-indirect-lighting)
 
-The matching course site and tagged source archive use the same `course-v2026.09.09.2`
+The matching course site and tagged source archive use the same `course-v2026.09.10.1`
 identifier. Report learner-facing problems in this repository's Issues page.

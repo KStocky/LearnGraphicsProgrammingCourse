@@ -51,6 +51,7 @@ set(
     cascaded-shadow-maps
     gbuffer-and-deferred-shading
     tiled-forward-plus-and-clustered-lighting
+    transparency-alpha-and-order-independent-compositing
     visibility-buffers-and-material-evaluation
     monte-carlo-sampling-fundamentals
     importance-sampling-and-multiple-importance-sampling
@@ -76,7 +77,7 @@ function(lgp_chapter_is_selected chapter result)
     endif()
 endfunction()
 
-set(LGP_COURSE_VERSION "course-v2026.09.09.2" CACHE STRING "Published course version" FORCE)
+set(LGP_COURSE_VERSION "course-v2026.09.10.1" CACHE STRING "Published course version" FORCE)
 set(CMAKE_CXX_STANDARD 23)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)

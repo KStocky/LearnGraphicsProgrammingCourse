@@ -1,0 +1,77 @@
+diff --git a/chapters/transparency-alpha-and-order-independent-compositing/Starter/TransparencyLab.hlsl b/chapters/transparency-alpha-and-order-independent-compositing/Starter/TransparencyLab.hlsl
+--- a/chapters/transparency-alpha-and-order-independent-compositing/Starter/TransparencyLab.hlsl
++++ b/chapters/transparency-alpha-and-order-independent-compositing/Starter/TransparencyLab.hlsl
+@@ -1,14 +1,15 @@
+-// Chapter 32 checkpoint 4: the weight, and the colour half of the order-independent accumulation.
++// Chapter 32 checkpoint 5: the frame measures how wrong each approximation is.
+ //
+-// A weighted blended fragment carries a confidence, not a second opacity, which is why the weight is a function of
+-// depth alone and why the fragment's alpha enters the accumulation separately and exactly once. The weight is
+-// clamped: an unbounded weight would let one fragment win the average outright and turn the technique into an
+-// expensive, order-independent way of drawing the nearest fragment.
++// Three composites have existed since checkpoint 1 and none of them has said anything about the others. ComposeCS
++// now publishes the four numbers that let a reader rank them: the largest per-channel difference between the
++// order-independent composite and the sorted reference, the difference in scene luminance between them, the
++// difference in layer alpha between them - which is where the claim that weighted blended coverage is exact stops
++// being a claim - and the largest per-channel difference between the per-draw composite and the sorted reference.
+ //
+-// OitAccumulateCS now adds each fragment's weighted premultiplied colour and its weighted alpha into whichever
+-// accumulator it is visiting, so the resolve finally has a colour to average and its epsilon guard stops firing
+-// wherever the layer is present. The revealage the stage has accumulated since checkpoint 2 does not change, which
+-// is the point: the coverage was already exact, and it is the colour that is the approximation.
++// The frame also stops assuming its accumulators are safe. A pixel whose candidate count exceeds the authored pane
++// table or whose weighted alpha sum exceeds the declared bound raises an overflow flag, and the frame publishes the
++// maximum of every error, of the reactive mask and of the weighted alpha sum as float bit patterns, which order
++// identically to the non-negative floats themselves.
+
+ #include "../Common/TransparencyShared.hlsli"
+
+@@ -852,6 +853,13 @@ bool EarlierSubmitted(uint leftDrawOrder, uint leftSlot, uint rightDrawOrder, ui
+     float3 objectOver = float3(record.objectOverR, record.objectOverG, record.objectOverB);
+     float3 oitOver = float3(record.oitOverR, record.oitOverG, record.oitOverB);
+
++    // The approximation evidence. Nothing here claims the weighted blended path is exact; these are the numbers that
++    // say by how much it is not, and the order error beside them says the same about the cheaper per-draw order.
++    record.oitChannelError = MaximumChannel(abs(oitOver - sortedOver));
++    record.oitLuminanceError = abs(SceneLuminance(oitOver) - SceneLuminance(sortedOver));
++    record.oitAlphaError = abs(record.oitLayerAlpha - record.sortedLayerAlpha);
++    record.orderChannelError = MaximumChannel(abs(objectOver - sortedOver));
++
+     float3 composite = sortedOver;
+     if (CompositeModeId == CompositeObjectSorted)
+     {
+@@ -921,7 +929,8 @@ bool EarlierSubmitted(uint leftDrawOrder, uint leftSlot, uint rightDrawOrder, ui
+     Records[index] = record;
+
+     // Frame-level evidence. Every counter is an integer, so the totals are a property of the dispatch rather than of
+-    // the order its groups happened to finish in.
++    // the order its groups happened to finish in, and every maximum is accumulated as the bit pattern of a
++    // non-negative float, which orders identically to the float itself.
+     InterlockedAdd(Frame[0].candidateFragmentCount, record.candidateFragmentCount);
+     InterlockedAdd(Frame[0].storedFragmentCount, record.storedFragmentCount);
+     InterlockedAdd(Frame[0].droppedFragmentCount, record.droppedFragmentCount);
+@@ -943,6 +952,14 @@ bool EarlierSubmitted(uint leftDrawOrder, uint leftSlot, uint rightDrawOrder, ui
+         InterlockedAdd(Frame[0].overflowPixelCount, 1u);
+         InterlockedOr(Frame[0].overflowFlags, OverflowFragmentCapacity);
+     }
++    if (record.candidateFragmentCount > LabPaneCount)
++    {
++        InterlockedOr(Frame[0].overflowFlags, OverflowCandidateCount);
++    }
++    if (record.weightedAlphaSum > MaximumWeightedAccumulation)
++    {
++        InterlockedOr(Frame[0].overflowFlags, OverflowWeightedAccumulation);
++    }
+     if (record.hasClusterBinding != 0u)
+     {
+         InterlockedAdd(Frame[0].clusterPixelCount, 1u);
+@@ -952,4 +969,9 @@ bool EarlierSubmitted(uint leftDrawOrder, uint leftSlot, uint rightDrawOrder, ui
+         }
+     }
+     InterlockedMax(Frame[0].maximumStoredFragmentCount, record.storedFragmentCount);
++    InterlockedMax(Frame[0].maximumOitChannelErrorBits, asuint(record.oitChannelError));
++    InterlockedMax(Frame[0].maximumOitAlphaErrorBits, asuint(record.oitAlphaError));
++    InterlockedMax(Frame[0].maximumOrderChannelErrorBits, asuint(record.orderChannelError));
++    InterlockedMax(Frame[0].maximumReactiveMaskBits, asuint(record.reactiveMask));
++    InterlockedMax(Frame[0].maximumWeightedAlphaSumBits, asuint(record.weightedAlphaSum));
+ }

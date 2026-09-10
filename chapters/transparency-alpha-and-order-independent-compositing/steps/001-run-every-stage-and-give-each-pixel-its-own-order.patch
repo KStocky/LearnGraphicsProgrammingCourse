@@ -1,0 +1,719 @@
+diff --git a/chapters/transparency-alpha-and-order-independent-compositing/Starter/Main.cpp b/chapters/transparency-alpha-and-order-independent-compositing/Starter/Main.cpp
+--- a/chapters/transparency-alpha-and-order-independent-compositing/Starter/Main.cpp
++++ b/chapters/transparency-alpha-and-order-independent-compositing/Starter/Main.cpp
+@@ -4,15 +4,14 @@
+
+ int wmain(int argc, wchar_t **argv)
+ {
+-    std::puts("Ch32 Starter: an opaque scene, a CPU per-draw back-to-front sort, and premultiplied source-over.");
+-    std::puts("Every fragment is a blend, every fragment is tested against the opaque depth, and every fragment");
+-    std::puts("consumes the light list of its own depth slice. There is no per-pixel sort, no order-independent");
+-    std::puts("accumulator, no coverage decision, no refraction and no reactive mask.");
+-    std::puts("Checkpoint: display=192x120 scene=showcase composite=per-draw order capacity=8 fog=none.");
+-    std::puts("Keys: V view, S scene.");
+-    ch32::transparency::starter::Renderer renderer{};
++    std::puts("Ch32 Solution in progress: every stage the Solution dispatches runs, and each one publishes only");
++    std::puts("what it has actually computed. The status word, the stage list and the per-pixel record say which");
++    std::puts("parts of the transparency graph exist yet, and the chapter's remaining patches replace the");
++    std::puts("stand-ins one at a time.");
++    std::puts("Keys: V view, S scene, M composite, O traversal, W weight, F fog, K capacity.");
++    ch32::transparency::solution::Renderer renderer{};
+     lgp::framework::ApplicationConfiguration configuration{};
+-    configuration.title = L"Ch32 Transparency Starter (CPU per-draw sorted source-over)";
++    configuration.title = L"Ch32 Transparency, Alpha and Order-Independent Compositing Solution";
+     configuration.width = 192U;
+     configuration.height = 120U;
+     auto result = lgp::framework::RunApplication(configuration, argc, argv, renderer);
+diff --git a/chapters/transparency-alpha-and-order-independent-compositing/Starter/Renderer.cpp b/chapters/transparency-alpha-and-order-independent-compositing/Starter/Renderer.cpp
+--- a/chapters/transparency-alpha-and-order-independent-compositing/Starter/Renderer.cpp
++++ b/chapters/transparency-alpha-and-order-independent-compositing/Starter/Renderer.cpp
+@@ -1,9 +1,9 @@
+ #include "Renderer.hpp"
+
+-namespace ch32::transparency::starter
++namespace ch32::transparency::solution
+ {
+ Renderer::Renderer()
+-    : RendererCore(std::filesystem::path{__FILE__}.parent_path() / "TransparencyLab.hlsl", gpu::LabVariant::Starter)
++    : RendererCore(std::filesystem::path{__FILE__}.parent_path() / "TransparencyLab.hlsl", gpu::LabVariant::Solution)
+ {
+ }
+-} // namespace ch32::transparency::starter
++} // namespace ch32::transparency::solution
+diff --git a/chapters/transparency-alpha-and-order-independent-compositing/Starter/Renderer.hpp b/chapters/transparency-alpha-and-order-independent-compositing/Starter/Renderer.hpp
+--- a/chapters/transparency-alpha-and-order-independent-compositing/Starter/Renderer.hpp
++++ b/chapters/transparency-alpha-and-order-independent-compositing/Starter/Renderer.hpp
+@@ -1,7 +1,7 @@
+ #pragma once
+ #include "../Common/GpuLabSupport.hpp"
+
+-namespace ch32::transparency::starter
++namespace ch32::transparency::solution
+ {
+ using HeadlessTestConfiguration = gpu::LabConfiguration;
+ class Renderer final : public gpu::RendererCore
+@@ -9,4 +9,4 @@ class Renderer final : public gpu::RendererCore
+   public:
+     Renderer();
+ };
+-} // namespace ch32::transparency::starter
++} // namespace ch32::transparency::solution
+diff --git a/chapters/transparency-alpha-and-order-independent-compositing/Starter/TransparencyLab.hlsl b/chapters/transparency-alpha-and-order-independent-compositing/Starter/TransparencyLab.hlsl
+--- a/chapters/transparency-alpha-and-order-independent-compositing/Starter/TransparencyLab.hlsl
++++ b/chapters/transparency-alpha-and-order-independent-compositing/Starter/TransparencyLab.hlsl
+@@ -1,32 +1,36 @@
+-// Chapter 32 Starter: the transparency pass almost every renderer writes first, written honestly.
++// Chapter 32 checkpoint 1: every stage the Solution submits runs, and every pixel finally has an order of its own.
+ //
+-// What this file owns is a complete, runnable, believable transparent surface pass:
++// The lab becomes the Solution variant here, so the renderer compiles RefractionSourceCS, OitAccumulateCS and
++// OitResolveCS as well as the five entry points the Starter owned, creates a pipeline state for each of them, and
++// submits the stage list BuildExecutedStages declares for the Solution: Clear, Opaque, RefractionSource, Fragments,
++// ForwardComposite, OitAccumulate, OitResolve, Compose. Every one of those stages therefore has to exist before any
++// of them can be an algorithm, and each does only the part of its job it can do honestly:
+ //
+-//   * The opaque scene is shaded and its view depth is stored, because a transparent fragment that is behind an
+-//     opaque surface must not be composited at all.
+-//   * The CPU sorts the transparent draws back to front by a representative depth and uploads them in that order.
+-//     This file walks that order, once per pixel, and composites with premultiplied source-over.
+-//   * Every fragment is premultiplied exactly once, and source-over never multiplies by alpha a second time.
+-//   * Every fragment consumes the light list of the cluster its own view depth lands in, not the cluster the opaque
+-//     surface behind it lands in.
++//   * RefractionSourceCS is complete. It copies the lit opaque scene into the buffer a screen-space refraction
++//     reads, before any transparency was composited, which is the single fact that contains every limitation the
++//     technique has. Nothing samples that copy yet, and every fragment record says so.
++//   * FragmentsCS gains the thing a CPU sort cannot give it: a per-pixel order. Each surviving fragment is written
++//     at its position in the declared back-to-front total order - descending view depth, then ascending draw order,
++//     then ascending buffer index - and carries beside it the position the CPU's per-draw order would have given
++//     it. A bounded store keeps at most the declared capacity under the declared policy and counts what it dropped.
++//   * ForwardCompositeCS composites those fragments twice: once in the per-pixel order, which is the reference, and
++//     once in the per-draw order, which is the composite the Starter published as its only result.
++//   * OitAccumulateCS publishes how many stored fragments an order-independent pass would have to visit and
++//     accumulates nothing at all, because it has neither a declared traversal nor a weight yet.
++//   * OitResolveCS is the final resolve equation applied to that empty accumulator: the epsilon guard fires on
++//     every pixel, the layer is empty, and the order-independent composite is the opaque background exactly.
+ //
+-// What this file deliberately does not own, and does not secretly do anywhere:
+-//
+-//   * There is no per-pixel sort. The only order this pass has is the one the CPU handed it, which is a total order
+-//     over the *draws* and is not a per-pixel order. Where two surfaces interpenetrate it is wrong, and this file
+-//     has no way to know that, which is exactly the problem the chapter exists to make measurable.
+-//   * There is no weighted blended accumulation, no revealage target and no resolve. The accumulator fields the
+-//     record carries stay zero and the stage list does not contain the stages that would fill them.
+-//   * There is no coverage decision. Every fragment is a blend, the frame says so through StatusBlendOnly, and the
+-//     alpha-test and stochastic counters stay at zero.
+-//   * There is no refraction source copy and no refraction sample, no fog fold, no bounded store with a keep-and-drop
+-//     rule, and no reactive mask. The configuration validation refuses to switch any of them on.
+-//
+-// The Solution adds those stages one at a time. Nothing in the structure of this file has to change for it to do so,
+-// which is the shape the chapter's patches follow.
++// No coverage decision, no weight, no measured error, no refraction sample, no fog and no stochastic or refractive
++// reactive term is here. Each patch that follows replaces one of these stand-ins with the thing it stands in for.
+
+ #include "../Common/TransparencyShared.hlsli"
+
++// The compact per-pane decision the fragment stage takes once and then ranks. Keeping it small matters: re-deriving
++// it inside a ranking loop would multiply its cost by the number of panes twice over.
++static const uint PaneStateAbsent = 0u;
++static const uint PaneStateDepthRejected = 1u;
++static const uint PaneStateCandidate = 2u;
++
+ // ---------------------------------------------------------------------------------------------------------------
+ // The lesson: the one multiply and the one blend equation.
+ // ---------------------------------------------------------------------------------------------------------------
+@@ -95,8 +99,6 @@ float3 CompositeOverOpaqueBackground(float3 layerColor, float layerAlpha, float3
+     record.netExposureScaleChannel = 0u;
+     record.fogTransmittance = 1.0f;
+     Records[index] = record;
+-    // The refraction source is cleared and never written again: this variant copies no opaque scene and samples
+-    // nothing from one, and a zero buffer beside a zero status bit is what makes that checkable.
+     RefractionSource[index] = float4(0.0f, 0.0f, 0.0f, 0.0f);
+     for (uint slot = 0u; slot < LabFragmentCapacity; ++slot)
+     {
+@@ -106,6 +108,8 @@ float3 CompositeOverOpaqueBackground(float3 layerColor, float layerAlpha, float3
+
+ // ---------------------------------------------------------------------------------------------------------------
+ // Stage: Opaque. The G-buffer and its lighting, and the depth every transparent fragment will be tested against.
++// The opaque surface consumes the cluster of its own depth, which is the correct thing for it to do and is exactly
++// the cluster a transparent fragment must not reuse.
+ // ---------------------------------------------------------------------------------------------------------------
+
+ [numthreads(8, 8, 1)] void OpaqueCS(uint3 dispatchThreadId : SV_DispatchThreadID)
+@@ -150,12 +154,58 @@ float3 CompositeOverOpaqueBackground(float3 layerColor, float layerAlpha, float3
+ }
+
+ // ---------------------------------------------------------------------------------------------------------------
+-// Stage: Fragments. One pass over the panes in the order the CPU sorted them into, keeping the ones the opaque
+-// depth test admits. There is no sort here and no coverage decision: the pane buffer arrives in the declared
+-// per-draw back-to-front order and this loop walks it in index order, which is precisely what "the CPU sorted the
+-// draws" means.
++// Stage: RefractionSource. One copy of the lit opaque scene, taken before any transparency was composited. Whatever
++// is not in this copy cannot be refracted, which is why a second pane of glass behind the first is invisible
++// through it, and why the copy has to be its own stage rather than a re-evaluation of the opaque pass.
+ // ---------------------------------------------------------------------------------------------------------------
+
++[numthreads(8, 8, 1)] void RefractionSourceCS(uint3 dispatchThreadId : SV_DispatchThreadID)
++{
++    if (dispatchThreadId.x >= DisplayWidth || dispatchThreadId.y >= DisplayHeight)
++    {
++        return;
++    }
++    uint index = TexelIndex(dispatchThreadId.xy);
++    PixelRecord record = Records[index];
++    float3 source = float3(record.opaqueR, record.opaqueG, record.opaqueB);
++    RefractionSource[index] = float4(source, 1.0f);
++    record.refractionSourceR = source.r;
++    record.refractionSourceG = source.g;
++    record.refractionSourceB = source.b;
++    record.status |= StatusRefractionSource;
++    Records[index] = record;
++}
++
++// ---------------------------------------------------------------------------------------------------------------
++// Stage: Fragments.
++// ---------------------------------------------------------------------------------------------------------------
++
++// The declared total order, back to front: descending view depth, then ascending draw order, then ascending buffer
++// index. The last key is what makes the order total, so the composite never depends on how the fragments happened
++// to be gathered.
++bool PrecedesInDeclaredOrder(float leftDepth, uint leftDrawOrder, uint leftSlot, float rightDepth,
++                             uint rightDrawOrder, uint rightSlot)
++{
++    if (leftDepth != rightDepth)
++    {
++        return leftDepth > rightDepth;
++    }
++    if (leftDrawOrder != rightDrawOrder)
++    {
++        return leftDrawOrder < rightDrawOrder;
++    }
++    return leftSlot < rightSlot;
++}
++
++bool EarlierSubmitted(uint leftDrawOrder, uint leftSlot, uint rightDrawOrder, uint rightSlot)
++{
++    if (leftDrawOrder != rightDrawOrder)
++    {
++        return leftDrawOrder < rightDrawOrder;
++    }
++    return leftSlot < rightSlot;
++}
++
+ [numthreads(8, 8, 1)] void FragmentsCS(uint3 dispatchThreadId : SV_DispatchThreadID)
+ {
+     if (dispatchThreadId.x >= DisplayWidth || dispatchThreadId.y >= DisplayHeight)
+@@ -170,19 +220,23 @@ float3 CompositeOverOpaqueBackground(float3 layerColor, float layerAlpha, float3
+     bool hasOpaque = record.hasOpaqueSurface != 0u;
+     float opaqueDepth = record.opaqueViewDepthMetres;
+     bool testDepth = (Flags & FlagTestAgainstOpaqueDepth) != 0u;
+-    uint fragmentBase = index * LabFragmentCapacity;
++
++    float paneDepth[LabPaneCount];
++    uint paneState[LabPaneCount];
++    uint paneRequestedAlpha[LabPaneCount];
+
+     uint candidateCount = 0u;
+-    uint storedCount = 0u;
+     uint depthRejected = 0u;
+-    uint clusterIndex = 0u;
+-    uint clusterSlice = 0u;
+-    uint clusterLightOffset = 0u;
+-    uint clusterLightCount = 0u;
+-    uint hasClusterBinding = 0u;
+-    float nearestDepth = 0.0f;
+
+-    for (uint slot = 0u; slot < ActivePaneCount; ++slot)
++    uint slot = 0u;
++    for (slot = 0u; slot < LabPaneCount; ++slot)
++    {
++        paneDepth[slot] = 0.0f;
++        paneState[slot] = PaneStateAbsent;
++        paneRequestedAlpha[slot] = 0u;
++    }
++
++    for (slot = 0u; slot < ActivePaneCount; ++slot)
+     {
+         PaneRecord pane = Panes[slot];
+         if (!PaneCovers(pane, normalized))
+@@ -190,25 +244,117 @@ float3 CompositeOverOpaqueBackground(float3 layerColor, float layerAlpha, float3
+             continue;
+         }
+         float depth = PaneViewDepth(pane, normalized);
++        paneDepth[slot] = depth;
++        paneRequestedAlpha[slot] = PaneAlphaFixed(pane, normalized);
+
+-        // Equal depths are rejected, matching a LESS depth test: a transparent fragment coplanar with the opaque
+-        // surface it is drawn against is z-fighting, and accepting it would make the image depend on precision.
++        // The depth test comes first because a fragment behind the opaque surface never reaches a blend unit at
++        // all. Equal depths are rejected, matching a LESS depth test: a transparent fragment coplanar with the
++        // opaque surface it is drawn against is z-fighting, and accepting it would make the image depend on
++        // precision.
+         if (testDepth && hasOpaque && !(depth < opaqueDepth))
+         {
++            paneState[slot] = PaneStateDepthRejected;
+             ++depthRejected;
+             continue;
+         }
++
++        // Every fragment this checkpoint produces is a blend, whatever coverage mode the pane authored, so the
++        // alpha a pane asks for is the alpha it gets. The frame declares that through StatusBlendOnly rather than
++        // leaving a reader to assume it.
++        paneState[slot] = PaneStateCandidate;
+         ++candidateCount;
+-        if (storedCount >= LabFragmentCapacity)
++    }
++
++    uint capacity = min(FragmentCapacity, LabFragmentCapacity);
++    uint storedCount = 0u;
++    uint droppedCount = 0u;
++
++    // The bounded store's keep-and-drop rule, evaluated without ever materialising a list. A candidate is kept when
++    // fewer than the capacity of other candidates rank ahead of it under the declared policy, so the decision is a
++    // function of the fragment set rather than of the order the panes happened to be visited in. Neither policy is
++    // safe: KeepNearest loses the far fragments a thick stack of glass needs, and KeepFirstSubmitted is not a
++    // function of the geometry at all. Both count what they dropped, which is the only property that makes an
++    // overflowing store debuggable.
++    uint keptMask = 0u;
++    for (slot = 0u; slot < ActivePaneCount; ++slot)
++    {
++        if (paneState[slot] != PaneStateCandidate)
+         {
+             continue;
+         }
++        uint ahead = 0u;
++        for (uint other = 0u; other < ActivePaneCount; ++other)
++        {
++            if (other == slot || paneState[other] != PaneStateCandidate)
++            {
++                continue;
++            }
++            bool ranksAhead;
++            if (OverflowPolicyId == OverflowKeepFirstSubmitted)
++            {
++                ranksAhead = EarlierSubmitted(Panes[other].drawOrder, other, Panes[slot].drawOrder, slot);
++            }
++            else
++            {
++                // KeepNearest keeps the tail of the back-to-front order, so the candidates that rank ahead of this
++                // one are the ones nearer than it.
++                ranksAhead = PrecedesInDeclaredOrder(paneDepth[slot], Panes[slot].drawOrder, slot, paneDepth[other],
++                                                     Panes[other].drawOrder, other);
++            }
++            if (ranksAhead)
++            {
++                ++ahead;
++            }
++        }
++        if (ahead < capacity)
++        {
++            keptMask |= 1u << slot;
++            ++storedCount;
++        }
++        else
++        {
++            ++droppedCount;
++        }
++    }
+
+-        // The pane's authored alpha, used as a blend alpha and nothing else. This variant takes no coverage
+-        // decision, so an alpha-tested or stochastic pane is blended here exactly like every other pane, and the
+-        // frame declares that through StatusBlendOnly rather than leaving a reader to assume it.
+-        uint alphaFixed = PaneAlphaFixed(pane, normalized);
+-        float alpha = float(alphaFixed) / float(FixedOne);
++    uint fragmentBase = index * LabFragmentCapacity;
++    uint clusterIndex = 0u;
++    uint clusterSlice = 0u;
++    uint clusterLightOffset = 0u;
++    uint clusterLightCount = 0u;
++    uint hasClusterBinding = 0u;
++    float nearestDepth = 0.0f;
++
++    for (slot = 0u; slot < ActivePaneCount; ++slot)
++    {
++        if ((keptMask & (1u << slot)) == 0u)
++        {
++            continue;
++        }
++        PaneRecord pane = Panes[slot];
++        float depth = paneDepth[slot];
++        float alpha = float(paneRequestedAlpha[slot]) / float(FixedOne);
++
++        // The declared back-to-front position among the kept fragments, and the position the CPU's per-draw order
++        // would have put this fragment in. Publishing both is what lets the two composites be compared without
++        // either of them re-deriving the other's order.
++        uint sortedPosition = 0u;
++        uint objectPosition = 0u;
++        for (uint other = 0u; other < ActivePaneCount; ++other)
++        {
++            if (other == slot || (keptMask & (1u << other)) == 0u)
++            {
++                continue;
++            }
++            if (PrecedesInDeclaredOrder(paneDepth[other], Panes[other].drawOrder, other, depth, pane.drawOrder, slot))
++            {
++                ++sortedPosition;
++            }
++            if (other < slot)
++            {
++                ++objectPosition;
++            }
++        }
+
+         // The clustered light-list seam. The slice is derived from this fragment's own depth; deriving it from the
+         // opaque surface's depth would light a window with the light list of whatever is behind it.
+@@ -220,7 +366,9 @@ float3 CompositeOverOpaqueBackground(float3 layerColor, float layerAlpha, float3
+         float3 straight =
+             (float3(float(pane.colorFixedR), float(pane.colorFixedG), float(pane.colorFixedB)) / float(FixedOne)) *
+             lightScale;
++
+         float3 premultiplied = Premultiply(straight, alpha);
++        uint fragmentFlags = FragmentStored;
+
+         FragmentRecord fragment = (FragmentRecord)0;
+         fragment.straightR = straight.r;
+@@ -230,7 +378,7 @@ float3 CompositeOverOpaqueBackground(float3 layerColor, float layerAlpha, float3
+         fragment.premultipliedG = premultiplied.g;
+         fragment.premultipliedB = premultiplied.b;
+         fragment.alpha = alpha;
+-        fragment.requestedAlpha = alpha;
++        fragment.requestedAlpha = float(paneRequestedAlpha[slot]) / float(FixedOne);
+         fragment.viewDepthMetres = depth;
+         fragment.oitWeight = 0.0f;
+         fragment.fogTransmittance = 1.0f;
+@@ -242,22 +390,20 @@ float3 CompositeOverOpaqueBackground(float3 layerColor, float layerAlpha, float3
+         fragment.paneIndex = pane.paneIndex;
+         fragment.drawOrder = pane.drawOrder;
+         fragment.primitiveId = pane.primitiveId;
+-        // Every fragment this variant produces is a blend, whatever the pane authored, and it says so.
+         fragment.coverageMode = CoverageAlphaBlend;
+         fragment.outcome = OutcomeComposited;
+-        // The only order this pass has is the CPU's, so the two positions are the same number. That is not a
+-        // per-pixel sort quietly agreeing with a per-draw one; it is the absence of a per-pixel sort.
+-        fragment.sortedPosition = storedCount;
+-        fragment.objectPosition = storedCount;
+-        fragment.flags = FragmentStored;
++        fragment.sortedPosition = sortedPosition;
++        fragment.objectPosition = objectPosition;
++        fragment.flags = fragmentFlags;
+         fragment.clusterIndex = fragmentCluster;
+         fragment.sliceIndex = sliceIndex;
+         fragment.lightOffset = lightOffset;
+         fragment.lightCount = lightCount;
+         fragment.sampleCount = 0u;
+-        Fragments[fragmentBase + storedCount] = fragment;
+-        ++storedCount;
++        Fragments[fragmentBase + sortedPosition] = fragment;
+
++        // The cluster evidence the pixel publishes is the nearest stored fragment's, which is the fragment a viewer
++        // is looking at through everything else.
+         if (hasClusterBinding == 0u || depth < nearestDepth)
+         {
+             nearestDepth = depth;
+@@ -271,21 +417,9 @@ float3 CompositeOverOpaqueBackground(float3 layerColor, float layerAlpha, float3
+
+     record.candidateFragmentCount = candidateCount;
+     record.storedFragmentCount = storedCount;
+-    record.droppedFragmentCount = candidateCount - storedCount;
++    record.droppedFragmentCount = droppedCount;
+     record.depthRejectedCount = depthRejected;
+-    record.coverageRejectedCount = 0u;
+-    record.alphaTestPassCount = 0u;
+-    record.alphaTestFailCount = 0u;
+-    record.stochasticSampleCount = 0u;
+-    record.stochasticAcceptedCount = 0u;
+-    record.stochasticMaskLow = 0u;
+-    record.stochasticMaskHigh = 0u;
+-    record.stochasticPixelAccepted = 0u;
+-    record.hasStochasticFragment = 0u;
+-    record.overflowed = record.droppedFragmentCount > 0u ? 1u : 0u;
+-    record.refractionUsed = 0u;
+-    record.refractionFallback = RefractionFallbackNone;
+-    record.refractionClamped = 0u;
++    record.overflowed = droppedCount > 0u ? 1u : 0u;
+     record.fragmentSliceIndex = clusterSlice;
+     record.clusterIndex = clusterIndex;
+     record.lightOffset = clusterLightOffset;
+@@ -293,22 +427,21 @@ float3 CompositeOverOpaqueBackground(float3 layerColor, float layerAlpha, float3
+     record.hasClusterBinding = hasClusterBinding;
+     record.clusterAmbiguous =
+         (hasClusterBinding != 0u && record.hasOpaqueSurface != 0u && clusterSlice == record.opaqueSliceIndex) ? 1u : 0u;
+-    record.status |= StatusFragments;
+-    if (depthRejected > 0u)
++    record.status |= StatusFragments | StatusPerPixelSorted;
++    if (droppedCount > 0u)
+     {
+-        record.status |= StatusDepthRejected;
++        record.status |= StatusCapacityOverflow;
+     }
+-    if (record.overflowed != 0u)
++    if (depthRejected > 0u)
+     {
+-        record.status |= StatusCapacityOverflow;
++        record.status |= StatusDepthRejected;
+     }
+     Records[index] = record;
+ }
+
+ // ---------------------------------------------------------------------------------------------------------------
+-// Stage: ForwardComposite. One source-over walk, in the order the CPU handed this pass. The per-pixel sorted
+-// reference the Solution publishes has no counterpart here, so those fields stay at the values the clear wrote and
+-// StatusPerPixelSorted is never set.
++// Stage: ForwardComposite. The same fragments composited twice, in two different orders, so the cost of the cheaper
++// order is measured rather than asserted.
+ // ---------------------------------------------------------------------------------------------------------------
+
+ [numthreads(8, 8, 1)] void ForwardCompositeCS(uint3 dispatchThreadId : SV_DispatchThreadID)
+@@ -323,8 +456,8 @@ float3 CompositeOverOpaqueBackground(float3 layerColor, float layerAlpha, float3
+     uint count = min(record.storedFragmentCount, LabFragmentCapacity);
+     float3 background = float3(record.opaqueR, record.opaqueG, record.opaqueB);
+
+-    float3 objectColor = float3(0.0f, 0.0f, 0.0f);
+-    float objectAlpha = 0.0f;
++    float3 sortedColor = float3(0.0f, 0.0f, 0.0f);
++    float sortedAlpha = 0.0f;
+     float revealage = 1.0f;
+     uint composited = 0u;
+     uint fullyTransparent = 0u;
+@@ -337,12 +470,13 @@ float3 CompositeOverOpaqueBackground(float3 layerColor, float layerAlpha, float3
+         fragment.revealageBefore = revealage;
+         if (position > 0u && Fragments[base + position - 1u].viewDepthMetres == fragment.viewDepthMetres)
+         {
++            // A nonzero tie count means the image depends on the declared tie-break rather than on geometry.
+             fragment.flags |= FragmentTiedWithPrevious;
+             ++depthTies;
+         }
+         if (fragment.alpha == 0.0f)
+         {
+-            // Alpha zero with a black premultiplied colour is the source-over identity: recorded as seen and
++            // Alpha zero with a black premultiplied colour is the source-over identity. It is recorded as seen and
+             // excluded from the composited count rather than counted as a contribution that did nothing.
+             fragment.outcome = OutcomeRejectedAsFullyTransparent;
+             fragment.revealageAfter = revealage;
+@@ -351,7 +485,7 @@ float3 CompositeOverOpaqueBackground(float3 layerColor, float layerAlpha, float3
+             continue;
+         }
+         float3 source = float3(fragment.premultipliedR, fragment.premultipliedG, fragment.premultipliedB);
+-        SourceOver(source, fragment.alpha, objectColor, objectAlpha);
++        SourceOver(source, fragment.alpha, sortedColor, sortedAlpha);
+         revealage *= 1.0f - fragment.alpha;
+         fragment.revealageAfter = revealage;
+         fragment.outcome = OutcomeComposited;
+@@ -359,7 +493,9 @@ float3 CompositeOverOpaqueBackground(float3 layerColor, float layerAlpha, float3
+         Fragments[base + position] = fragment;
+     }
+
+-    // Survival is a fact about the fragments in front, so it is only known after the walk finishes.
++    // Survival is a fact about the fragments in front, so it is only known after the walk finishes. A fragment with
++    // a large alpha and a tiny survival fraction is invisible, and that is exactly the fragment a bounded store
++    // should have dropped.
+     float transmittance = 1.0f;
+     for (position = count; position > 0u; --position)
+     {
+@@ -373,11 +509,41 @@ float3 CompositeOverOpaqueBackground(float3 layerColor, float layerAlpha, float3
+         Fragments[slotIndex] = fragment;
+     }
+
++    // The same fragments in the order the CPU sorted the draws into. It is a total order over the draws and it is
++    // not a per-pixel order, which is exactly why the two results differ wherever two surfaces interpenetrate.
++    float3 objectColor = float3(0.0f, 0.0f, 0.0f);
++    float objectAlpha = 0.0f;
++    float objectRevealage = 1.0f;
++    for (position = 0u; position < count; ++position)
++    {
++        for (uint candidate = 0u; candidate < count; ++candidate)
++        {
++            FragmentRecord fragment = Fragments[base + candidate];
++            if (fragment.objectPosition != position || fragment.alpha == 0.0f)
++            {
++                continue;
++            }
++            float3 source = float3(fragment.premultipliedR, fragment.premultipliedG, fragment.premultipliedB);
++            SourceOver(source, fragment.alpha, objectColor, objectAlpha);
++            objectRevealage *= 1.0f - fragment.alpha;
++        }
++    }
++
++    record.sortedLayerR = sortedColor.r;
++    record.sortedLayerG = sortedColor.g;
++    record.sortedLayerB = sortedColor.b;
++    record.sortedLayerAlpha = sortedAlpha;
++    record.sortedRevealage = revealage;
++    float3 sortedOver = CompositeOverOpaqueBackground(sortedColor, sortedAlpha, background);
++    record.sortedOverR = sortedOver.r;
++    record.sortedOverG = sortedOver.g;
++    record.sortedOverB = sortedOver.b;
++
+     record.objectLayerR = objectColor.r;
+     record.objectLayerG = objectColor.g;
+     record.objectLayerB = objectColor.b;
+     record.objectLayerAlpha = objectAlpha;
+-    record.objectRevealage = revealage;
++    record.objectRevealage = objectRevealage;
+     float3 objectOver = CompositeOverOpaqueBackground(objectColor, objectAlpha, background);
+     record.objectOverR = objectOver.r;
+     record.objectOverG = objectOver.g;
+@@ -386,18 +552,83 @@ float3 CompositeOverOpaqueBackground(float3 layerColor, float layerAlpha, float3
+     record.compositedCount = composited;
+     record.fullyTransparentCount = fullyTransparent;
+     record.depthTieCount = depthTies;
+-    record.depthWriteCount = 0u;
+-    record.depthWritten = 0u;
+-    record.writtenViewDepthMetres = 0.0f;
+     record.status |= StatusForwardComposite | StatusObjectOrdered;
+     Records[index] = record;
+ }
+
+ // ---------------------------------------------------------------------------------------------------------------
+-// Stage: Compose. The composite the frame publishes, then one display exposure, the tone curve and the encoding.
+-//
+-// The exposure is applied once, after the composite. Applying it before would expose the transparent layer
+-// differently from the scene behind it; applying it twice would be invisible in the image and obvious in the count.
++// Stage: OitAccumulate. The stage exists and is dispatched, and it has nothing to accumulate: a weighted blended
++// accumulator needs a traversal and a weight, and this checkpoint has declared neither. It therefore publishes the
++// one fact it can establish - how many stored fragments an order-independent pass would have to visit - and leaves
++// both accumulators exactly as the clear left them.
++// ---------------------------------------------------------------------------------------------------------------
++
++[numthreads(8, 8, 1)] void OitAccumulateCS(uint3 dispatchThreadId : SV_DispatchThreadID)
++{
++    if (dispatchThreadId.x >= DisplayWidth || dispatchThreadId.y >= DisplayHeight)
++    {
++        return;
++    }
++    uint index = TexelIndex(dispatchThreadId.xy);
++    PixelRecord record = Records[index];
++    uint count = min(record.storedFragmentCount, LabFragmentCapacity);
++
++    // A zero colour sum, a zero alpha sum and a revealage of one are what the clear wrote, and they are what this
++    // stage leaves behind. Publishing a plausible transparent layer here would make the resolve below look like an
++    // algorithm rather than an equation with nothing in it.
++    record.oitFragmentCount = count;
++    record.status |= StatusOitAccumulated;
++    Records[index] = record;
++}
++
++// ---------------------------------------------------------------------------------------------------------------
++// Stage: OitResolve. The resolve equation in its final form, applied to an accumulator nothing has written. The
++// epsilon guard is a floor on the divisor rather than a clamp on the result, so an empty accumulator resolves to an
++// empty layer instead of dividing by zero, and the composite it publishes is the opaque background exactly. What
++// the technique gets right and what it approximates only become visible once there is something to resolve.
++// ---------------------------------------------------------------------------------------------------------------
++
++[numthreads(8, 8, 1)] void OitResolveCS(uint3 dispatchThreadId : SV_DispatchThreadID)
++{
++    if (dispatchThreadId.x >= DisplayWidth || dispatchThreadId.y >= DisplayHeight)
++    {
++        return;
++    }
++    uint index = TexelIndex(dispatchThreadId.xy);
++    PixelRecord record = Records[index];
++    float3 background = float3(record.opaqueR, record.opaqueG, record.opaqueB);
++    float3 colorSum = float3(record.weightedColorSumR, record.weightedColorSumG, record.weightedColorSumB);
++    float alphaSum = record.weightedAlphaSum;
++    float revealage = record.oitRevealage;
++
++    // The guard is a floor on the divisor, not a clamp on the result: when the accumulated alpha is smaller than
++    // this, the transparent layer is empty enough that its colour cannot matter.
++    bool guarded = alphaSum < OitAlphaEpsilon;
++    float divisor = max(alphaSum, OitAlphaEpsilon);
++    float3 average = colorSum / divisor;
++    float layerAlpha = 1.0f - revealage;
++    float3 layer = average * layerAlpha;
++
++    record.oitAverageR = average.r;
++    record.oitAverageG = average.g;
++    record.oitAverageB = average.b;
++    record.oitLayerR = layer.r;
++    record.oitLayerG = layer.g;
++    record.oitLayerB = layer.b;
++    record.oitLayerAlpha = layerAlpha;
++    float3 over = CompositeOverOpaqueBackground(layer, layerAlpha, background);
++    record.oitOverR = over.r;
++    record.oitOverG = over.g;
++    record.oitOverB = over.b;
++    record.oitUsedAlphaEpsilon = guarded ? 1u : 0u;
++    record.oitFullyRevealed = revealage == 1.0f ? 1u : 0u;
++    record.oitFullyOccluded = revealage == 0.0f ? 1u : 0u;
++    record.status |= StatusOitResolved;
++    Records[index] = record;
++}
++
++// ---------------------------------------------------------------------------------------------------------------
++// Stage: Compose.
+ // ---------------------------------------------------------------------------------------------------------------
+
+ [numthreads(8, 8, 1)] void ComposeCS(uint3 dispatchThreadId : SV_DispatchThreadID)
+@@ -409,27 +640,58 @@ float3 CompositeOverOpaqueBackground(float3 layerColor, float layerAlpha, float3
+     uint index = TexelIndex(dispatchThreadId.xy);
+     PixelRecord record = Records[index];
+
+-    // The only composite this variant has. The approximation and order-error fields the Solution publishes stay at
+-    // zero, because there is no second composite here to measure anything against; publishing a plausible number
+-    // for them would be the one thing an honest baseline must not do.
+-    float3 composite = float3(record.objectOverR, record.objectOverG, record.objectOverB);
++    float3 sortedOver = float3(record.sortedOverR, record.sortedOverG, record.sortedOverB);
++    float3 objectOver = float3(record.objectOverR, record.objectOverG, record.objectOverB);
++    float3 oitOver = float3(record.oitOverR, record.oitOverG, record.oitOverB);
++
++    float3 composite = sortedOver;
++    if (CompositeModeId == CompositeObjectSorted)
++    {
++        composite = objectOver;
++    }
++    else if (CompositeModeId == CompositeWeightedOit)
++    {
++        composite = oitOver;
++    }
+     record.compositeR = composite.r;
+     record.compositeG = composite.g;
+     record.compositeB = composite.b;
+-    record.compositeSource = CompositeObjectSorted;
+-    record.fogTransmittance = 1.0f;
+-    record.foggedR = composite.r;
+-    record.foggedG = composite.g;
+-    record.foggedB = composite.b;
+-    record.status |= StatusFogPerFragment;
++    record.compositeSource = CompositeModeId;
+
+-    // The pre-exposure radiance of this variant is the composite itself: no fog is folded in here, and the record
+-    // says so by publishing a transmittance of one and a fogged colour equal to the composite. Exposing that once
+-    // and dividing the exposure back out of the result is what makes the single multiply checkable.
+-    float3 exposed = composite * DisplayExposureScale;
++    // No fog is folded anywhere in this checkpoint, at either placement, so the frame publishes a transmittance of
++    // exactly one and a fogged colour equal to the composite rather than a plausible number for a stage it does not
++    // run yet.
++    float3 fogged = composite;
++    record.status |= StatusFogPerFragment;
++    record.fogTransmittance = 1.0f;
++    record.foggedR = fogged.r;
++    record.foggedG = fogged.g;
++    record.foggedB = fogged.b;
++
++    // The temporal reactive mask reports risk, not policy: this pixel's history is likely to describe something
++    // else. What a resolve should do about it belongs to Chapter 28. Only one of the three risks the chapter ends
++    // up reporting exists yet, so one term is published and the other two keep the zero the clear wrote.
++    float alphaTerm = 0.0f;
++    if ((Flags & FlagEnableReactiveMask) != 0u)
++    {
++        float transparentAlpha = 1.0f - record.sortedRevealage;
++        if ((Flags & FlagWroteTransparentMotionVector) == 0u)
++        {
++            alphaTerm = ReactiveAlphaWeight * transparentAlpha;
++        }
++        record.status |= StatusReactiveMask;
++    }
++    record.reactiveAlphaTerm = alphaTerm;
++    record.reactiveMask = min(alphaTerm, ReactiveMaximumMask);
++
++    // The one display exposure, applied once, after the composite. Applying it before would expose the transparent
++    // layer differently from the scene behind it; applying it twice would be invisible in the image and obvious in
++    // the published ratio, which is divided back out of this pixel's own radiance rather than copied from the
++    // constant that was uploaded.
++    float3 exposed = fogged * DisplayExposureScale;
+     record.exposedR = exposed.r;
+     record.exposedG = exposed.g;
+     record.exposedB = exposed.b;
+-    PublishNetExposureScale(composite, exposed, record);
++    PublishNetExposureScale(fogged, exposed, record);
+     record.exposureApplicationCount += 1u;
+     record.status |= StatusExposure;

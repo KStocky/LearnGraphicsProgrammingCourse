@@ -1,0 +1,124 @@
+diff --git a/chapters/transparency-alpha-and-order-independent-compositing/Starter/TransparencyLab.hlsl b/chapters/transparency-alpha-and-order-independent-compositing/Starter/TransparencyLab.hlsl
+--- a/chapters/transparency-alpha-and-order-independent-compositing/Starter/TransparencyLab.hlsl
++++ b/chapters/transparency-alpha-and-order-independent-compositing/Starter/TransparencyLab.hlsl
+@@ -1,27 +1,15 @@
+-// Chapter 32 checkpoint 1: every stage the Solution submits runs, and every pixel finally has an order of its own.
++// Chapter 32 checkpoint 2: the order-independent stage accumulates the half of the technique that needs no weight.
+ //
+-// The lab becomes the Solution variant here, so the renderer compiles RefractionSourceCS, OitAccumulateCS and
+-// OitResolveCS as well as the five entry points the Starter owned, creates a pipeline state for each of them, and
+-// submits the stage list BuildExecutedStages declares for the Solution: Clear, Opaque, RefractionSource, Fragments,
+-// ForwardComposite, OitAccumulate, OitResolve, Compose. Every one of those stages therefore has to exist before any
+-// of them can be an algorithm, and each does only the part of its job it can do honestly:
++// OitAccumulateCS now visits the pixel's stored fragments in whichever declared traversal order the configuration
++// asks for - stored, reversed, near to far, even positions then odd, or two independent partial accumulators merged
++// - and multiplies each fragment's transmission into a revealage product. A product is commutative and associative,
++// so every one of those orders has to produce the same revealage, which is how the technique's order independence
++// is measured rather than promised. The two-accumulator merge is written out because that is exactly what
++// independent GPU threads writing the same pixel through multiplicative blending do.
+ //
+-//   * RefractionSourceCS is complete. It copies the lit opaque scene into the buffer a screen-space refraction
+-//     reads, before any transparency was composited, which is the single fact that contains every limitation the
+-//     technique has. Nothing samples that copy yet, and every fragment record says so.
+-//   * FragmentsCS gains the thing a CPU sort cannot give it: a per-pixel order. Each surviving fragment is written
+-//     at its position in the declared back-to-front total order - descending view depth, then ascending draw order,
+-//     then ascending buffer index - and carries beside it the position the CPU's per-draw order would have given
+-//     it. A bounded store keeps at most the declared capacity under the declared policy and counts what it dropped.
+-//   * ForwardCompositeCS composites those fragments twice: once in the per-pixel order, which is the reference, and
+-//     once in the per-draw order, which is the composite the Starter published as its only result.
+-//   * OitAccumulateCS publishes how many stored fragments an order-independent pass would have to visit and
+-//     accumulates nothing at all, because it has neither a declared traversal nor a weight yet.
+-//   * OitResolveCS is the final resolve equation applied to that empty accumulator: the epsilon guard fires on
+-//     every pixel, the layer is empty, and the order-independent composite is the opaque background exactly.
+-//
+-// No coverage decision, no weight, no measured error, no refraction sample, no fog and no stochastic or refractive
+-// reactive term is here. Each patch that follows replaces one of these stand-ins with the thing it stands in for.
++// The colour half of the accumulation is still missing: there is no weight function yet, the weighted colour and
++// alpha sums stay at zero, the resolve's epsilon guard still fires on every pixel, and the order-independent layer
++// therefore has exactly the coverage of the sorted reference and none of its colour.
+
+ #include "../Common/TransparencyShared.hlsli"
+
+@@ -557,10 +545,9 @@ bool EarlierSubmitted(uint leftDrawOrder, uint leftSlot, uint rightDrawOrder, ui
+ }
+
+ // ---------------------------------------------------------------------------------------------------------------
+-// Stage: OitAccumulate. The stage exists and is dispatched, and it has nothing to accumulate: a weighted blended
+-// accumulator needs a traversal and a weight, and this checkpoint has declared neither. It therefore publishes the
+-// one fact it can establish - how many stored fragments an order-independent pass would have to visit - and leaves
+-// both accumulators exactly as the clear left them.
++// Stage: OitAccumulate. A sum and a product, both commutative and associative in exact arithmetic, which is the
++// whole basis of the technique's order independence. The traversal order is a configuration knob precisely so that
++// the independence can be measured instead of promised.
+ // ---------------------------------------------------------------------------------------------------------------
+
+ [numthreads(8, 8, 1)] void OitAccumulateCS(uint3 dispatchThreadId : SV_DispatchThreadID)
+@@ -571,21 +558,60 @@ bool EarlierSubmitted(uint leftDrawOrder, uint leftSlot, uint rightDrawOrder, ui
+     }
+     uint index = TexelIndex(dispatchThreadId.xy);
+     PixelRecord record = Records[index];
++    uint base = index * LabFragmentCapacity;
+     uint count = min(record.storedFragmentCount, LabFragmentCapacity);
+
+-    // A zero colour sum, a zero alpha sum and a revealage of one are what the clear wrote, and they are what this
+-    // stage leaves behind. Publishing a plausible transparent layer here would make the resolve below look like an
+-    // algorithm rather than an equation with nothing in it.
+-    record.oitFragmentCount = count;
++    float revealageA = 1.0f;
++    float revealageB = 1.0f;
++    uint accumulated = 0u;
++
++    for (uint step = 0u; step < count; ++step)
++    {
++        uint position = step;
++        bool secondAccumulator = false;
++        if (OitTraversalId == TraversalReversed || OitTraversalId == TraversalNearToFar)
++        {
++            // The stored order is far to near, so visiting it backwards is near to far.
++            position = count - 1u - step;
++        }
++        else if (OitTraversalId == TraversalEvenThenOdd)
++        {
++            uint evenCount = (count + 1u) / 2u;
++            position = step < evenCount ? (step * 2u) : (((step - evenCount) * 2u) + 1u);
++        }
++        else if (OitTraversalId == TraversalSplitMerge)
++        {
++            secondAccumulator = step >= (count / 2u);
++        }
++
++        FragmentRecord fragment = Fragments[base + position];
++        if (secondAccumulator)
++        {
++            revealageB *= 1.0f - fragment.alpha;
++        }
++        else
++        {
++            revealageA *= 1.0f - fragment.alpha;
++        }
++        ++accumulated;
++    }
++
++    // Merging two partial accumulators is exactly what independent GPU threads writing the same pixel through
++    // multiplicative blending do, so the merge is written out rather than hidden inside the loop.
++    float revealage = revealageA * revealageB;
++
++    record.oitRevealage = revealage;
++    record.oitFragmentCount = accumulated;
+     record.status |= StatusOitAccumulated;
+     Records[index] = record;
+ }
+
+ // ---------------------------------------------------------------------------------------------------------------
+-// Stage: OitResolve. The resolve equation in its final form, applied to an accumulator nothing has written. The
+-// epsilon guard is a floor on the divisor rather than a clamp on the result, so an empty accumulator resolves to an
+-// empty layer instead of dividing by zero, and the composite it publishes is the opaque background exactly. What
+-// the technique gets right and what it approximates only become visible once there is something to resolve.
++// Stage: OitResolve. What the technique gets exactly right is the coverage: revealage is the same product of
++// transmissions the sorted reference accumulates. What it approximates is the colour: every fragment is replaced by
++// the weighted average of all of them, so a red pane in front of a blue one and a blue pane in front of a red one
++// resolve identically. It is exact in two declared cases and only two: a single fragment, and any number of
++// fragments that share a colour.
+ // ---------------------------------------------------------------------------------------------------------------
+
+ [numthreads(8, 8, 1)] void OitResolveCS(uint3 dispatchThreadId : SV_DispatchThreadID)

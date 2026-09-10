@@ -1,0 +1,164 @@
+diff --git a/chapters/transparency-alpha-and-order-independent-compositing/Starter/Main.cpp b/chapters/transparency-alpha-and-order-independent-compositing/Starter/Main.cpp
+--- a/chapters/transparency-alpha-and-order-independent-compositing/Starter/Main.cpp
++++ b/chapters/transparency-alpha-and-order-independent-compositing/Starter/Main.cpp
+@@ -4,10 +4,12 @@
+
+ int wmain(int argc, wchar_t **argv)
+ {
+-    std::puts("Ch32 Solution in progress: every stage the Solution dispatches runs, and each one publishes only");
+-    std::puts("what it has actually computed. The status word, the stage list and the per-pixel record say which");
+-    std::puts("parts of the transparency graph exist yet, and the chapter's remaining patches replace the");
+-    std::puts("stand-ins one at a time.");
++    std::puts("Ch32 Solution: transparency as eight explicit stages, none of which is nominated as the winner.");
++    std::puts("A bounded per-pixel fragment store with a counted overflow, the declared back-to-front reference,");
++    std::puts("the CPU per-draw order beside it with the error between them, alpha testing and stochastic coverage");
++    std::puts("as coverage decisions rather than blends, a weighted blended accumulate and resolve with its own");
++    std::puts("published error, a clustered light-list seam, a bounded screen-space refraction with a declared");
++    std::puts("fallback, fog in the placement the policy asked for, and a temporal reactive mask.");
+-    std::puts("Keys: V view, S scene, M composite, O traversal, W weight, F fog, K capacity.");
++    std::puts("Keys: V view, S scene, M composite, O traversal, W weight, F fog placement, G fog density, K capacity.");
+     ch32::transparency::solution::Renderer renderer{};
+     lgp::framework::ApplicationConfiguration configuration{};
+diff --git a/chapters/transparency-alpha-and-order-independent-compositing/Starter/TransparencyLab.hlsl b/chapters/transparency-alpha-and-order-independent-compositing/Starter/TransparencyLab.hlsl
+--- a/chapters/transparency-alpha-and-order-independent-compositing/Starter/TransparencyLab.hlsl
++++ b/chapters/transparency-alpha-and-order-independent-compositing/Starter/TransparencyLab.hlsl
+@@ -1,15 +1,30 @@
+-// Chapter 32 checkpoint 6: a bounded screen-space refraction, and the fallback it declares when it cannot have one.
++// Chapter 32 Solution: transparency written out as a sequence of stages, each of which publishes the evidence that
++// distinguishes it from the stage beside it.
+ //
+-// A refracting pane now displaces its sample of the copy RefractionSourceCS has been taking since checkpoint 1. The
+-// whole limitation of the technique is in that sentence: the copy was taken before any transparency was
+-// composited, so whatever is not in it cannot be refracted. The requested offset is clamped to a declared maximum,
+-// a sample that leaves the frame and a sample that lands on an opaque surface in front of the glass are both
+-// refused, and a refused sample degrades to the surface's own texel - clear glass - rather than to a wrong part of
+-// the scene.
++// The stage graph, in submission order, is:
+ //
+-// The reactive mask gains its refraction term, because a refracted background moves with the background rather than
+-// with the glass, and a fallback counts as fully reactive because the sample position jumps between two texels as
+-// the surface moves.
++//   Clear             every buffer and counter the frame will accumulate into.
++//   Opaque            the opaque G-buffer and its lighting, which is where the depth every transparent fragment is
++//                     tested against comes from, and which folds fog at its own depth when the policy asks for it.
++//   RefractionSource  a copy of the lit opaque scene. Screen-space refraction reads this copy and nothing else,
++//                     which is the single sentence that contains every limitation the technique has.
++//   Fragments         deterministic per-pixel fragment generation: the coverage decisions, the cluster the fragment
++//                     itself lands in, the bounded screen-space refraction, the per-fragment fog fold, and a bounded
++//                     store with a declared keep-and-drop rule and a counted overflow.
++//   ForwardComposite  source-over twice over the same fragments: once in the declared per-pixel back-to-front total
++//                     order, which is the reference, and once in the order the CPU sorted the draws into, which is
++//                     what a real renderer can afford. The difference between them is published per pixel.
++//   OitAccumulate     weighted blended order-independent accumulation, visited in whichever declared order the
++//                     configuration asks for, so that order independence is measured rather than asserted.
++//   OitResolve        the two accumulators resolved against the opaque background, with the epsilon guard, the
++//                     revealage, and the weighted average that carries no ordering information at all.
++//   Compose           the composite the frame publishes, screen-space fog when the policy asked for that placement,
++//                     the temporal reactive mask, the single display exposure, the tone curve and the encoding.
++//
++// Nothing here claims a winner. The sorted reference is exact for the order it is given and that order is a fiction
++// wherever two surfaces interpenetrate; the per-draw order is cheaper and publishes how wrong it is; weighted
++// blended OIT needs no order and publishes how wrong it is everywhere; and the bounded store is exact until it
++// overflows and then says what it dropped.
+
+ #include "../Common/TransparencyShared.hlsli"
+
+@@ -105,6 +120,32 @@ float OitFragmentWeight(float viewDepthMetres)
+     return clamp(OitDepthWeightNumerator / denominator, OitMinimumWeight, OitMaximumWeight);
+ }
+
++// ---------------------------------------------------------------------------------------------------------------
++// The lesson: fog placement. Folding fog into a fragment at the fragment's own depth is the only placement that can
++// be correct, because a pane at five metres and the wall behind it need different amounts of fog and only a
++// per-fragment application knows two depths. The in-scattering is multiplied by the fragment's alpha so that the
++// result is still premultiplied: fog added to the covered part of the pixel only. Adding unpremultiplied
++// in-scattering here is what makes transparent surfaces glow against a foggy background.
++// ---------------------------------------------------------------------------------------------------------------
++
++float FogTransmittance(float viewDepthMetres)
++{
++    return exp(-FogDensityPerMetre * viewDepthMetres);
++}
++
++float3 ApplyFogToRadiance(float3 radiance, float viewDepthMetres)
++{
++    float transmittance = FogTransmittance(viewDepthMetres);
++    return (radiance * transmittance) + (float3(FogInscatterR, FogInscatterG, FogInscatterB) * (1.0f - transmittance));
++}
++
++float3 ApplyFogToFragment(float3 premultiplied, float alpha, float viewDepthMetres, out float transmittance)
++{
++    transmittance = FogTransmittance(viewDepthMetres);
++    return (premultiplied * transmittance) +
++           (float3(FogInscatterR, FogInscatterG, FogInscatterB) * ((1.0f - transmittance) * alpha));
++}
++
+ // The temporal reactive mask reports risk, not policy: this pixel's history is likely to describe something else.
+ // What a resolve should do about it belongs to Chapter 28.
+ float ProbabilisticOr(float left, float right)
+@@ -201,6 +242,13 @@ float ProbabilisticOr(float left, float right)
+         radiance = float3(float(SkyFixedR), float(SkyFixedG), float(SkyFixedB)) / float(FixedOne);
+     }
+
++    // Per-fragment fog is folded into every shaded fragment, and an opaque surface is a shaded fragment. A sky pixel
++    // has no depth of its own, so the frame declares the far wall's depth for it rather than inventing one.
++    if (FogApplicationId == FogPerFragmentBeforeComposite && FogDensityPerMetre > 0.0f)
++    {
++        radiance = ApplyFogToRadiance(radiance, hasSurface ? depth : OpaqueBaseDepthMetres);
++    }
++
+     record.opaqueR = radiance.r;
+     record.opaqueG = radiance.g;
+     record.opaqueB = radiance.b;
+@@ -575,7 +623,13 @@ bool EarlierSubmitted(uint leftDrawOrder, uint leftSlot, uint rightDrawOrder, ui
+         }
+
+         float3 premultiplied = Premultiply(straight, alpha);
++        float fogTransmittance = 1.0f;
+         uint fragmentFlags = FragmentStored;
++        if (FogApplicationId == FogPerFragmentBeforeComposite && FogDensityPerMetre > 0.0f)
++        {
++            premultiplied = ApplyFogToFragment(premultiplied, alpha, depth, fogTransmittance);
++            fragmentFlags |= FragmentFogged;
++        }
+         if (refracts)
+         {
+             fragmentFlags |= FragmentRefracted;
+@@ -604,7 +658,7 @@ bool EarlierSubmitted(uint leftDrawOrder, uint leftSlot, uint rightDrawOrder, ui
+         fragment.requestedAlpha = float(paneRequestedAlpha[slot]) / float(FixedOne);
+         fragment.viewDepthMetres = depth;
+         fragment.oitWeight = OitFragmentWeight(depth);
+-        fragment.fogTransmittance = 1.0f;
++        fragment.fogTransmittance = fogTransmittance;
+         fragment.refractionOffsetLengthUv = length(appliedOffset);
+         fragment.revealageBefore = 1.0f;
+         fragment.revealageAfter = 1.0f;
+@@ -985,12 +1039,23 @@ bool EarlierSubmitted(uint leftDrawOrder, uint leftSlot, uint rightDrawOrder, ui
+     record.compositeB = composite.b;
+     record.compositeSource = CompositeModeId;
+
+-    // No fog is folded anywhere in this checkpoint, at either placement, so the frame publishes a transmittance of
+-    // exactly one and a fogged colour equal to the composite rather than a plausible number for a stage it does not
+-    // run yet.
++    // Screen-space fog after the composite is cheaper, it is what a deferred fog pass naturally does, and it is
++    // wrong for every transparent pixel because it fogs the near glass at the depth of whatever is behind it. The
++    // frame reports it as the approximation the policy chose rather than as a mistake it can fix.
+     float3 fogged = composite;
+-    record.status |= StatusFogPerFragment;
+-    record.fogTransmittance = 1.0f;
++    float transmittance = 1.0f;
++    if (FogApplicationId == FogScreenSpaceAfterComposite)
++    {
++        float fogDepth = record.hasOpaqueSurface != 0u ? record.opaqueViewDepthMetres : OpaqueBaseDepthMetres;
++        transmittance = FogTransmittance(fogDepth);
++        fogged = ApplyFogToRadiance(composite, fogDepth);
++        record.status |= StatusFogScreenSpace;
++    }
++    else
++    {
++        record.status |= StatusFogPerFragment;
++    }
++    record.fogTransmittance = transmittance;
+     record.foggedR = fogged.r;
+     record.foggedG = fogged.g;
+     record.foggedB = fogged.b;
