@@ -1,0 +1,360 @@
+diff --git a/chapters/gpu-particle-systems/Starter/Main.cpp b/chapters/gpu-particle-systems/Starter/Main.cpp
+index 846d841..ff5bca1 100644
+--- a/chapters/gpu-particle-systems/Starter/Main.cpp
++++ b/chapters/gpu-particle-systems/Starter/Main.cpp
+@@ -4,15 +4,14 @@
+ 
+ int wmain(int argc, wchar_t **argv)
+ {
+-    std::puts("Ch34 Starter: an honest particle baseline. The CPU reference advances emission, fixed-step");
+-    std::puts("simulation, lifetime and compaction, and the host uploads the compacted live set for a direct");
+-    std::puts("instanced draw. No GPU emission, simulation, compaction or indirect arguments run here; the stage");
+-    std::puts("ledger reports every one of them as skipped, and the Solution replaces the upload with the");
+-    std::puts("equivalent on-GPU passes that produce the same picture.");
++    std::puts("Ch34 Solution: the full particle frame on the GPU. Emission allocates free slots from a scanned dead");
++    std::puts("list, issues monotone identities and seeds each particle; a fixed-step simulation integrates, resolves");
++    std::puts("the ground plane, ages and retires; a stable scan-and-scatter compaction feeds a compute pass that");
++    std::puts("writes the D3D12_DRAW_ARGUMENTS an ExecuteIndirect consumes across the UAV-to-indirect barrier.");
+ 
+-    ch34::particles::starter::Renderer renderer{};
++    ch34::particles::solution::Renderer renderer{};
+     lgp::framework::ApplicationConfiguration configuration{};
+-    configuration.title = L"Ch34 GPU Particle Systems Starter (CPU-reference baseline)";
++    configuration.title = L"Ch34 GPU Particle Systems Solution (indirect GPU pipeline)";
+     configuration.width = 1280U;
+     configuration.height = 720U;
+     configuration.enableDebugLayer = false;
+diff --git a/chapters/gpu-particle-systems/Starter/ParticleLab.hlsl b/chapters/gpu-particle-systems/Starter/ParticleLab.hlsl
+index 79ba78f..5abe6c0 100644
+--- a/chapters/gpu-particle-systems/Starter/ParticleLab.hlsl
++++ b/chapters/gpu-particle-systems/Starter/ParticleLab.hlsl
+@@ -1,11 +1,15 @@
+-// Chapter 34 checkpoint 5: indirect argument generation and the ExecuteIndirect draw.
++// Chapter 34 Solution GPU particle lab.
+ //
+-// IndirectArgsCS reads the emitted count the compaction produced and writes the D3D12_DRAW_ARGUMENTS a command
+-// signature reads, plus the one-or-zero command count. The host then places the explicit unordered-access to
+-// indirect-argument barrier that makes the compute write visible to ExecuteIndirect, transitions the final state
+-// slot and the compacted list to vertex-shader reads, and issues a single ExecuteIndirect that draws one instanced
+-// quad per live particle straight from GPU-produced arguments, with no CPU readback of the count. The picture
+-// finally appears. The checksum evidence pass arrives in the final checkpoint.
++// The whole particle frame runs on the GPU: emission allocates free slots from a scanned dead list, issues
++// monotone identities and seeds each particle from (seed, identity); a fixed-step simulation integrates, resolves
++// the ground plane, ages, and retires; a stable exclusive-scan-and-scatter compaction produces the live index
++// list; a single-thread pass writes the D3D12_DRAW_ARGUMENTS the command signature reads; and a checksum pass
++// hashes the float32 state image exactly as the CPU contract does, so a readback can be compared bit-for-bit in a
++// dyadic scenario.
++//
++// One teaching simplification is pinned here and mirrored by the host: the lab caps capacity at the thread-group
++// size so emission and compaction are single-thread-group passes whose scans live in group-shared memory. A
++// shipping system scans across groups; a lab that fits in one group keeps every ordering decision visible.
+ 
+ #define LGP_PARTICLE_THREAD_GROUP_SIZE 256
+ 
+@@ -93,6 +97,8 @@ static const uint kCounterEmitted = 7u;
+ 
+ static const uint kInvalidId = 0xFFFFFFFFu;
+ 
++groupshared uint gScan[LGP_PARTICLE_THREAD_GROUP_SIZE];
++
+ uint Finalize32(uint value)
+ {
+     value ^= value >> 16u;
+@@ -155,8 +161,6 @@ void StoreState(uint slot, uint index, GpuParticle value)
+     }
+ }
+ 
+-groupshared uint gScan[LGP_PARTICLE_THREAD_GROUP_SIZE];
+-
+ // Inclusive Hillis-Steele scan of gScan over the whole group. Returns the total and leaves gScan holding the
+ // inclusive prefix so a caller recovers the exclusive prefix by subtracting its own input.
+ uint InclusiveScanGroup(uint groupIndex)
+@@ -380,6 +384,68 @@ void IndirectArgsCS()
+     gIndirectCount[0] = (instanceCount > 0u) ? 1u : 0u;
+ }
+ 
++uint2 Mul32(uint a, uint b)
++{
++    uint aLow = a & 0xFFFFu;
++    uint aHigh = a >> 16u;
++    uint bLow = b & 0xFFFFu;
++    uint bHigh = b >> 16u;
++
++    uint lowLow = aLow * bLow;
++    uint lowHigh = aLow * bHigh;
++    uint highLow = aHigh * bLow;
++    uint highHigh = aHigh * bHigh;
++
++    uint cross = (lowLow >> 16u) + (lowHigh & 0xFFFFu) + (highLow & 0xFFFFu);
++    uint low = (lowLow & 0xFFFFu) | (cross << 16u);
++    uint high = highHigh + (lowHigh >> 16u) + (highLow >> 16u) + (cross >> 16u);
++    return uint2(low, high);
++}
++
++uint2 Mul64(uint2 a, uint2 b)
++{
++    uint2 low = Mul32(a.x, b.x);
++    uint high = low.y + (a.x * b.y) + (a.y * b.x);
++    return uint2(low.x, high);
++}
++
++uint2 HashWord(uint2 hash, uint value)
++{
++    const uint2 prime = uint2(0x000001B3u, 0x00000100u);
++    [unroll]
++    for (uint shift = 0u; shift < 32u; shift += 8u)
++    {
++        hash.x ^= (value >> shift) & 0xFFu;
++        hash = Mul64(hash, prime);
++    }
++    return hash;
++}
++
++[numthreads(1, 1, 1)]
++void ChecksumCS()
++{
++    uint2 hash = uint2(0x84222325u, 0xCBF29CE4u);
++    for (uint index = 0u; index < gCapacity; ++index)
++    {
++        GpuParticle p = LoadState(gReadSlot, index);
++        hash = HashWord(hash, p.identity);
++        hash = HashWord(hash, (p.alive != 0u) ? 1u : 0u);
++        if (p.alive == 0u)
++        {
++            continue;
++        }
++        hash = HashWord(hash, asuint(p.px));
++        hash = HashWord(hash, asuint(p.py));
++        hash = HashWord(hash, asuint(p.pz));
++        hash = HashWord(hash, asuint(p.vx));
++        hash = HashWord(hash, asuint(p.vy));
++        hash = HashWord(hash, asuint(p.vz));
++        hash = HashWord(hash, asuint(p.age));
++        hash = HashWord(hash, asuint(p.lifetime));
++    }
++    gChecksum[0] = hash;
++}
++
+ float2 QuadCorner(uint vertexId)
+ {
+     switch (vertexId)
+diff --git a/chapters/gpu-particle-systems/Starter/Renderer.cpp b/chapters/gpu-particle-systems/Starter/Renderer.cpp
+index 21ee932..04c5540 100644
+--- a/chapters/gpu-particle-systems/Starter/Renderer.cpp
++++ b/chapters/gpu-particle-systems/Starter/Renderer.cpp
+@@ -16,7 +16,7 @@
+ #include <filesystem>
+ #include <string>
+ 
+-namespace ch34::particles::starter
++namespace ch34::particles::solution
+ {
+ namespace
+ {
+@@ -176,6 +176,10 @@ lgp::framework::Status Renderer::CreateShaders()
+     {
+         return status;
+     }
++    if (auto status = gpu::CompileShader(compiler, options, L"ChecksumCS", L"cs_6_0", checksumShader_); !status)
++    {
++        return status;
++    }
+     if (auto status = gpu::CompileShader(compiler, options, L"ParticleVS", L"vs_6_0", vertexShader_); !status)
+     {
+         return status;
+@@ -299,6 +303,12 @@ lgp::framework::Status Renderer::CreatePipelines()
+     {
+         return status;
+     }
++    if (auto status =
++            CreateComputePipeline(device, *computeRootSignature_.Get(), checksumShader_, "checksum", checksumPipeline_);
++        !status)
++    {
++        return status;
++    }
+ 
+     D3D12_BLEND_DESC blend{};
+     blend.RenderTarget[0].RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
+@@ -611,6 +621,19 @@ lgp::framework::Status Renderer::Render(lgp::framework::FrameContext const &fram
+     commandList.SetComputeRootSignature(computeRootSignature_.Get());
+     commandList.SetComputeRootDescriptorTable(ComputeUavTable, descriptors_.GpuHandle(0U));
+ 
++    ID3D12Resource *const stateBuffers[2]{stateA_.Get(), stateB_.Get()};
++
++    auto uavBarrier = [&commandList](std::initializer_list<ID3D12Resource *> resources)
++    {
++        std::vector<D3D12_BUFFER_BARRIER> barriers{};
++        for (ID3D12Resource *resource : resources)
++        {
++            barriers.push_back(gpu::MakeBufferBarrier(*resource, gpu::ComputeUnorderedAccessState(),
++                                                      gpu::ComputeUnorderedAccessState()));
++        }
++        gpu::SubmitBufferBarriers(commandList, barriers);
++    };
++
+     // Reset: bring every buffer into unordered-access state and clear it.
+     {
+         gpu::BufferBarrierState const before =
+@@ -633,22 +656,6 @@ lgp::framework::Status Renderer::Render(lgp::framework::FrameContext const &fram
+     commandList.SetPipelineState(initPipeline_.Get());
+     commandList.Dispatch(1U, 1U, 1U);
+ 
+-    ID3D12Resource *const stateBuffers[2]{stateA_.Get(), stateB_.Get()};
+-
+-    auto uavBarrier = [&commandList](std::initializer_list<ID3D12Resource *> resources)
+-    {
+-        std::vector<D3D12_BUFFER_BARRIER> barriers{};
+-        for (ID3D12Resource *resource : resources)
+-        {
+-            barriers.push_back(gpu::MakeBufferBarrier(*resource, gpu::ComputeUnorderedAccessState(),
+-                                                      gpu::ComputeUnorderedAccessState()));
+-        }
+-        gpu::SubmitBufferBarriers(commandList, barriers);
+-    };
+-
+-    // Emission and fixed-step simulation run each substep. Emission allocates from the scanned dead list into the
+-    // read slot; simulation integrates the read slot into the write slot; the host then ping-pongs ownership so the
+-    // next substep reads the slot just written. Compaction and the indirect draw arrive in later checkpoints.
+     FrameSlots currentSlots{.readSlot = BufferSlot::A, .writeSlot = BufferSlot::B};
+     double accumulator = 0.0;
+     double carry = 0.0;
+@@ -705,14 +712,16 @@ lgp::framework::Status Renderer::Render(lgp::framework::FrameContext const &fram
+         resultSlot_ = slotsUsed_.writeSlot;
+     }
+ 
+-    // Compaction reads the final state slot and scatters the live set into the compacted lists.
++    // Compaction, checksum, and indirect arguments read the final state slot.
+     uavBarrier({finalState, compactedSlots_.Get(), compactedIdentities_.Get(), counters_.Get()});
+     SetLabConstants(commandList, configuration, finalIndex, finalIndex ^ 1U, 0U);
+     commandList.SetPipelineState(compactPipeline_.Get());
+     commandList.Dispatch(1U, 1U, 1U);
+ 
+-    // Indirect arguments: read the emitted count that compaction produced and write the draw arguments the command
+-    // signature consumes. The constants compaction set (read slot, output boundary) still apply.
++    uavBarrier({finalState});
++    commandList.SetPipelineState(checksumPipeline_.Get());
++    commandList.Dispatch(1U, 1U, 1U);
++
+     uavBarrier({counters_.Get(), indirectArgs_.Get(), indirectCount_.Get(), compactedSlots_.Get()});
+     commandList.SetPipelineState(indirectArgsPipeline_.Get());
+     commandList.Dispatch(1U, 1U, 1U);
+@@ -760,8 +769,7 @@ lgp::framework::Status Renderer::Render(lgp::framework::FrameContext const &fram
+     };
+     gpu::SubmitTextureBarriers(commandList, textureBarriers);
+ 
+-    // Copy the evidence buffers out, then restore unordered-access state for the next run. The checksum evidence
+-    // pass arrives in the final checkpoint, so its buffer is not produced or copied here.
++    // Copy every evidence buffer out, then restore unordered-access state for the next run.
+     {
+         std::vector<D3D12_BUFFER_BARRIER> barriers{
+             gpu::MakeBufferBarrier(*finalState, gpu::VertexShaderResourceState(), gpu::CopySourceState()),
+@@ -769,6 +777,7 @@ lgp::framework::Status Renderer::Render(lgp::framework::FrameContext const &fram
+             gpu::MakeBufferBarrier(*compactedIdentities_.Get(), gpu::ComputeUnorderedAccessState(),
+                                    gpu::CopySourceState()),
+             gpu::MakeBufferBarrier(*counters_.Get(), gpu::ComputeUnorderedAccessState(), gpu::CopySourceState()),
++            gpu::MakeBufferBarrier(*checksum_.Get(), gpu::ComputeUnorderedAccessState(), gpu::CopySourceState()),
+             gpu::MakeBufferBarrier(*indirectArgs_.Get(), gpu::ExecuteIndirectState(), gpu::CopySourceState()),
+             gpu::MakeBufferBarrier(*indirectCount_.Get(), gpu::ExecuteIndirectState(), gpu::CopySourceState()),
+         };
+@@ -786,6 +795,7 @@ lgp::framework::Status Renderer::Render(lgp::framework::FrameContext const &fram
+                                  indirectArgs_.size_in_bytes());
+     commandList.CopyBufferRegion(indirectCountReadback_.Get(), 0U, indirectCount_.Get(), 0U,
+                                  indirectCount_.size_in_bytes());
++    commandList.CopyBufferRegion(checksumReadback_.Get(), 0U, checksum_.Get(), 0U, checksum_.size_in_bytes());
+ 
+     {
+         std::vector<D3D12_BUFFER_BARRIER> barriers{
+@@ -794,6 +804,7 @@ lgp::framework::Status Renderer::Render(lgp::framework::FrameContext const &fram
+             gpu::MakeBufferBarrier(*compactedIdentities_.Get(), gpu::CopySourceState(),
+                                    gpu::ComputeUnorderedAccessState()),
+             gpu::MakeBufferBarrier(*counters_.Get(), gpu::CopySourceState(), gpu::ComputeUnorderedAccessState()),
++            gpu::MakeBufferBarrier(*checksum_.Get(), gpu::CopySourceState(), gpu::ComputeUnorderedAccessState()),
+             gpu::MakeBufferBarrier(*indirectArgs_.Get(), gpu::CopySourceState(), gpu::ComputeUnorderedAccessState()),
+             gpu::MakeBufferBarrier(*indirectCount_.Get(), gpu::CopySourceState(), gpu::ComputeUnorderedAccessState()),
+         };
+@@ -816,9 +827,10 @@ std::expected<gpu::FrameReadback, lgp::framework::Error> Renderer::ReadBackOutpu
+     auto const *identities = reinterpret_cast<std::uint32_t const *>(compactedIdentitiesReadback_.mapped_data());
+     auto const *args = reinterpret_cast<std::uint32_t const *>(indirectArgsReadback_.mapped_data());
+     auto const *count = reinterpret_cast<std::uint32_t const *>(indirectCountReadback_.mapped_data());
++    auto const *checksum = reinterpret_cast<std::uint32_t const *>(checksumReadback_.mapped_data());
+     auto const *state = reinterpret_cast<gpu::GpuParticle const *>(stateReadback_.mapped_data());
+     if (counters == nullptr || slots == nullptr || identities == nullptr || args == nullptr || count == nullptr ||
+-        state == nullptr)
++        checksum == nullptr || state == nullptr)
+     {
+         return std::unexpected(
+             lgp::framework::MakeError("ReadBackOutputs", "The Chapter 34 readbacks are not mapped."));
+@@ -839,15 +851,13 @@ std::expected<gpu::FrameReadback, lgp::framework::Error> Renderer::ReadBackOutpu
+ 
+     readback.indirectArguments = {args[0], args[1], args[2], args[3]};
+     readback.executedCommandCount = count[0];
++    readback.checksum = static_cast<std::uint64_t>(checksum[0]) | (static_cast<std::uint64_t>(checksum[1]) << 32U);
+ 
+     readback.state.assign(state, state + configuration.capacity);
+     readback.readbackChecksum = gpu::ChecksumGpuState(readback.state);
+ 
+     readback.slotsUsed = slotsUsed_;
+     readback.resultSlot = resultSlot_;
+-
+-    // Every frame stage has now run, including the indirect draw. The checksum evidence is not computed yet, so it
+-    // reads back as zero; the stage partition itself is complete.
+     readback.stagePartition = gpu::BuildStagePartition(anySubsteps_, readback.executedCommandCount > 0U, true);
+ 
+     std::uint32_t const outputCapacity = gpu::ResolveOutputCapacity(configuration);
+@@ -887,6 +897,7 @@ void Renderer::Shutdown(lgp::framework::DeviceResources &deviceResources) noexce
+     DestroyResources(deviceResources);
+     commandSignature_.Reset();
+     graphicsPipeline_.Reset();
++    checksumPipeline_.Reset();
+     indirectArgsPipeline_.Reset();
+     compactPipeline_.Reset();
+     simulatePipeline_.Reset();
+@@ -899,6 +910,7 @@ void Renderer::Shutdown(lgp::framework::DeviceResources &deviceResources) noexce
+     simulateShader_ = {};
+     compactShader_ = {};
+     indirectArgsShader_ = {};
++    checksumShader_ = {};
+     vertexShader_ = {};
+     pixelShader_ = {};
+     resourcesInitialized_ = false;
+@@ -910,4 +922,4 @@ void Renderer::ConfigureHeadlessTest(gpu::LabConfiguration const &configuration)
+     headlessConfiguration_ = configuration;
+ }
+ 
+-} // namespace ch34::particles::starter
++} // namespace ch34::particles::solution
+diff --git a/chapters/gpu-particle-systems/Starter/Renderer.hpp b/chapters/gpu-particle-systems/Starter/Renderer.hpp
+index a8268f1..342115d 100644
+--- a/chapters/gpu-particle-systems/Starter/Renderer.hpp
++++ b/chapters/gpu-particle-systems/Starter/Renderer.hpp
+@@ -11,7 +11,7 @@
+ #include <expected>
+ #include <optional>
+ 
+-namespace ch34::particles::starter
++namespace ch34::particles::solution
+ {
+ 
+ using HeadlessTestConfiguration = gpu::LabConfiguration;
+@@ -55,6 +55,7 @@ class Renderer final : public lgp::framework::IChapterRenderer
+     lgp::framework::CompiledShader simulateShader_{};
+     lgp::framework::CompiledShader compactShader_{};
+     lgp::framework::CompiledShader indirectArgsShader_{};
++    lgp::framework::CompiledShader checksumShader_{};
+     lgp::framework::CompiledShader vertexShader_{};
+     lgp::framework::CompiledShader pixelShader_{};
+ 
+@@ -65,6 +66,7 @@ class Renderer final : public lgp::framework::IChapterRenderer
+     Microsoft::WRL::ComPtr<ID3D12PipelineState> simulatePipeline_{};
+     Microsoft::WRL::ComPtr<ID3D12PipelineState> compactPipeline_{};
+     Microsoft::WRL::ComPtr<ID3D12PipelineState> indirectArgsPipeline_{};
++    Microsoft::WRL::ComPtr<ID3D12PipelineState> checksumPipeline_{};
+     Microsoft::WRL::ComPtr<ID3D12PipelineState> graphicsPipeline_{};
+     Microsoft::WRL::ComPtr<ID3D12CommandSignature> commandSignature_{};
+ 
+@@ -97,4 +99,4 @@ class Renderer final : public lgp::framework::IChapterRenderer
+     bool anySubsteps_{false};
+ };
+ 
+-} // namespace ch34::particles::starter
++} // namespace ch34::particles::solution

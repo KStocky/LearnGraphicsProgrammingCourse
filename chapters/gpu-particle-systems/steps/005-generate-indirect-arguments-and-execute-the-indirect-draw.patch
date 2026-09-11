@@ -1,0 +1,429 @@
+diff --git a/chapters/gpu-particle-systems/Starter/ParticleLab.hlsl b/chapters/gpu-particle-systems/Starter/ParticleLab.hlsl
+index 20cf45a..79ba78f 100644
+--- a/chapters/gpu-particle-systems/Starter/ParticleLab.hlsl
++++ b/chapters/gpu-particle-systems/Starter/ParticleLab.hlsl
+@@ -1,11 +1,11 @@
+-// Chapter 34 checkpoint 4: stable scan-and-scatter compaction of the live set.
++// Chapter 34 checkpoint 5: indirect argument generation and the ExecuteIndirect draw.
+ //
+-// CompactCS flags each live particle, runs the same group-wide inclusive scan emission used, and scatters each
+-// live index to its exclusive-prefix position, producing a dense, index-ordered list of live slots and their
+-// identities plus the live and emitted counters. The scatter is clamped to the output capacity and an
+-// out-of-bounds sentinel guards the boundary, so an over-full frame is bounded rather than corrupting. Indirect
+-// arguments, the indirect draw and the checksum arrive in later checkpoints, so the compacted list is produced but
+-// not yet consumed by a draw.
++// IndirectArgsCS reads the emitted count the compaction produced and writes the D3D12_DRAW_ARGUMENTS a command
++// signature reads, plus the one-or-zero command count. The host then places the explicit unordered-access to
++// indirect-argument barrier that makes the compute write visible to ExecuteIndirect, transitions the final state
++// slot and the compacted list to vertex-shader reads, and issues a single ExecuteIndirect that draws one instanced
++// quad per live particle straight from GPU-produced arguments, with no CPU readback of the count. The picture
++// finally appears. The checksum evidence pass arrives in the final checkpoint.
+ 
+ #define LGP_PARTICLE_THREAD_GROUP_SIZE 256
+ 
+@@ -367,6 +367,19 @@ void CompactCS(uint3 dispatchThreadId : SV_DispatchThreadID, uint groupIndex : S
+     }
+ }
+ 
++[numthreads(1, 1, 1)]
++void IndirectArgsCS()
++{
++    uint instanceCount = min(gCounters[kCounterEmitted], gDrawCapacity);
++
++    gIndirectArgs.Store(0u, gVertexCountPerParticle);
++    gIndirectArgs.Store(4u, instanceCount);
++    gIndirectArgs.Store(8u, 0u);
++    gIndirectArgs.Store(12u, 0u);
++
++    gIndirectCount[0] = (instanceCount > 0u) ? 1u : 0u;
++}
++
+ float2 QuadCorner(uint vertexId)
+ {
+     switch (vertexId)
+diff --git a/chapters/gpu-particle-systems/Starter/Renderer.cpp b/chapters/gpu-particle-systems/Starter/Renderer.cpp
+index cea9664..21ee932 100644
+--- a/chapters/gpu-particle-systems/Starter/Renderer.cpp
++++ b/chapters/gpu-particle-systems/Starter/Renderer.cpp
+@@ -34,6 +34,12 @@ enum ComputeRootParameter : UINT
+     ComputeUavTable = 1U,
+ };
+ 
++enum GraphicsRootParameter : UINT
++{
++    DrawConstantsParam = 0U,
++    DrawSrvTable = 1U,
++};
++
+ enum UavIndex : UINT
+ {
+     StateAUav = 0U,
+@@ -84,6 +90,16 @@ struct LabConstants final
+ 
+ static_assert(sizeof(LabConstants) == 128U);
+ 
++struct DrawConstants final
++{
++    std::uint32_t drawStateSlot{};
++    float viewScale{};
++    float quadHalfExtent{};
++    std::uint32_t pad{};
++};
++
++static_assert(sizeof(DrawConstants) == 16U);
++
+ [[nodiscard]] std::filesystem::path ShaderPath()
+ {
+     return std::filesystem::path{__FILE__}.parent_path() / "ParticleLab.hlsl";
+@@ -152,7 +168,19 @@ lgp::framework::Status Renderer::CreateShaders()
+     {
+         return status;
+     }
+-    return gpu::CompileShader(compiler, options, L"CompactCS", L"cs_6_0", compactShader_);
++    if (auto status = gpu::CompileShader(compiler, options, L"CompactCS", L"cs_6_0", compactShader_); !status)
++    {
++        return status;
++    }
++    if (auto status = gpu::CompileShader(compiler, options, L"IndirectArgsCS", L"cs_6_0", indirectArgsShader_); !status)
++    {
++        return status;
++    }
++    if (auto status = gpu::CompileShader(compiler, options, L"ParticleVS", L"vs_6_0", vertexShader_); !status)
++    {
++        return status;
++    }
++    return gpu::CompileShader(compiler, options, L"ParticlePS", L"ps_6_0", pixelShader_);
+ }
+ 
+ lgp::framework::Status Renderer::CreateRootSignatures()
+@@ -196,6 +224,47 @@ lgp::framework::Status Renderer::CreateRootSignatures()
+             lgp::framework::MakeHResultError("ID3D12Device::CreateRootSignature", createResult,
+                                              "Failed to create the Chapter 34 compute root signature."));
+     }
++
++    D3D12_DESCRIPTOR_RANGE srvRange{};
++    srvRange.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
++    srvRange.NumDescriptors = kSrvCount;
++    srvRange.BaseShaderRegister = 0U;
++    srvRange.OffsetInDescriptorsFromTableStart = D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND;
++
++    D3D12_ROOT_PARAMETER graphicsParameters[2]{};
++    graphicsParameters[DrawConstantsParam].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
++    graphicsParameters[DrawConstantsParam].Constants.ShaderRegister = 1U;
++    graphicsParameters[DrawConstantsParam].Constants.Num32BitValues = sizeof(DrawConstants) / sizeof(std::uint32_t);
++    graphicsParameters[DrawConstantsParam].ShaderVisibility = D3D12_SHADER_VISIBILITY_VERTEX;
++    graphicsParameters[DrawSrvTable].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
++    graphicsParameters[DrawSrvTable].DescriptorTable.NumDescriptorRanges = 1U;
++    graphicsParameters[DrawSrvTable].DescriptorTable.pDescriptorRanges = &srvRange;
++    graphicsParameters[DrawSrvTable].ShaderVisibility = D3D12_SHADER_VISIBILITY_VERTEX;
++
++    D3D12_ROOT_SIGNATURE_DESC graphicsDescription{};
++    graphicsDescription.NumParameters = static_cast<UINT>(std::size(graphicsParameters));
++    graphicsDescription.pParameters = graphicsParameters;
++    graphicsDescription.Flags = D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT |
++                                D3D12_ROOT_SIGNATURE_FLAG_DENY_HULL_SHADER_ROOT_ACCESS |
++                                D3D12_ROOT_SIGNATURE_FLAG_DENY_DOMAIN_SHADER_ROOT_ACCESS |
++                                D3D12_ROOT_SIGNATURE_FLAG_DENY_GEOMETRY_SHADER_ROOT_ACCESS;
++
++    serializeResult = D3D12SerializeRootSignature(&graphicsDescription, D3D_ROOT_SIGNATURE_VERSION_1,
++                                                  serialized.ReleaseAndGetAddressOf(), errors.ReleaseAndGetAddressOf());
++    if (FAILED(serializeResult))
++    {
++        return std::unexpected(
++            lgp::framework::MakeHResultError("D3D12SerializeRootSignature", serializeResult, BlobText(errors.Get())));
++    }
++    createResult =
++        deviceResources_->device()->CreateRootSignature(0U, serialized->GetBufferPointer(), serialized->GetBufferSize(),
++                                                        IID_PPV_ARGS(graphicsRootSignature_.ReleaseAndGetAddressOf()));
++    if (FAILED(createResult))
++    {
++        return std::unexpected(
++            lgp::framework::MakeHResultError("ID3D12Device::CreateRootSignature", createResult,
++                                             "Failed to create the Chapter 34 graphics root signature."));
++    }
+     return {};
+ }
+ 
+@@ -218,7 +287,72 @@ lgp::framework::Status Renderer::CreatePipelines()
+     {
+         return status;
+     }
+-    return CreateComputePipeline(device, *computeRootSignature_.Get(), compactShader_, "compact", compactPipeline_);
++    if (auto status =
++            CreateComputePipeline(device, *computeRootSignature_.Get(), compactShader_, "compact", compactPipeline_);
++        !status)
++    {
++        return status;
++    }
++    if (auto status = CreateComputePipeline(device, *computeRootSignature_.Get(), indirectArgsShader_,
++                                            "indirect arguments", indirectArgsPipeline_);
++        !status)
++    {
++        return status;
++    }
++
++    D3D12_BLEND_DESC blend{};
++    blend.RenderTarget[0].RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
++    D3D12_RASTERIZER_DESC rasterizer{};
++    rasterizer.FillMode = D3D12_FILL_MODE_SOLID;
++    rasterizer.CullMode = D3D12_CULL_MODE_NONE;
++    rasterizer.DepthClipEnable = TRUE;
++    D3D12_DEPTH_STENCIL_DESC depth{};
++    depth.DepthEnable = FALSE;
++    depth.DepthWriteMask = D3D12_DEPTH_WRITE_MASK_ZERO;
++    depth.DepthFunc = D3D12_COMPARISON_FUNC_ALWAYS;
++
++    D3D12_GRAPHICS_PIPELINE_STATE_DESC description{};
++    description.pRootSignature = graphicsRootSignature_.Get();
++    description.VS = vertexShader_.Bytecode();
++    description.PS = pixelShader_.Bytecode();
++    description.BlendState = blend;
++    description.SampleMask = UINT_MAX;
++    description.RasterizerState = rasterizer;
++    description.DepthStencilState = depth;
++    description.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
++    description.NumRenderTargets = 1U;
++    description.RTVFormats[0] = deviceResources_->back_buffer_format();
++    description.SampleDesc.Count = 1U;
++
++    HRESULT const createResult =
++        device.CreateGraphicsPipelineState(&description, IID_PPV_ARGS(graphicsPipeline_.ReleaseAndGetAddressOf()));
++    if (FAILED(createResult))
++    {
++        return std::unexpected(lgp::framework::MakeHResultError("ID3D12Device::CreateGraphicsPipelineState",
++                                                                createResult,
++                                                                "Failed to create the Chapter 34 graphics pipeline."));
++    }
++    return {};
++}
++
++lgp::framework::Status Renderer::CreateCommandSignature()
++{
++    D3D12_INDIRECT_ARGUMENT_DESC argument{};
++    argument.Type = D3D12_INDIRECT_ARGUMENT_TYPE_DRAW;
++
++    D3D12_COMMAND_SIGNATURE_DESC description{};
++    description.ByteStride = static_cast<UINT>(kDrawArgumentsSizeBytes);
++    description.NumArgumentDescs = 1U;
++    description.pArgumentDescs = &argument;
++
++    HRESULT const createResult = deviceResources_->device()->CreateCommandSignature(
++        &description, nullptr, IID_PPV_ARGS(commandSignature_.ReleaseAndGetAddressOf()));
++    if (FAILED(createResult))
++    {
++        return std::unexpected(lgp::framework::MakeHResultError("ID3D12Device::CreateCommandSignature", createResult,
++                                                                "Failed to create the Chapter 34 command signature."));
++    }
++    return {};
+ }
+ 
+ lgp::framework::Status Renderer::CreateResources()
+@@ -404,6 +538,10 @@ lgp::framework::Status Renderer::Initialize(lgp::framework::ApplicationInitConte
+     {
+         return status;
+     }
++    if (auto status = CreateCommandSignature(); !status)
++    {
++        return status;
++    }
+     return CreateResources();
+ }
+ 
+@@ -573,8 +711,26 @@ lgp::framework::Status Renderer::Render(lgp::framework::FrameContext const &fram
+     commandList.SetPipelineState(compactPipeline_.Get());
+     commandList.Dispatch(1U, 1U, 1U);
+ 
+-    // The compacted list is produced but not drawn yet: indirect arguments and the indirect draw arrive in later
+-    // checkpoints. Present an empty frame so compaction is exercised on the GPU while the picture is still black.
++    // Indirect arguments: read the emitted count that compaction produced and write the draw arguments the command
++    // signature consumes. The constants compaction set (read slot, output boundary) still apply.
++    uavBarrier({counters_.Get(), indirectArgs_.Get(), indirectCount_.Get(), compactedSlots_.Get()});
++    commandList.SetPipelineState(indirectArgsPipeline_.Get());
++    commandList.Dispatch(1U, 1U, 1U);
++
++    // The UAV-write to indirect-argument-read edge, plus the compute-to-vertex reads the draw depends on.
++    {
++        std::vector<D3D12_BUFFER_BARRIER> barriers{
++            gpu::MakeBufferBarrier(*indirectArgs_.Get(), gpu::ComputeUnorderedAccessState(),
++                                   gpu::ExecuteIndirectState()),
++            gpu::MakeBufferBarrier(*indirectCount_.Get(), gpu::ComputeUnorderedAccessState(),
++                                   gpu::ExecuteIndirectState()),
++            gpu::MakeBufferBarrier(*finalState, gpu::ComputeUnorderedAccessState(), gpu::VertexShaderResourceState()),
++            gpu::MakeBufferBarrier(*compactedSlots_.Get(), gpu::ComputeUnorderedAccessState(),
++                                   gpu::VertexShaderResourceState()),
++        };
++        gpu::SubmitBufferBarriers(commandList, barriers);
++    }
++
+     std::vector<D3D12_TEXTURE_BARRIER> textureBarriers{
+         gpu::MakeTextureBarrier(*frameContext.renderTarget, gpu::FrameStartState(frameContext),
+                                 gpu::RenderTargetState()),
+@@ -586,23 +742,39 @@ lgp::framework::Status Renderer::Render(lgp::framework::FrameContext const &fram
+     commandList.OMSetRenderTargets(1U, &frameContext.renderTargetView, FALSE, nullptr);
+     commandList.RSSetViewports(1U, &frameContext.viewport);
+     commandList.RSSetScissorRects(1U, &frameContext.scissorRect);
++    commandList.IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
++    commandList.SetGraphicsRootSignature(graphicsRootSignature_.Get());
++    commandList.SetGraphicsRootDescriptorTable(DrawSrvTable, descriptors_.GpuHandle(kSrvTableOffset));
++
++    DrawConstants drawConstants{};
++    drawConstants.drawStateSlot = finalIndex;
++    drawConstants.viewScale = configuration.viewScale;
++    drawConstants.quadHalfExtent = configuration.quadHalfExtent;
++    commandList.SetGraphicsRoot32BitConstants(DrawConstantsParam, sizeof(DrawConstants) / sizeof(std::uint32_t),
++                                              &drawConstants, 0U);
++    commandList.SetPipelineState(graphicsPipeline_.Get());
++    commandList.ExecuteIndirect(commandSignature_.Get(), 1U, indirectArgs_.Get(), 0U, indirectCount_.Get(), 0U);
+ 
+     textureBarriers = {
+         gpu::MakeTextureBarrier(*frameContext.renderTarget, gpu::RenderTargetState(), gpu::FrameEndState(frameContext)),
+     };
+     gpu::SubmitTextureBarriers(commandList, textureBarriers);
+ 
+-    // Copy the advanced state image, the counters and the compacted lists out of their buffers.
++    // Copy the evidence buffers out, then restore unordered-access state for the next run. The checksum evidence
++    // pass arrives in the final checkpoint, so its buffer is not produced or copied here.
+     {
+         std::vector<D3D12_BUFFER_BARRIER> barriers{
+-            gpu::MakeBufferBarrier(*finalState, gpu::ComputeUnorderedAccessState(), gpu::CopySourceState()),
+-            gpu::MakeBufferBarrier(*counters_.Get(), gpu::ComputeUnorderedAccessState(), gpu::CopySourceState()),
+-            gpu::MakeBufferBarrier(*compactedSlots_.Get(), gpu::ComputeUnorderedAccessState(), gpu::CopySourceState()),
++            gpu::MakeBufferBarrier(*finalState, gpu::VertexShaderResourceState(), gpu::CopySourceState()),
++            gpu::MakeBufferBarrier(*compactedSlots_.Get(), gpu::VertexShaderResourceState(), gpu::CopySourceState()),
+             gpu::MakeBufferBarrier(*compactedIdentities_.Get(), gpu::ComputeUnorderedAccessState(),
+                                    gpu::CopySourceState()),
++            gpu::MakeBufferBarrier(*counters_.Get(), gpu::ComputeUnorderedAccessState(), gpu::CopySourceState()),
++            gpu::MakeBufferBarrier(*indirectArgs_.Get(), gpu::ExecuteIndirectState(), gpu::CopySourceState()),
++            gpu::MakeBufferBarrier(*indirectCount_.Get(), gpu::ExecuteIndirectState(), gpu::CopySourceState()),
+         };
+         gpu::SubmitBufferBarriers(commandList, barriers);
+     }
++
+     commandList.CopyBufferRegion(stateReadback_.Get(), 0U, finalState, 0U,
+                                  static_cast<std::uint64_t>(configuration.capacity) * sizeof(gpu::GpuParticle));
+     commandList.CopyBufferRegion(countersReadback_.Get(), 0U, counters_.Get(), 0U, counters_.size_in_bytes());
+@@ -610,13 +782,20 @@ lgp::framework::Status Renderer::Render(lgp::framework::FrameContext const &fram
+                                  compactedSlots_.size_in_bytes());
+     commandList.CopyBufferRegion(compactedIdentitiesReadback_.Get(), 0U, compactedIdentities_.Get(), 0U,
+                                  compactedIdentities_.size_in_bytes());
++    commandList.CopyBufferRegion(indirectArgsReadback_.Get(), 0U, indirectArgs_.Get(), 0U,
++                                 indirectArgs_.size_in_bytes());
++    commandList.CopyBufferRegion(indirectCountReadback_.Get(), 0U, indirectCount_.Get(), 0U,
++                                 indirectCount_.size_in_bytes());
++
+     {
+         std::vector<D3D12_BUFFER_BARRIER> barriers{
+             gpu::MakeBufferBarrier(*finalState, gpu::CopySourceState(), gpu::ComputeUnorderedAccessState()),
+-            gpu::MakeBufferBarrier(*counters_.Get(), gpu::CopySourceState(), gpu::ComputeUnorderedAccessState()),
+             gpu::MakeBufferBarrier(*compactedSlots_.Get(), gpu::CopySourceState(), gpu::ComputeUnorderedAccessState()),
+             gpu::MakeBufferBarrier(*compactedIdentities_.Get(), gpu::CopySourceState(),
+                                    gpu::ComputeUnorderedAccessState()),
++            gpu::MakeBufferBarrier(*counters_.Get(), gpu::CopySourceState(), gpu::ComputeUnorderedAccessState()),
++            gpu::MakeBufferBarrier(*indirectArgs_.Get(), gpu::CopySourceState(), gpu::ComputeUnorderedAccessState()),
++            gpu::MakeBufferBarrier(*indirectCount_.Get(), gpu::CopySourceState(), gpu::ComputeUnorderedAccessState()),
+         };
+         gpu::SubmitBufferBarriers(commandList, barriers);
+     }
+@@ -635,8 +814,11 @@ std::expected<gpu::FrameReadback, lgp::framework::Error> Renderer::ReadBackOutpu
+     auto const *counters = reinterpret_cast<std::uint32_t const *>(countersReadback_.mapped_data());
+     auto const *slots = reinterpret_cast<std::uint32_t const *>(compactedSlotsReadback_.mapped_data());
+     auto const *identities = reinterpret_cast<std::uint32_t const *>(compactedIdentitiesReadback_.mapped_data());
++    auto const *args = reinterpret_cast<std::uint32_t const *>(indirectArgsReadback_.mapped_data());
++    auto const *count = reinterpret_cast<std::uint32_t const *>(indirectCountReadback_.mapped_data());
+     auto const *state = reinterpret_cast<gpu::GpuParticle const *>(stateReadback_.mapped_data());
+-    if (counters == nullptr || slots == nullptr || identities == nullptr || state == nullptr)
++    if (counters == nullptr || slots == nullptr || identities == nullptr || args == nullptr || count == nullptr ||
++        state == nullptr)
+     {
+         return std::unexpected(
+             lgp::framework::MakeError("ReadBackOutputs", "The Chapter 34 readbacks are not mapped."));
+@@ -655,28 +837,18 @@ std::expected<gpu::FrameReadback, lgp::framework::Error> Renderer::ReadBackOutpu
+     readback.compactedSlots.assign(slots, slots + readback.emittedCount);
+     readback.compactedIdentities.assign(identities, identities + readback.emittedCount);
+ 
++    readback.indirectArguments = {args[0], args[1], args[2], args[3]};
++    readback.executedCommandCount = count[0];
++
+     readback.state.assign(state, state + configuration.capacity);
+     readback.readbackChecksum = gpu::ChecksumGpuState(readback.state);
+ 
+     readback.slotsUsed = slotsUsed_;
+     readback.resultSlot = resultSlot_;
+ 
+-    // Emission, simulation and compaction have run, but indirect arguments and the draw have not. Report those
+-    // stages honestly instead of borrowing the shared partition, which assumes the whole frame executed.
+-    StagePartition partition{};
+-    partition.submittedMask =
+-        StageBit(FrameStage::Reset) | StageBit(FrameStage::Compaction) | StageBit(FrameStage::Readback);
+-    partition.skippedMask = StageBit(FrameStage::IndirectArguments) | StageBit(FrameStage::Render);
+-    if (anySubsteps_)
+-    {
+-        partition.submittedMask |= StageBit(FrameStage::Emission) | StageBit(FrameStage::Simulation);
+-    }
+-    else
+-    {
+-        partition.skippedMask |= StageBit(FrameStage::Emission) | StageBit(FrameStage::Simulation);
+-    }
+-    partition.recordedMask = partition.submittedMask | partition.skippedMask | partition.unavailableMask;
+-    readback.stagePartition = partition;
++    // Every frame stage has now run, including the indirect draw. The checksum evidence is not computed yet, so it
++    // reads back as zero; the stage partition itself is complete.
++    readback.stagePartition = gpu::BuildStagePartition(anySubsteps_, readback.executedCommandCount > 0U, true);
+ 
+     std::uint32_t const outputCapacity = gpu::ResolveOutputCapacity(configuration);
+     bool const guardSlot = slots[outputCapacity] == kInvalidParticleId;
+@@ -713,15 +885,22 @@ void Renderer::DestroyResources(lgp::framework::DeviceResources &deviceResources
+ void Renderer::Shutdown(lgp::framework::DeviceResources &deviceResources) noexcept
+ {
+     DestroyResources(deviceResources);
++    commandSignature_.Reset();
++    graphicsPipeline_.Reset();
++    indirectArgsPipeline_.Reset();
+     compactPipeline_.Reset();
+     simulatePipeline_.Reset();
+     emitPipeline_.Reset();
+     initPipeline_.Reset();
++    graphicsRootSignature_.Reset();
+     computeRootSignature_.Reset();
+     initShader_ = {};
+     emitShader_ = {};
+     simulateShader_ = {};
+     compactShader_ = {};
++    indirectArgsShader_ = {};
++    vertexShader_ = {};
++    pixelShader_ = {};
+     resourcesInitialized_ = false;
+     deviceResources_ = nullptr;
+ }
+diff --git a/chapters/gpu-particle-systems/Starter/Renderer.hpp b/chapters/gpu-particle-systems/Starter/Renderer.hpp
+index 942d160..a8268f1 100644
+--- a/chapters/gpu-particle-systems/Starter/Renderer.hpp
++++ b/chapters/gpu-particle-systems/Starter/Renderer.hpp
+@@ -40,6 +40,7 @@ class Renderer final : public lgp::framework::IChapterRenderer
+     [[nodiscard]] lgp::framework::Status CreateShaders();
+     [[nodiscard]] lgp::framework::Status CreateRootSignatures();
+     [[nodiscard]] lgp::framework::Status CreatePipelines();
++    [[nodiscard]] lgp::framework::Status CreateCommandSignature();
+     [[nodiscard]] lgp::framework::Status CreateResources();
+     void DestroyResources(lgp::framework::DeviceResources &deviceResources) noexcept;
+     [[nodiscard]] gpu::LabConfiguration ActiveConfiguration() const noexcept;
+@@ -53,12 +54,19 @@ class Renderer final : public lgp::framework::IChapterRenderer
+     lgp::framework::CompiledShader emitShader_{};
+     lgp::framework::CompiledShader simulateShader_{};
+     lgp::framework::CompiledShader compactShader_{};
++    lgp::framework::CompiledShader indirectArgsShader_{};
++    lgp::framework::CompiledShader vertexShader_{};
++    lgp::framework::CompiledShader pixelShader_{};
+ 
+     Microsoft::WRL::ComPtr<ID3D12RootSignature> computeRootSignature_{};
++    Microsoft::WRL::ComPtr<ID3D12RootSignature> graphicsRootSignature_{};
+     Microsoft::WRL::ComPtr<ID3D12PipelineState> initPipeline_{};
+     Microsoft::WRL::ComPtr<ID3D12PipelineState> emitPipeline_{};
+     Microsoft::WRL::ComPtr<ID3D12PipelineState> simulatePipeline_{};
+     Microsoft::WRL::ComPtr<ID3D12PipelineState> compactPipeline_{};
++    Microsoft::WRL::ComPtr<ID3D12PipelineState> indirectArgsPipeline_{};
++    Microsoft::WRL::ComPtr<ID3D12PipelineState> graphicsPipeline_{};
++    Microsoft::WRL::ComPtr<ID3D12CommandSignature> commandSignature_{};
+ 
+     gpu::BufferResource stateA_{};
+     gpu::BufferResource stateB_{};

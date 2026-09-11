@@ -1,0 +1,316 @@
+diff --git a/chapters/gpu-particle-systems/Starter/ParticleLab.hlsl b/chapters/gpu-particle-systems/Starter/ParticleLab.hlsl
+index 2fbe377..33dfddf 100644
+--- a/chapters/gpu-particle-systems/Starter/ParticleLab.hlsl
++++ b/chapters/gpu-particle-systems/Starter/ParticleLab.hlsl
+@@ -1,11 +1,11 @@
+-// Chapter 34 checkpoint 2: GPU emission with deterministic identities and capacity accounting.
++// Chapter 34 checkpoint 3: fixed-step simulation and ping-pong slot ownership.
+ //
+-// After the reset pass, EmitCS allocates free slots from a group-scanned dead list, issues a monotone identity to
+-// each spawned particle from a persistent counter, and seeds its position and velocity deterministically from
+-// (seed, identity) so a spawn is reproducible on any adapter. Requested, spawned and dropped counters are the
+-// honest capacity ledger: when more emission is requested than there are dead slots, the surplus is dropped rather
+-// than silently overrunning. Simulation, compaction, indirect arguments and the checksum arrive in later
+-// checkpoints, so emitted particles are not moved, retired, compacted or drawn yet.
++// SimulateCS reads a particle from the read slot, integrates it under the configured integrator and force field,
++// resolves the ground plane, ages it and retires it when it outlives its lifetime, then writes the result into the
++// write slot. Because a substep reads one slot and writes the other, the host ping-pongs ownership between the two
++// state buffers each substep, so a substep never reads a slot it is still writing. The died and contact counters
++// are the honest lifetime and collision ledger. Compaction, indirect arguments and the checksum arrive later, so
++// the advanced live set is still not compacted or drawn.
+ 
+ #define LGP_PARTICLE_THREAD_GROUP_SIZE 256
+ 
+@@ -247,6 +247,96 @@ void EmitCS(uint3 dispatchThreadId : SV_DispatchThreadID, uint groupIndex : SV_G
+     }
+ }
+ 
++[numthreads(LGP_PARTICLE_THREAD_GROUP_SIZE, 1, 1)]
++void SimulateCS(uint3 dispatchThreadId : SV_DispatchThreadID)
++{
++    uint index = dispatchThreadId.x;
++    if (index >= gCapacity)
++    {
++        return;
++    }
++
++    GpuParticle p = LoadState(gReadSlot, index);
++    if (p.alive == 0u)
++    {
++        StoreState(gWriteSlot, index, DeadParticle());
++        return;
++    }
++
++    float3 position = float3(p.px, p.py, p.pz);
++    float3 velocity = float3(p.vx, p.vy, p.vz);
++    float3 gravity = float3(gGravityX, gGravityY, gGravityZ);
++    float h = gTimestep;
++    float3 acceleration = gravity - (gLinearDrag * velocity);
++
++    float3 newPosition = position;
++    float3 newVelocity = velocity;
++    if (gIntegrator == 0u)
++    {
++        newPosition = position + (h * velocity);
++        newVelocity = velocity + (h * acceleration);
++    }
++    else if (gIntegrator == 1u)
++    {
++        newVelocity = velocity + (h * acceleration);
++        newPosition = position + (h * newVelocity);
++    }
++    else
++    {
++        newPosition = position + (h * velocity) + ((0.5 * h * h) * acceleration);
++        newVelocity = velocity + (h * acceleration);
++    }
++
++    bool contacted = false;
++    if (gGroundEnabled != 0u)
++    {
++        float penetration = gGroundHeight - newPosition.y;
++        if (penetration > 0.0)
++        {
++            contacted = true;
++            newPosition.y = gGroundHeight;
++            float normalSpeed = newVelocity.y;
++            if (normalSpeed < 0.0)
++            {
++                normalSpeed = -gRestitution * normalSpeed;
++                float tangentialScale = 1.0 - gFriction;
++                newVelocity.x = newVelocity.x * tangentialScale;
++                newVelocity.z = newVelocity.z * tangentialScale;
++            }
++            if (normalSpeed <= gRestingSpeed)
++            {
++                normalSpeed = 0.0;
++            }
++            newVelocity.y = normalSpeed;
++        }
++    }
++
++    p.px = newPosition.x;
++    p.py = newPosition.y;
++    p.pz = newPosition.z;
++    p.vx = newVelocity.x;
++    p.vy = newVelocity.y;
++    p.vz = newVelocity.z;
++    p.age = p.age + h;
++
++    if (contacted)
++    {
++        uint previousContact;
++        InterlockedAdd(gCounters[kCounterContact], 1u, previousContact);
++    }
++
++    if (p.age >= p.lifetime)
++    {
++        StoreState(gWriteSlot, index, DeadParticle());
++        uint previousDied;
++        InterlockedAdd(gCounters[kCounterDied], 1u, previousDied);
++    }
++    else
++    {
++        StoreState(gWriteSlot, index, p);
++    }
++}
++
+ float2 QuadCorner(uint vertexId)
+ {
+     switch (vertexId)
+diff --git a/chapters/gpu-particle-systems/Starter/Renderer.cpp b/chapters/gpu-particle-systems/Starter/Renderer.cpp
+index 3f23d64..ec25e0a 100644
+--- a/chapters/gpu-particle-systems/Starter/Renderer.cpp
++++ b/chapters/gpu-particle-systems/Starter/Renderer.cpp
+@@ -144,7 +144,11 @@ lgp::framework::Status Renderer::CreateShaders()
+     {
+         return status;
+     }
+-    return gpu::CompileShader(compiler, options, L"EmitCS", L"cs_6_0", emitShader_);
++    if (auto status = gpu::CompileShader(compiler, options, L"EmitCS", L"cs_6_0", emitShader_); !status)
++    {
++        return status;
++    }
++    return gpu::CompileShader(compiler, options, L"SimulateCS", L"cs_6_0", simulateShader_);
+ }
+ 
+ lgp::framework::Status Renderer::CreateRootSignatures()
+@@ -199,7 +203,12 @@ lgp::framework::Status Renderer::CreatePipelines()
+     {
+         return status;
+     }
+-    return CreateComputePipeline(device, *computeRootSignature_.Get(), emitShader_, "emit", emitPipeline_);
++    if (auto status = CreateComputePipeline(device, *computeRootSignature_.Get(), emitShader_, "emit", emitPipeline_);
++        !status)
++    {
++        return status;
++    }
++    return CreateComputePipeline(device, *computeRootSignature_.Get(), simulateShader_, "simulate", simulatePipeline_);
+ }
+ 
+ lgp::framework::Status Renderer::CreateResources()
+@@ -489,12 +498,15 @@ lgp::framework::Status Renderer::Render(lgp::framework::FrameContext const &fram
+         gpu::SubmitBufferBarriers(commandList, barriers);
+     };
+ 
+-    // Emission runs each substep, allocating from the scanned dead list into the read slot in place. Simulation and
+-    // ping-pong ownership arrive in the next checkpoint, so the read slot is never advanced yet.
++    // Emission and fixed-step simulation run each substep. Emission allocates from the scanned dead list into the
++    // read slot; simulation integrates the read slot into the write slot; the host then ping-pongs ownership so the
++    // next substep reads the slot just written. Compaction and the indirect draw arrive in later checkpoints.
+     FrameSlots currentSlots{.readSlot = BufferSlot::A, .writeSlot = BufferSlot::B};
+     double accumulator = 0.0;
+     double carry = 0.0;
+     anySubsteps_ = false;
++    FrameSlots frameStartSlots = currentSlots;
++    std::uint32_t lastSubstepCount = 0U;
+ 
+     for (std::uint32_t frame = 0U; frame < configuration.frameCount; ++frame)
+     {
+@@ -504,6 +516,8 @@ lgp::framework::Status Renderer::Render(lgp::framework::FrameContext const &fram
+             return std::unexpected(lgp::framework::MakeError(
+                 "Render", std::string{"Plan failed: "} + std::string{ContractErrorName(plan.error())}));
+         }
++        frameStartSlots = currentSlots;
++        lastSubstepCount = plan->plan.substepCount;
+         lastPlan_ = plan->plan;
+ 
+         for (std::uint32_t substep = 0U; substep < plan->plan.substepCount; ++substep)
+@@ -511,10 +525,17 @@ lgp::framework::Status Renderer::Render(lgp::framework::FrameContext const &fram
+             UINT const readIndex = SlotIndex(currentSlots.readSlot);
+             UINT const writeIndex = SlotIndex(currentSlots.writeSlot);
+ 
+-            uavBarrier({stateBuffers[readIndex], counters_.Get()});
++            uavBarrier({stateBuffers[readIndex], stateBuffers[writeIndex], counters_.Get()});
+             SetLabConstants(commandList, configuration, readIndex, writeIndex, plan->requestedPerSubstep[substep]);
+             commandList.SetPipelineState(emitPipeline_.Get());
+             commandList.Dispatch(1U, 1U, 1U);
++
++            uavBarrier({stateBuffers[readIndex], counters_.Get()});
++            commandList.SetPipelineState(simulatePipeline_.Get());
++            commandList.Dispatch(1U, 1U, 1U);
++
++            uavBarrier({stateBuffers[writeIndex], counters_.Get()});
++            currentSlots = AdvanceFrameSlots(currentSlots);
+             anySubsteps_ = true;
+         }
+ 
+@@ -522,8 +543,22 @@ lgp::framework::Status Renderer::Render(lgp::framework::FrameContext const &fram
+         carry = plan->nextEmissionCarry;
+     }
+ 
+-    // No live set is drawn yet: simulation, compaction and the indirect draw arrive in later checkpoints. Present an
+-    // empty frame so emission is exercised on the GPU while the picture is still honestly black.
++    UINT const finalIndex = SlotIndex(currentSlots.readSlot);
++    ID3D12Resource *finalState = stateBuffers[finalIndex];
++
++    if (lastSubstepCount == 0U)
++    {
++        slotsUsed_ = frameStartSlots;
++        resultSlot_ = frameStartSlots.readSlot;
++    }
++    else
++    {
++        slotsUsed_ = AdvanceFrameSlots(currentSlots);
++        resultSlot_ = slotsUsed_.writeSlot;
++    }
++
++    // The advanced live set is not compacted or drawn yet: present an empty frame so simulation is exercised on the
++    // GPU while the picture is still honestly black.
+     std::vector<D3D12_TEXTURE_BARRIER> textureBarriers{
+         gpu::MakeTextureBarrier(*frameContext.renderTarget, gpu::FrameStartState(frameContext),
+                                 gpu::RenderTargetState()),
+@@ -541,20 +576,20 @@ lgp::framework::Status Renderer::Render(lgp::framework::FrameContext const &fram
+     };
+     gpu::SubmitTextureBarriers(commandList, textureBarriers);
+ 
+-    // Copy the reset evidence out: the cleared state image and the zeroed counters.
++    // Copy the advanced state image and the counters out of the final ping-pong slot.
+     {
+         std::vector<D3D12_BUFFER_BARRIER> barriers{
+-            gpu::MakeBufferBarrier(*stateA_.Get(), gpu::ComputeUnorderedAccessState(), gpu::CopySourceState()),
++            gpu::MakeBufferBarrier(*finalState, gpu::ComputeUnorderedAccessState(), gpu::CopySourceState()),
+             gpu::MakeBufferBarrier(*counters_.Get(), gpu::ComputeUnorderedAccessState(), gpu::CopySourceState()),
+         };
+         gpu::SubmitBufferBarriers(commandList, barriers);
+     }
+-    commandList.CopyBufferRegion(stateReadback_.Get(), 0U, stateA_.Get(), 0U,
++    commandList.CopyBufferRegion(stateReadback_.Get(), 0U, finalState, 0U,
+                                  static_cast<std::uint64_t>(configuration.capacity) * sizeof(gpu::GpuParticle));
+     commandList.CopyBufferRegion(countersReadback_.Get(), 0U, counters_.Get(), 0U, counters_.size_in_bytes());
+     {
+         std::vector<D3D12_BUFFER_BARRIER> barriers{
+-            gpu::MakeBufferBarrier(*stateA_.Get(), gpu::CopySourceState(), gpu::ComputeUnorderedAccessState()),
++            gpu::MakeBufferBarrier(*finalState, gpu::CopySourceState(), gpu::ComputeUnorderedAccessState()),
+             gpu::MakeBufferBarrier(*counters_.Get(), gpu::CopySourceState(), gpu::ComputeUnorderedAccessState()),
+         };
+         gpu::SubmitBufferBarriers(commandList, barriers);
+@@ -592,19 +627,22 @@ std::expected<gpu::FrameReadback, lgp::framework::Error> Renderer::ReadBackOutpu
+     readback.state.assign(state, state + configuration.capacity);
+     readback.readbackChecksum = gpu::ChecksumGpuState(readback.state);
+ 
+-    // Emission has run, but simulation, compaction, indirect arguments and the draw have not. Report the emission
+-    // stage as submitted and the rest as skipped instead of borrowing the shared partition.
++    readback.slotsUsed = slotsUsed_;
++    readback.resultSlot = resultSlot_;
++
++    // Emission and simulation have run, but compaction, indirect arguments and the draw have not. Report those
++    // stages honestly instead of borrowing the shared partition, which assumes the whole frame executed.
+     StagePartition partition{};
+     partition.submittedMask = StageBit(FrameStage::Reset) | StageBit(FrameStage::Readback);
+-    partition.skippedMask = StageBit(FrameStage::Simulation) | StageBit(FrameStage::Compaction) |
+-                            StageBit(FrameStage::IndirectArguments) | StageBit(FrameStage::Render);
++    partition.skippedMask =
++        StageBit(FrameStage::Compaction) | StageBit(FrameStage::IndirectArguments) | StageBit(FrameStage::Render);
+     if (anySubsteps_)
+     {
+-        partition.submittedMask |= StageBit(FrameStage::Emission);
++        partition.submittedMask |= StageBit(FrameStage::Emission) | StageBit(FrameStage::Simulation);
+     }
+     else
+     {
+-        partition.skippedMask |= StageBit(FrameStage::Emission);
++        partition.skippedMask |= StageBit(FrameStage::Emission) | StageBit(FrameStage::Simulation);
+     }
+     partition.recordedMask = partition.submittedMask | partition.skippedMask | partition.unavailableMask;
+     readback.stagePartition = partition;
+@@ -641,11 +679,13 @@ void Renderer::DestroyResources(lgp::framework::DeviceResources &deviceResources
+ void Renderer::Shutdown(lgp::framework::DeviceResources &deviceResources) noexcept
+ {
+     DestroyResources(deviceResources);
++    simulatePipeline_.Reset();
+     emitPipeline_.Reset();
+     initPipeline_.Reset();
+     computeRootSignature_.Reset();
+     initShader_ = {};
+     emitShader_ = {};
++    simulateShader_ = {};
+     resourcesInitialized_ = false;
+     deviceResources_ = nullptr;
+ }
+diff --git a/chapters/gpu-particle-systems/Starter/Renderer.hpp b/chapters/gpu-particle-systems/Starter/Renderer.hpp
+index 25e8d2a..78d1c23 100644
+--- a/chapters/gpu-particle-systems/Starter/Renderer.hpp
++++ b/chapters/gpu-particle-systems/Starter/Renderer.hpp
+@@ -51,10 +51,12 @@ class Renderer final : public lgp::framework::IChapterRenderer
+ 
+     lgp::framework::CompiledShader initShader_{};
+     lgp::framework::CompiledShader emitShader_{};
++    lgp::framework::CompiledShader simulateShader_{};
+ 
+     Microsoft::WRL::ComPtr<ID3D12RootSignature> computeRootSignature_{};
+     Microsoft::WRL::ComPtr<ID3D12PipelineState> initPipeline_{};
+     Microsoft::WRL::ComPtr<ID3D12PipelineState> emitPipeline_{};
++    Microsoft::WRL::ComPtr<ID3D12PipelineState> simulatePipeline_{};
+ 
+     gpu::BufferResource stateA_{};
+     gpu::BufferResource stateB_{};
+@@ -80,6 +82,8 @@ class Renderer final : public lgp::framework::IChapterRenderer
+     bool headless_{false};
+ 
+     FixedStepPlan lastPlan_{};
++    FrameSlots slotsUsed_{};
++    BufferSlot resultSlot_{BufferSlot::A};
+     bool anySubsteps_{false};
+ };
+ 

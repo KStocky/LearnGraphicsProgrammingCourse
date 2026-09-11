@@ -1,0 +1,317 @@
+diff --git a/chapters/gpu-particle-systems/Starter/ParticleLab.hlsl b/chapters/gpu-particle-systems/Starter/ParticleLab.hlsl
+index 03d5d4c..2fbe377 100644
+--- a/chapters/gpu-particle-systems/Starter/ParticleLab.hlsl
++++ b/chapters/gpu-particle-systems/Starter/ParticleLab.hlsl
+@@ -1,11 +1,11 @@
+-// Chapter 34 checkpoint 1: establish the GPU particle state and the reset pass.
++// Chapter 34 checkpoint 2: GPU emission with deterministic identities and capacity accounting.
+ //
+-// The lab stops uploading a CPU reference and starts owning its state on the GPU. This file declares the particle
+-// ABI, the unordered-access views the compute passes write, the constant block the host fills every dispatch, and
+-// the first pass the frame runs: InitCS clears both state slots to dead particles, zeroes the counters, and seeds
+-// the compacted lists and their out-of-bounds sentinels. Emission, simulation, compaction, indirect arguments and
+-// the checksum arrive in later checkpoints; their bindings are declared here so the resource layout is stable, but
+-// nothing writes them yet.
++// After the reset pass, EmitCS allocates free slots from a group-scanned dead list, issues a monotone identity to
++// each spawned particle from a persistent counter, and seeds its position and velocity deterministically from
++// (seed, identity) so a spawn is reproducible on any adapter. Requested, spawned and dropped counters are the
++// honest capacity ledger: when more emission is requested than there are dead slots, the surplus is dropped rather
++// than silently overrunning. Simulation, compaction, indirect arguments and the checksum arrive in later
++// checkpoints, so emitted particles are not moved, retired, compacted or drawn yet.
+ 
+ #define LGP_PARTICLE_THREAD_GROUP_SIZE 256
+ 
+@@ -103,6 +103,21 @@ uint Finalize32(uint value)
+     return value;
+ }
+ 
++uint MixSeed(uint seedLo, uint seedHi, uint identity, uint stream)
++{
++    uint state = Finalize32(seedLo ^ 0x9E3779B9u);
++    state = Finalize32(state ^ seedHi);
++    state = Finalize32(state ^ identity);
++    state = Finalize32(state ^ stream);
++    return state;
++}
++
++float SignedUnitFromBits(uint bits)
++{
++    float unit = float(bits >> 8u) * (1.0 / 16777216.0);
++    return (unit * 2.0) - 1.0;
++}
++
+ GpuParticle DeadParticle()
+ {
+     GpuParticle p;
+@@ -119,6 +134,44 @@ GpuParticle DeadParticle()
+     return p;
+ }
+ 
++GpuParticle LoadState(uint slot, uint index)
++{
++    if (slot == 0u)
++    {
++        return gStateA[index];
++    }
++    return gStateB[index];
++}
++
++void StoreState(uint slot, uint index, GpuParticle value)
++{
++    if (slot == 0u)
++    {
++        gStateA[index] = value;
++    }
++    else
++    {
++        gStateB[index] = value;
++    }
++}
++
++groupshared uint gScan[LGP_PARTICLE_THREAD_GROUP_SIZE];
++
++// Inclusive Hillis-Steele scan of gScan over the whole group. Returns the total and leaves gScan holding the
++// inclusive prefix so a caller recovers the exclusive prefix by subtracting its own input.
++uint InclusiveScanGroup(uint groupIndex)
++{
++    [unroll]
++    for (uint offset = 1u; offset < LGP_PARTICLE_THREAD_GROUP_SIZE; offset <<= 1u)
++    {
++        uint addend = (groupIndex >= offset) ? gScan[groupIndex - offset] : 0u;
++        GroupMemoryBarrierWithGroupSync();
++        gScan[groupIndex] += addend;
++        GroupMemoryBarrierWithGroupSync();
++    }
++    return gScan[LGP_PARTICLE_THREAD_GROUP_SIZE - 1u];
++}
++
+ [numthreads(LGP_PARTICLE_THREAD_GROUP_SIZE, 1, 1)]
+ void InitCS(uint3 dispatchThreadId : SV_DispatchThreadID)
+ {
+@@ -146,6 +199,54 @@ void InitCS(uint3 dispatchThreadId : SV_DispatchThreadID)
+     }
+ }
+ 
++[numthreads(LGP_PARTICLE_THREAD_GROUP_SIZE, 1, 1)]
++void EmitCS(uint3 dispatchThreadId : SV_DispatchThreadID, uint groupIndex : SV_GroupIndex)
++{
++    uint index = dispatchThreadId.x;
++    uint dead = 0u;
++    if (index < gCapacity)
++    {
++        dead = (LoadState(gReadSlot, index).alive == 0u) ? 1u : 0u;
++    }
++    gScan[groupIndex] = dead;
++    GroupMemoryBarrierWithGroupSync();
++
++    uint totalDead = InclusiveScanGroup(groupIndex);
++    uint exclusiveDead = gScan[groupIndex] - dead;
++
++    uint spawnCount = min(gRequested, totalDead);
++    uint nextIdentity = gCounters[kCounterNextIdentity];
++
++    uint spawnIndex = (gDeadSlotPolicy == 0u) ? exclusiveDead : (totalDead - 1u - exclusiveDead);
++    if (index < gCapacity && dead == 1u && spawnIndex < spawnCount)
++    {
++        uint identity = nextIdentity + spawnIndex;
++
++        GpuParticle p;
++        p.identity = identity;
++        p.alive = 1u;
++        p.px = gOriginX + (gPosJitter * SignedUnitFromBits(MixSeed(gSeedLo, gSeedHi, identity, 0u)));
++        p.py = gOriginY + (gPosJitter * SignedUnitFromBits(MixSeed(gSeedLo, gSeedHi, identity, 1u)));
++        p.pz = gOriginZ + (gPosJitter * SignedUnitFromBits(MixSeed(gSeedLo, gSeedHi, identity, 2u)));
++        p.vx = gBaseVelX + (gVelJitter * SignedUnitFromBits(MixSeed(gSeedLo, gSeedHi, identity, 3u)));
++        p.vy = gBaseVelY + (gVelJitter * SignedUnitFromBits(MixSeed(gSeedLo, gSeedHi, identity, 4u)));
++        p.vz = gBaseVelZ + (gVelJitter * SignedUnitFromBits(MixSeed(gSeedLo, gSeedHi, identity, 5u)));
++        p.age = 0.0;
++        p.lifetime = gLifetime;
++        StoreState(gReadSlot, index, p);
++    }
++
++    GroupMemoryBarrierWithGroupSync();
++    if (groupIndex == 0u)
++    {
++        uint dropped = gRequested - spawnCount;
++        gCounters[kCounterNextIdentity] = nextIdentity + spawnCount;
++        gCounters[kCounterRequested] += gRequested;
++        gCounters[kCounterSpawned] += spawnCount;
++        gCounters[kCounterDropped] += dropped;
++    }
++}
++
+ float2 QuadCorner(uint vertexId)
+ {
+     switch (vertexId)
+diff --git a/chapters/gpu-particle-systems/Starter/Renderer.cpp b/chapters/gpu-particle-systems/Starter/Renderer.cpp
+index 01ea91a..3f23d64 100644
+--- a/chapters/gpu-particle-systems/Starter/Renderer.cpp
++++ b/chapters/gpu-particle-systems/Starter/Renderer.cpp
+@@ -116,6 +116,11 @@ static_assert(sizeof(LabConstants) == 128U);
+     return {};
+ }
+ 
++[[nodiscard]] UINT SlotIndex(BufferSlot slot) noexcept
++{
++    return slot == BufferSlot::A ? 0U : 1U;
++}
++
+ } // namespace
+ 
+ lgp::framework::Status Renderer::CreateShaders()
+@@ -135,7 +140,11 @@ lgp::framework::Status Renderer::CreateShaders()
+     options.optimize = false;
+ #endif
+ 
+-    return gpu::CompileShader(compiler, options, L"InitCS", L"cs_6_0", initShader_);
++    if (auto status = gpu::CompileShader(compiler, options, L"InitCS", L"cs_6_0", initShader_); !status)
++    {
++        return status;
++    }
++    return gpu::CompileShader(compiler, options, L"EmitCS", L"cs_6_0", emitShader_);
+ }
+ 
+ lgp::framework::Status Renderer::CreateRootSignatures()
+@@ -185,7 +194,12 @@ lgp::framework::Status Renderer::CreateRootSignatures()
+ lgp::framework::Status Renderer::CreatePipelines()
+ {
+     ID3D12Device10 &device = *deviceResources_->device();
+-    return CreateComputePipeline(device, *computeRootSignature_.Get(), initShader_, "init", initPipeline_);
++    if (auto status = CreateComputePipeline(device, *computeRootSignature_.Get(), initShader_, "init", initPipeline_);
++        !status)
++    {
++        return status;
++    }
++    return CreateComputePipeline(device, *computeRootSignature_.Get(), emitShader_, "emit", emitPipeline_);
+ }
+ 
+ lgp::framework::Status Renderer::CreateResources()
+@@ -462,8 +476,54 @@ lgp::framework::Status Renderer::Render(lgp::framework::FrameContext const &fram
+     commandList.SetPipelineState(initPipeline_.Get());
+     commandList.Dispatch(1U, 1U, 1U);
+ 
+-    // No live set exists yet: emission, simulation and compaction arrive in later checkpoints. Present an empty
+-    // frame so the reset pass is exercised on the GPU while the picture is still honestly black.
++    ID3D12Resource *const stateBuffers[2]{stateA_.Get(), stateB_.Get()};
++
++    auto uavBarrier = [&commandList](std::initializer_list<ID3D12Resource *> resources)
++    {
++        std::vector<D3D12_BUFFER_BARRIER> barriers{};
++        for (ID3D12Resource *resource : resources)
++        {
++            barriers.push_back(gpu::MakeBufferBarrier(*resource, gpu::ComputeUnorderedAccessState(),
++                                                      gpu::ComputeUnorderedAccessState()));
++        }
++        gpu::SubmitBufferBarriers(commandList, barriers);
++    };
++
++    // Emission runs each substep, allocating from the scanned dead list into the read slot in place. Simulation and
++    // ping-pong ownership arrive in the next checkpoint, so the read slot is never advanced yet.
++    FrameSlots currentSlots{.readSlot = BufferSlot::A, .writeSlot = BufferSlot::B};
++    double accumulator = 0.0;
++    double carry = 0.0;
++    anySubsteps_ = false;
++
++    for (std::uint32_t frame = 0U; frame < configuration.frameCount; ++frame)
++    {
++        auto plan = gpu::PlanFrameEmission(configuration.frame, accumulator, carry, configuration.frameDeltaSeconds);
++        if (!plan)
++        {
++            return std::unexpected(lgp::framework::MakeError(
++                "Render", std::string{"Plan failed: "} + std::string{ContractErrorName(plan.error())}));
++        }
++        lastPlan_ = plan->plan;
++
++        for (std::uint32_t substep = 0U; substep < plan->plan.substepCount; ++substep)
++        {
++            UINT const readIndex = SlotIndex(currentSlots.readSlot);
++            UINT const writeIndex = SlotIndex(currentSlots.writeSlot);
++
++            uavBarrier({stateBuffers[readIndex], counters_.Get()});
++            SetLabConstants(commandList, configuration, readIndex, writeIndex, plan->requestedPerSubstep[substep]);
++            commandList.SetPipelineState(emitPipeline_.Get());
++            commandList.Dispatch(1U, 1U, 1U);
++            anySubsteps_ = true;
++        }
++
++        accumulator = plan->nextAccumulatorSeconds;
++        carry = plan->nextEmissionCarry;
++    }
++
++    // No live set is drawn yet: simulation, compaction and the indirect draw arrive in later checkpoints. Present an
++    // empty frame so emission is exercised on the GPU while the picture is still honestly black.
+     std::vector<D3D12_TEXTURE_BARRIER> textureBarriers{
+         gpu::MakeTextureBarrier(*frameContext.renderTarget, gpu::FrameStartState(frameContext),
+                                 gpu::RenderTargetState()),
+@@ -520,6 +580,7 @@ std::expected<gpu::FrameReadback, lgp::framework::Error> Renderer::ReadBackOutpu
+     }
+ 
+     gpu::FrameReadback readback{};
++    readback.lastPlan = lastPlan_;
+     readback.requested = counters[1];
+     readback.spawned = counters[2];
+     readback.dropped = counters[3];
+@@ -531,13 +592,20 @@ std::expected<gpu::FrameReadback, lgp::framework::Error> Renderer::ReadBackOutpu
+     readback.state.assign(state, state + configuration.capacity);
+     readback.readbackChecksum = gpu::ChecksumGpuState(readback.state);
+ 
+-    // Only the reset pass has run. Report that honestly rather than borrowing the shared partition, which assumes
+-    // the whole frame executed: emission, simulation, compaction, indirect arguments and the draw are skipped.
++    // Emission has run, but simulation, compaction, indirect arguments and the draw have not. Report the emission
++    // stage as submitted and the rest as skipped instead of borrowing the shared partition.
+     StagePartition partition{};
+     partition.submittedMask = StageBit(FrameStage::Reset) | StageBit(FrameStage::Readback);
+-    partition.skippedMask = StageBit(FrameStage::Emission) | StageBit(FrameStage::Simulation) |
+-                            StageBit(FrameStage::Compaction) | StageBit(FrameStage::IndirectArguments) |
+-                            StageBit(FrameStage::Render);
++    partition.skippedMask = StageBit(FrameStage::Simulation) | StageBit(FrameStage::Compaction) |
++                            StageBit(FrameStage::IndirectArguments) | StageBit(FrameStage::Render);
++    if (anySubsteps_)
++    {
++        partition.submittedMask |= StageBit(FrameStage::Emission);
++    }
++    else
++    {
++        partition.skippedMask |= StageBit(FrameStage::Emission);
++    }
+     partition.recordedMask = partition.submittedMask | partition.skippedMask | partition.unavailableMask;
+     readback.stagePartition = partition;
+ 
+@@ -573,9 +641,11 @@ void Renderer::DestroyResources(lgp::framework::DeviceResources &deviceResources
+ void Renderer::Shutdown(lgp::framework::DeviceResources &deviceResources) noexcept
+ {
+     DestroyResources(deviceResources);
++    emitPipeline_.Reset();
+     initPipeline_.Reset();
+     computeRootSignature_.Reset();
+     initShader_ = {};
++    emitShader_ = {};
+     resourcesInitialized_ = false;
+     deviceResources_ = nullptr;
+ }
+diff --git a/chapters/gpu-particle-systems/Starter/Renderer.hpp b/chapters/gpu-particle-systems/Starter/Renderer.hpp
+index 83bdd97..25e8d2a 100644
+--- a/chapters/gpu-particle-systems/Starter/Renderer.hpp
++++ b/chapters/gpu-particle-systems/Starter/Renderer.hpp
+@@ -50,9 +50,11 @@ class Renderer final : public lgp::framework::IChapterRenderer
+     lgp::framework::DeviceResources *deviceResources_{};
+ 
+     lgp::framework::CompiledShader initShader_{};
++    lgp::framework::CompiledShader emitShader_{};
+ 
+     Microsoft::WRL::ComPtr<ID3D12RootSignature> computeRootSignature_{};
+     Microsoft::WRL::ComPtr<ID3D12PipelineState> initPipeline_{};
++    Microsoft::WRL::ComPtr<ID3D12PipelineState> emitPipeline_{};
+ 
+     gpu::BufferResource stateA_{};
+     gpu::BufferResource stateB_{};
+@@ -76,6 +78,9 @@ class Renderer final : public lgp::framework::IChapterRenderer
+ 
+     std::optional<gpu::LabConfiguration> headlessConfiguration_{};
+     bool headless_{false};
++
++    FixedStepPlan lastPlan_{};
++    bool anySubsteps_{false};
+ };
+ 
+ } // namespace ch34::particles::starter

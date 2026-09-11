@@ -1,0 +1,959 @@
+diff --git a/chapters/gpu-particle-systems/Starter/ParticleLab.hlsl b/chapters/gpu-particle-systems/Starter/ParticleLab.hlsl
+index bf9b9bc..03d5d4c 100644
+--- a/chapters/gpu-particle-systems/Starter/ParticleLab.hlsl
++++ b/chapters/gpu-particle-systems/Starter/ParticleLab.hlsl
+@@ -1,11 +1,13 @@
+-// Chapter 34 Starter GPU particle lab.
++// Chapter 34 checkpoint 1: establish the GPU particle state and the reset pass.
+ //
+-// The Starter is an honest deterministic baseline, not a pretend GPU pipeline. The CPU reference advances the
+-// particle system, compacts the live set, and the host uploads that compacted state for a direct instanced draw.
+-// There is no emission, simulation, compaction, or indirect-argument compute here: the render pass simply draws
+-// the particles the reference produced, so the picture on screen is real GPU output while every decision it
+-// depends on is made by the auditable CPU contract. The Solution replaces the upload with the equivalent on-GPU
+-// passes, and shares this exact draw so the two images agree.
++// The lab stops uploading a CPU reference and starts owning its state on the GPU. This file declares the particle
++// ABI, the unordered-access views the compute passes write, the constant block the host fills every dispatch, and
++// the first pass the frame runs: InitCS clears both state slots to dead particles, zeroes the counters, and seeds
++// the compacted lists and their out-of-bounds sentinels. Emission, simulation, compaction, indirect arguments and
++// the checksum arrive in later checkpoints; their bindings are declared here so the resource layout is stable, but
++// nothing writes them yet.
++
++#define LGP_PARTICLE_THREAD_GROUP_SIZE 256
+ 
+ struct GpuParticle
+ {
+@@ -21,10 +23,55 @@ struct GpuParticle
+     float lifetime;
+ };
+ 
++RWStructuredBuffer<GpuParticle> gStateA : register(u0);
++RWStructuredBuffer<GpuParticle> gStateB : register(u1);
++RWStructuredBuffer<uint> gCounters : register(u2);
++RWStructuredBuffer<uint> gCompactedSlots : register(u3);
++RWStructuredBuffer<uint> gCompactedIdentities : register(u4);
++RWByteAddressBuffer gIndirectArgs : register(u5);
++RWStructuredBuffer<uint> gIndirectCount : register(u6);
++RWStructuredBuffer<uint2> gChecksum : register(u7);
++
+ StructuredBuffer<GpuParticle> gDrawStateA : register(t0);
+ StructuredBuffer<GpuParticle> gDrawStateB : register(t1);
+ StructuredBuffer<uint> gDrawSlots : register(t2);
+ 
++cbuffer LabConstants : register(b0)
++{
++    uint gCapacity;
++    uint gReadSlot;
++    uint gWriteSlot;
++    uint gRequested;
++    uint gIntegrator;
++    uint gGroundEnabled;
++    uint gVertexCountPerParticle;
++    uint gDrawCapacity;
++    uint gOutputCapacity;
++    uint gSeedLo;
++    uint gSeedHi;
++    uint gDeadSlotPolicy;
++    float gTimestep;
++    float gGravityX;
++    float gGravityY;
++    float gGravityZ;
++    float gLinearDrag;
++    float gOriginX;
++    float gOriginY;
++    float gOriginZ;
++    float gPosJitter;
++    float gBaseVelX;
++    float gBaseVelY;
++    float gBaseVelZ;
++    float gVelJitter;
++    float gGroundHeight;
++    float gRestitution;
++    float gFriction;
++    float gRestingSpeed;
++    float gLifetime;
++    float gViewScale;
++    float gQuadHalfExtent;
++};
++
+ cbuffer DrawConstants : register(b1)
+ {
+     uint gDrawStateSlot;
+@@ -33,6 +80,19 @@ cbuffer DrawConstants : register(b1)
+     uint gDrawPad;
+ };
+ 
++// Counter buffer indices. The dead list is a scanned free list rather than an append counter, so the only counter
++// that must persist across substeps is the monotone identity source and the lifetime accounting.
++static const uint kCounterNextIdentity = 0u;
++static const uint kCounterRequested = 1u;
++static const uint kCounterSpawned = 2u;
++static const uint kCounterDropped = 3u;
++static const uint kCounterDied = 4u;
++static const uint kCounterContact = 5u;
++static const uint kCounterLive = 6u;
++static const uint kCounterEmitted = 7u;
++
++static const uint kInvalidId = 0xFFFFFFFFu;
++
+ uint Finalize32(uint value)
+ {
+     value ^= value >> 16u;
+@@ -43,6 +103,49 @@ uint Finalize32(uint value)
+     return value;
+ }
+ 
++GpuParticle DeadParticle()
++{
++    GpuParticle p;
++    p.identity = kInvalidId;
++    p.alive = 0u;
++    p.px = 0.0;
++    p.py = 0.0;
++    p.pz = 0.0;
++    p.vx = 0.0;
++    p.vy = 0.0;
++    p.vz = 0.0;
++    p.age = 0.0;
++    p.lifetime = 0.0;
++    return p;
++}
++
++[numthreads(LGP_PARTICLE_THREAD_GROUP_SIZE, 1, 1)]
++void InitCS(uint3 dispatchThreadId : SV_DispatchThreadID)
++{
++    uint index = dispatchThreadId.x;
++    if (index < gCapacity)
++    {
++        gStateA[index] = DeadParticle();
++        gStateB[index] = DeadParticle();
++    }
++    if (index < 8u)
++    {
++        gCounters[index] = 0u;
++    }
++    if (index < gCapacity)
++    {
++        gCompactedSlots[index] = kInvalidId;
++        gCompactedIdentities[index] = kInvalidId;
++    }
++    // The sentinel sits at the configured output boundary. Without the scatter clamp, the first excess live
++    // particle overwrites it, including when the boundary equals the maximum 256-particle capacity.
++    if (index == 0u)
++    {
++        gCompactedSlots[gOutputCapacity] = kInvalidId;
++        gCompactedIdentities[gOutputCapacity] = kInvalidId;
++    }
++}
++
+ float2 QuadCorner(uint vertexId)
+ {
+     switch (vertexId)
+diff --git a/chapters/gpu-particle-systems/Starter/Renderer.cpp b/chapters/gpu-particle-systems/Starter/Renderer.cpp
+index e0c2f3d..01ea91a 100644
+--- a/chapters/gpu-particle-systems/Starter/Renderer.cpp
++++ b/chapters/gpu-particle-systems/Starter/Renderer.cpp
+@@ -11,8 +11,8 @@
+ #include <d3d12.h>
+ #include <wrl/client.h>
+ 
+-#include <algorithm>
+ #include <array>
++#include <cstring>
+ #include <filesystem>
+ #include <string>
+ 
+@@ -23,20 +23,67 @@ namespace
+ 
+ using Microsoft::WRL::ComPtr;
+ 
+-enum GraphicsRootParameter : UINT
++inline constexpr UINT kUavCount = 8U;
++inline constexpr UINT kSrvCount = 3U;
++inline constexpr UINT kDescriptorCount = kUavCount + kSrvCount;
++inline constexpr UINT kSrvTableOffset = kUavCount;
++
++enum ComputeRootParameter : UINT
++{
++    ComputeConstants = 0U,
++    ComputeUavTable = 1U,
++};
++
++enum UavIndex : UINT
+ {
+-    DrawConstantsParam = 0U,
+-    DrawSrvTable = 1U,
++    StateAUav = 0U,
++    StateBUav = 1U,
++    CountersUav = 2U,
++    CompactedSlotsUav = 3U,
++    CompactedIdentitiesUav = 4U,
++    IndirectArgsUav = 5U,
++    IndirectCountUav = 6U,
++    ChecksumUav = 7U,
+ };
+ 
+-struct DrawConstants final
++struct LabConstants final
+ {
+-    std::uint32_t drawStateSlot{};
++    std::uint32_t capacity{};
++    std::uint32_t readSlot{};
++    std::uint32_t writeSlot{};
++    std::uint32_t requested{};
++    std::uint32_t integrator{};
++    std::uint32_t groundEnabled{};
++    std::uint32_t vertexCountPerParticle{};
++    std::uint32_t drawCapacity{};
++    std::uint32_t outputCapacity{};
++    std::uint32_t seedLo{};
++    std::uint32_t seedHi{};
++    std::uint32_t deadSlotPolicy{};
++    float timestep{};
++    float gravityX{};
++    float gravityY{};
++    float gravityZ{};
++    float linearDrag{};
++    float originX{};
++    float originY{};
++    float originZ{};
++    float posJitter{};
++    float baseVelX{};
++    float baseVelY{};
++    float baseVelZ{};
++    float velJitter{};
++    float groundHeight{};
++    float restitution{};
++    float friction{};
++    float restingSpeed{};
++    float lifetime{};
+     float viewScale{};
+     float quadHalfExtent{};
+-    std::uint32_t pad{};
+ };
+ 
++static_assert(sizeof(LabConstants) == 128U);
++
+ [[nodiscard]] std::filesystem::path ShaderPath()
+ {
+     return std::filesystem::path{__FILE__}.parent_path() / "ParticleLab.hlsl";
+@@ -51,6 +98,24 @@ struct DrawConstants final
+     return {static_cast<char const *>(blob->GetBufferPointer()), static_cast<std::size_t>(blob->GetBufferSize())};
+ }
+ 
++[[nodiscard]] lgp::framework::Status CreateComputePipeline(ID3D12Device10 &device, ID3D12RootSignature &rootSignature,
++                                                           lgp::framework::CompiledShader const &shader,
++                                                           char const *label, ComPtr<ID3D12PipelineState> &pipeline)
++{
++    D3D12_COMPUTE_PIPELINE_STATE_DESC description{};
++    description.pRootSignature = &rootSignature;
++    description.CS = shader.Bytecode();
++    HRESULT const result =
++        device.CreateComputePipelineState(&description, IID_PPV_ARGS(pipeline.ReleaseAndGetAddressOf()));
++    if (FAILED(result))
++    {
++        return std::unexpected(
++            lgp::framework::MakeHResultError("ID3D12Device::CreateComputePipelineState", result,
++                                             std::string{"Failed to create the Chapter 34 "} + label + " pipeline."));
++    }
++    return {};
++}
++
+ } // namespace
+ 
+ lgp::framework::Status Renderer::CreateShaders()
+@@ -70,152 +135,173 @@ lgp::framework::Status Renderer::CreateShaders()
+     options.optimize = false;
+ #endif
+ 
+-    if (auto status = gpu::CompileShader(compiler, options, L"ParticleVS", L"vs_6_0", vertexShader_); !status)
+-    {
+-        return status;
+-    }
+-    return gpu::CompileShader(compiler, options, L"ParticlePS", L"ps_6_0", pixelShader_);
++    return gpu::CompileShader(compiler, options, L"InitCS", L"cs_6_0", initShader_);
+ }
+ 
+-lgp::framework::Status Renderer::CreateRootSignature()
++lgp::framework::Status Renderer::CreateRootSignatures()
+ {
+-    D3D12_DESCRIPTOR_RANGE srvRange{};
+-    srvRange.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV;
+-    srvRange.NumDescriptors = 3U;
+-    srvRange.BaseShaderRegister = 0U;
+-    srvRange.OffsetInDescriptorsFromTableStart = D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND;
+-
+-    D3D12_ROOT_PARAMETER parameters[2]{};
+-    parameters[DrawConstantsParam].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+-    parameters[DrawConstantsParam].Constants.ShaderRegister = 1U;
+-    parameters[DrawConstantsParam].Constants.Num32BitValues = sizeof(DrawConstants) / sizeof(std::uint32_t);
+-    parameters[DrawConstantsParam].ShaderVisibility = D3D12_SHADER_VISIBILITY_VERTEX;
+-    parameters[DrawSrvTable].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+-    parameters[DrawSrvTable].DescriptorTable.NumDescriptorRanges = 1U;
+-    parameters[DrawSrvTable].DescriptorTable.pDescriptorRanges = &srvRange;
+-    parameters[DrawSrvTable].ShaderVisibility = D3D12_SHADER_VISIBILITY_VERTEX;
+-
+-    D3D12_ROOT_SIGNATURE_DESC description{};
+-    description.NumParameters = static_cast<UINT>(std::size(parameters));
+-    description.pParameters = parameters;
+-    description.Flags = D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT |
+-                        D3D12_ROOT_SIGNATURE_FLAG_DENY_HULL_SHADER_ROOT_ACCESS |
+-                        D3D12_ROOT_SIGNATURE_FLAG_DENY_DOMAIN_SHADER_ROOT_ACCESS |
+-                        D3D12_ROOT_SIGNATURE_FLAG_DENY_GEOMETRY_SHADER_ROOT_ACCESS;
++    D3D12_DESCRIPTOR_RANGE uavRange{};
++    uavRange.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_UAV;
++    uavRange.NumDescriptors = kUavCount;
++    uavRange.BaseShaderRegister = 0U;
++    uavRange.OffsetInDescriptorsFromTableStart = D3D12_DESCRIPTOR_RANGE_OFFSET_APPEND;
++
++    D3D12_ROOT_PARAMETER computeParameters[2]{};
++    computeParameters[ComputeConstants].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
++    computeParameters[ComputeConstants].Constants.ShaderRegister = 0U;
++    computeParameters[ComputeConstants].Constants.Num32BitValues = sizeof(LabConstants) / sizeof(std::uint32_t);
++    computeParameters[ComputeConstants].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
++    computeParameters[ComputeUavTable].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
++    computeParameters[ComputeUavTable].DescriptorTable.NumDescriptorRanges = 1U;
++    computeParameters[ComputeUavTable].DescriptorTable.pDescriptorRanges = &uavRange;
++    computeParameters[ComputeUavTable].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
++
++    D3D12_ROOT_SIGNATURE_DESC computeDescription{};
++    computeDescription.NumParameters = static_cast<UINT>(std::size(computeParameters));
++    computeDescription.pParameters = computeParameters;
+ 
+     ComPtr<ID3DBlob> serialized{};
+     ComPtr<ID3DBlob> errors{};
+-    HRESULT const serializeResult =
+-        D3D12SerializeRootSignature(&description, D3D_ROOT_SIGNATURE_VERSION_1, serialized.ReleaseAndGetAddressOf(),
+-                                    errors.ReleaseAndGetAddressOf());
++    HRESULT serializeResult =
++        D3D12SerializeRootSignature(&computeDescription, D3D_ROOT_SIGNATURE_VERSION_1,
++                                    serialized.ReleaseAndGetAddressOf(), errors.ReleaseAndGetAddressOf());
+     if (FAILED(serializeResult))
+     {
+         return std::unexpected(
+             lgp::framework::MakeHResultError("D3D12SerializeRootSignature", serializeResult, BlobText(errors.Get())));
+     }
+-    HRESULT const createResult =
++    HRESULT createResult =
+         deviceResources_->device()->CreateRootSignature(0U, serialized->GetBufferPointer(), serialized->GetBufferSize(),
+-                                                        IID_PPV_ARGS(graphicsRootSignature_.ReleaseAndGetAddressOf()));
++                                                        IID_PPV_ARGS(computeRootSignature_.ReleaseAndGetAddressOf()));
+     if (FAILED(createResult))
+     {
+         return std::unexpected(
+             lgp::framework::MakeHResultError("ID3D12Device::CreateRootSignature", createResult,
+-                                             "Failed to create the Chapter 34 Starter root signature."));
++                                             "Failed to create the Chapter 34 compute root signature."));
+     }
+     return {};
+ }
+ 
+-lgp::framework::Status Renderer::CreatePipeline()
++lgp::framework::Status Renderer::CreatePipelines()
+ {
+-    D3D12_BLEND_DESC blend{};
+-    blend.RenderTarget[0].RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
+-    D3D12_RASTERIZER_DESC rasterizer{};
+-    rasterizer.FillMode = D3D12_FILL_MODE_SOLID;
+-    rasterizer.CullMode = D3D12_CULL_MODE_NONE;
+-    rasterizer.DepthClipEnable = TRUE;
+-    D3D12_DEPTH_STENCIL_DESC depth{};
+-    depth.DepthEnable = FALSE;
+-    depth.DepthWriteMask = D3D12_DEPTH_WRITE_MASK_ZERO;
+-    depth.DepthFunc = D3D12_COMPARISON_FUNC_ALWAYS;
+-
+-    D3D12_GRAPHICS_PIPELINE_STATE_DESC description{};
+-    description.pRootSignature = graphicsRootSignature_.Get();
+-    description.VS = vertexShader_.Bytecode();
+-    description.PS = pixelShader_.Bytecode();
+-    description.BlendState = blend;
+-    description.SampleMask = UINT_MAX;
+-    description.RasterizerState = rasterizer;
+-    description.DepthStencilState = depth;
+-    description.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+-    description.NumRenderTargets = 1U;
+-    description.RTVFormats[0] = deviceResources_->back_buffer_format();
+-    description.SampleDesc.Count = 1U;
+-
+-    HRESULT const createResult = deviceResources_->device()->CreateGraphicsPipelineState(
+-        &description, IID_PPV_ARGS(graphicsPipeline_.ReleaseAndGetAddressOf()));
+-    if (FAILED(createResult))
+-    {
+-        return std::unexpected(lgp::framework::MakeHResultError("ID3D12Device::CreateGraphicsPipelineState",
+-                                                                createResult,
+-                                                                "Failed to create the Chapter 34 Starter pipeline."));
+-    }
+-    return {};
++    ID3D12Device10 &device = *deviceResources_->device();
++    return CreateComputePipeline(device, *computeRootSignature_.Get(), initShader_, "init", initPipeline_);
+ }
+ 
+ lgp::framework::Status Renderer::CreateResources()
+ {
++    allocatedCapacity_ = gpu::kMaximumLabCapacity;
+     ID3D12Device10 &device = *deviceResources_->device();
+-    std::uint64_t const stateBytes = static_cast<std::uint64_t>(gpu::kMaximumLabCapacity) * sizeof(gpu::GpuParticle);
+-    std::uint64_t const listBytes = static_cast<std::uint64_t>(gpu::kMaximumLabCapacity + 1U) * sizeof(std::uint32_t);
+ 
+-    frameSlots_.resize(deviceResources_->back_buffer_count());
+-    for (FrameSlotResources &slot : frameSlots_)
++    std::uint64_t const stateBytes = static_cast<std::uint64_t>(allocatedCapacity_) * sizeof(gpu::GpuParticle);
++    std::uint64_t const listBytes = static_cast<std::uint64_t>(allocatedCapacity_ + 1U) * sizeof(std::uint32_t);
++    std::uint64_t const countersBytes = 8U * sizeof(std::uint32_t);
++    std::uint64_t const argsBytes = kDrawArgumentsSizeBytes;
++    std::uint64_t const countBytes = sizeof(std::uint32_t);
++    std::uint64_t const checksumBytes = 2U * sizeof(std::uint32_t);
++
++    auto make = [&device](gpu::BufferResource &target, std::uint64_t size, D3D12_HEAP_TYPE heap,
++                          D3D12_RESOURCE_FLAGS flags, wchar_t const *name, bool mapped) -> lgp::framework::Status
+     {
+-        auto stateA = gpu::CreateBuffer(device, stateBytes, D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_FLAG_NONE,
+-                                        L"Ch34 Starter State A", true);
+-        auto stateB = gpu::CreateBuffer(device, stateBytes, D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_FLAG_NONE,
+-                                        L"Ch34 Starter State B", true);
+-        auto slots = gpu::CreateBuffer(device, listBytes, D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_FLAG_NONE,
+-                                       L"Ch34 Starter Slots", true);
+-        if (!stateA)
++        auto buffer = gpu::CreateBuffer(device, size, heap, flags, name, mapped);
++        if (!buffer)
+         {
+-            return std::unexpected(std::move(stateA.error()));
++            return std::unexpected(std::move(buffer.error()));
+         }
+-        if (!stateB)
+-        {
+-            return std::unexpected(std::move(stateB.error()));
+-        }
+-        if (!slots)
+-        {
+-            return std::unexpected(std::move(slots.error()));
+-        }
+-        slot.stateA = std::move(*stateA);
+-        slot.stateB = std::move(*stateB);
+-        slot.slots = std::move(*slots);
++        target = std::move(*buffer);
++        return {};
++    };
+ 
+-        auto descriptors = deviceResources_->shader_visible_cbv_srv_uav_heap().Allocate(3U);
+-        if (!descriptors)
++    constexpr D3D12_RESOURCE_FLAGS kUav = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
++    constexpr D3D12_RESOURCE_FLAGS kNone = D3D12_RESOURCE_FLAG_NONE;
++    struct BufferSpec final
++    {
++        gpu::BufferResource *target;
++        std::uint64_t size;
++        D3D12_HEAP_TYPE heap;
++        D3D12_RESOURCE_FLAGS flags;
++        wchar_t const *name;
++        bool mapped;
++    };
++    std::array<BufferSpec, 15U> const specs{{
++        {&stateA_, stateBytes, D3D12_HEAP_TYPE_DEFAULT, kUav, L"Ch34 State A", false},
++        {&stateB_, stateBytes, D3D12_HEAP_TYPE_DEFAULT, kUav, L"Ch34 State B", false},
++        {&counters_, countersBytes, D3D12_HEAP_TYPE_DEFAULT, kUav, L"Ch34 Counters", false},
++        {&compactedSlots_, listBytes, D3D12_HEAP_TYPE_DEFAULT, kUav, L"Ch34 Compacted Slots", false},
++        {&compactedIdentities_, listBytes, D3D12_HEAP_TYPE_DEFAULT, kUav, L"Ch34 Compacted Ids", false},
++        {&indirectArgs_, argsBytes, D3D12_HEAP_TYPE_DEFAULT, kUav, L"Ch34 Indirect Args", false},
++        {&indirectCount_, countBytes, D3D12_HEAP_TYPE_DEFAULT, kUav, L"Ch34 Indirect Count", false},
++        {&checksum_, checksumBytes, D3D12_HEAP_TYPE_DEFAULT, kUav, L"Ch34 Checksum", false},
++        {&stateReadback_, stateBytes, D3D12_HEAP_TYPE_READBACK, kNone, L"Ch34 State RB", true},
++        {&countersReadback_, countersBytes, D3D12_HEAP_TYPE_READBACK, kNone, L"Ch34 Counters RB", true},
++        {&compactedSlotsReadback_, listBytes, D3D12_HEAP_TYPE_READBACK, kNone, L"Ch34 Slots RB", true},
++        {&compactedIdentitiesReadback_, listBytes, D3D12_HEAP_TYPE_READBACK, kNone, L"Ch34 Ids RB", true},
++        {&indirectArgsReadback_, argsBytes, D3D12_HEAP_TYPE_READBACK, kNone, L"Ch34 Args RB", true},
++        {&indirectCountReadback_, countBytes, D3D12_HEAP_TYPE_READBACK, kNone, L"Ch34 Count RB", true},
++        {&checksumReadback_, checksumBytes, D3D12_HEAP_TYPE_READBACK, kNone, L"Ch34 Checksum RB", true},
++    }};
++    for (BufferSpec const &spec : specs)
++    {
++        if (auto status = make(*spec.target, spec.size, spec.heap, spec.flags, spec.name, spec.mapped); !status)
+         {
+-            return std::unexpected(std::move(descriptors.error()));
++            return status;
+         }
+-        slot.descriptors = *descriptors;
++    }
+ 
+-        auto structuredSrv =
+-            [&device](gpu::BufferResource &buffer, UINT numElements, UINT stride, D3D12_CPU_DESCRIPTOR_HANDLE handle)
+-        {
+-            D3D12_SHADER_RESOURCE_VIEW_DESC srv{};
+-            srv.ViewDimension = D3D12_SRV_DIMENSION_BUFFER;
+-            srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+-            srv.Format = DXGI_FORMAT_UNKNOWN;
+-            srv.Buffer.FirstElement = 0U;
+-            srv.Buffer.NumElements = numElements;
+-            srv.Buffer.StructureByteStride = stride;
+-            device.CreateShaderResourceView(buffer.Get(), &srv, handle);
+-        };
+-        structuredSrv(slot.stateA, gpu::kMaximumLabCapacity, sizeof(gpu::GpuParticle), slot.descriptors.CpuHandle(0U));
+-        structuredSrv(slot.stateB, gpu::kMaximumLabCapacity, sizeof(gpu::GpuParticle), slot.descriptors.CpuHandle(1U));
+-        structuredSrv(slot.slots, gpu::kMaximumLabCapacity + 1U, sizeof(std::uint32_t), slot.descriptors.CpuHandle(2U));
++    auto descriptors = deviceResources_->shader_visible_cbv_srv_uav_heap().Allocate(kDescriptorCount);
++    if (!descriptors)
++    {
++        return std::unexpected(std::move(descriptors.error()));
+     }
++    descriptors_ = *descriptors;
++
++    auto structuredUav =
++        [&device](gpu::BufferResource &buffer, UINT numElements, UINT stride, D3D12_CPU_DESCRIPTOR_HANDLE handle)
++    {
++        D3D12_UNORDERED_ACCESS_VIEW_DESC uav{};
++        uav.ViewDimension = D3D12_UAV_DIMENSION_BUFFER;
++        uav.Format = DXGI_FORMAT_UNKNOWN;
++        uav.Buffer.FirstElement = 0U;
++        uav.Buffer.NumElements = numElements;
++        uav.Buffer.StructureByteStride = stride;
++        device.CreateUnorderedAccessView(buffer.Get(), nullptr, &uav, handle);
++    };
++
++    structuredUav(stateA_, allocatedCapacity_, sizeof(gpu::GpuParticle), descriptors_.CpuHandle(StateAUav));
++    structuredUav(stateB_, allocatedCapacity_, sizeof(gpu::GpuParticle), descriptors_.CpuHandle(StateBUav));
++    structuredUav(counters_, 8U, sizeof(std::uint32_t), descriptors_.CpuHandle(CountersUav));
++    structuredUav(compactedSlots_, allocatedCapacity_ + 1U, sizeof(std::uint32_t),
++                  descriptors_.CpuHandle(CompactedSlotsUav));
++    structuredUav(compactedIdentities_, allocatedCapacity_ + 1U, sizeof(std::uint32_t),
++                  descriptors_.CpuHandle(CompactedIdentitiesUav));
++    structuredUav(indirectCount_, 1U, sizeof(std::uint32_t), descriptors_.CpuHandle(IndirectCountUav));
++    structuredUav(checksum_, 1U, 2U * sizeof(std::uint32_t), descriptors_.CpuHandle(ChecksumUav));
++
++    D3D12_UNORDERED_ACCESS_VIEW_DESC argsUav{};
++    argsUav.ViewDimension = D3D12_UAV_DIMENSION_BUFFER;
++    argsUav.Format = DXGI_FORMAT_R32_TYPELESS;
++    argsUav.Buffer.FirstElement = 0U;
++    argsUav.Buffer.NumElements = static_cast<UINT>(argsBytes / sizeof(std::uint32_t));
++    argsUav.Buffer.Flags = D3D12_BUFFER_UAV_FLAG_RAW;
++    device.CreateUnorderedAccessView(indirectArgs_.Get(), nullptr, &argsUav, descriptors_.CpuHandle(IndirectArgsUav));
++
++    auto structuredSrv =
++        [&device](gpu::BufferResource &buffer, UINT numElements, UINT stride, D3D12_CPU_DESCRIPTOR_HANDLE handle)
++    {
++        D3D12_SHADER_RESOURCE_VIEW_DESC srv{};
++        srv.ViewDimension = D3D12_SRV_DIMENSION_BUFFER;
++        srv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
++        srv.Format = DXGI_FORMAT_UNKNOWN;
++        srv.Buffer.FirstElement = 0U;
++        srv.Buffer.NumElements = numElements;
++        srv.Buffer.StructureByteStride = stride;
++        device.CreateShaderResourceView(buffer.Get(), &srv, handle);
++    };
++
++    structuredSrv(stateA_, allocatedCapacity_, sizeof(gpu::GpuParticle), descriptors_.CpuHandle(kSrvTableOffset + 0U));
++    structuredSrv(stateB_, allocatedCapacity_, sizeof(gpu::GpuParticle), descriptors_.CpuHandle(kSrvTableOffset + 1U));
++    structuredSrv(compactedSlots_, allocatedCapacity_ + 1U, sizeof(std::uint32_t),
++                  descriptors_.CpuHandle(kSrvTableOffset + 2U));
+     return {};
+ }
+ 
+@@ -228,6 +314,47 @@ gpu::LabConfiguration Renderer::ActiveConfiguration() const noexcept
+     return gpu::DefaultLabConfiguration();
+ }
+ 
++void Renderer::SetLabConstants(ID3D12GraphicsCommandList7 &commandList, gpu::LabConfiguration const &configuration,
++                               std::uint32_t readSlot, std::uint32_t writeSlot, std::uint32_t requested) const noexcept
++{
++    LabConstants constants{};
++    constants.capacity = configuration.capacity;
++    constants.readSlot = readSlot;
++    constants.writeSlot = writeSlot;
++    constants.requested = requested;
++    constants.integrator = static_cast<std::uint32_t>(configuration.frame.integrator);
++    constants.groundEnabled = configuration.frame.ground.enabled ? 1U : 0U;
++    constants.vertexCountPerParticle = gpu::kVertexCountPerParticle;
++    constants.drawCapacity = gpu::ResolveDrawCapacity(configuration);
++    constants.outputCapacity = gpu::ResolveOutputCapacity(configuration);
++    constants.seedLo = static_cast<std::uint32_t>(configuration.seed & 0xFFFFFFFFULL);
++    constants.seedHi = static_cast<std::uint32_t>(configuration.seed >> 32U);
++    constants.deadSlotPolicy = static_cast<std::uint32_t>(configuration.frame.emission.deadSlotPolicy);
++    constants.timestep = static_cast<float>(configuration.frame.step.fixedTimestepSeconds);
++    constants.gravityX = static_cast<float>(configuration.frame.field.gravityMetresPerSecondSquared.x);
++    constants.gravityY = static_cast<float>(configuration.frame.field.gravityMetresPerSecondSquared.y);
++    constants.gravityZ = static_cast<float>(configuration.frame.field.gravityMetresPerSecondSquared.z);
++    constants.linearDrag = static_cast<float>(configuration.frame.field.linearDragPerSecond);
++    constants.originX = static_cast<float>(configuration.frame.emission.originMetres.x);
++    constants.originY = static_cast<float>(configuration.frame.emission.originMetres.y);
++    constants.originZ = static_cast<float>(configuration.frame.emission.originMetres.z);
++    constants.posJitter = static_cast<float>(configuration.frame.emission.positionJitterMetres);
++    constants.baseVelX = static_cast<float>(configuration.frame.emission.baseVelocityMetresPerSecond.x);
++    constants.baseVelY = static_cast<float>(configuration.frame.emission.baseVelocityMetresPerSecond.y);
++    constants.baseVelZ = static_cast<float>(configuration.frame.emission.baseVelocityMetresPerSecond.z);
++    constants.velJitter = static_cast<float>(configuration.frame.emission.velocityJitterMetresPerSecond);
++    constants.groundHeight = static_cast<float>(configuration.frame.ground.heightMetres);
++    constants.restitution = static_cast<float>(configuration.frame.ground.restitution);
++    constants.friction = static_cast<float>(configuration.frame.ground.friction);
++    constants.restingSpeed = static_cast<float>(configuration.frame.ground.restingSpeedMetresPerSecond);
++    constants.lifetime = static_cast<float>(configuration.frame.emission.lifetimeSeconds);
++    constants.viewScale = configuration.viewScale;
++    constants.quadHalfExtent = configuration.quadHalfExtent;
++
++    commandList.SetComputeRoot32BitConstants(ComputeConstants, sizeof(LabConstants) / sizeof(std::uint32_t), &constants,
++                                             0U);
++}
++
+ lgp::framework::Status Renderer::Initialize(lgp::framework::ApplicationInitContext const &context)
+ {
+     deviceResources_ = &context.deviceResources;
+@@ -236,11 +363,11 @@ lgp::framework::Status Renderer::Initialize(lgp::framework::ApplicationInitConte
+     {
+         return status;
+     }
+-    if (auto status = CreateRootSignature(); !status)
++    if (auto status = CreateRootSignatures(); !status)
+     {
+         return status;
+     }
+-    if (auto status = CreatePipeline(); !status)
++    if (auto status = CreatePipelines(); !status)
+     {
+         return status;
+     }
+@@ -258,131 +385,198 @@ lgp::framework::Status Renderer::OnResize(lgp::framework::DeviceResources &devic
+ lgp::framework::Status Renderer::Update(lgp::framework::UpdateContext const &context)
+ {
+     (void)context;
+-    auto reference = gpu::BuildReferenceReadback(ActiveConfiguration());
+-    if (!reference)
++    gpu::LabConfiguration const configuration = ActiveConfiguration();
++    if (configuration.capacity == 0U || configuration.capacity > gpu::kMaximumLabCapacity)
++    {
++        return std::unexpected(
++            lgp::framework::MakeError("Update", "The Chapter 34 lab capacity is out of the single-group budget."));
++    }
++    if (gpu::ResolveOutputCapacity(configuration) > gpu::kMaximumLabCapacity ||
++        gpu::ResolveDrawCapacity(configuration) > gpu::kMaximumLabCapacity)
++    {
++        return std::unexpected(
++            lgp::framework::MakeError("Update", "The Chapter 34 output or draw capacity exceeds the lab budget."));
++    }
++    if (auto check = ValidateEmissionSettings(configuration.frame.emission); !check)
++    {
++        return std::unexpected(lgp::framework::MakeError("Update", std::string{"Invalid emission: "} +
++                                                                       std::string{ContractErrorName(check.error())}));
++    }
++    if (auto check = ValidateForceField(configuration.frame.field); !check)
++    {
++        return std::unexpected(lgp::framework::MakeError("Update", std::string{"Invalid field: "} +
++                                                                       std::string{ContractErrorName(check.error())}));
++    }
++    if (auto check = ValidateGroundPlane(configuration.frame.ground); !check)
++    {
++        return std::unexpected(lgp::framework::MakeError("Update", std::string{"Invalid ground: "} +
++                                                                       std::string{ContractErrorName(check.error())}));
++    }
++    if (auto check = ValidateFixedStepSettings(configuration.frame.step); !check)
++    {
++        return std::unexpected(lgp::framework::MakeError("Update", std::string{"Invalid step: "} +
++                                                                       std::string{ContractErrorName(check.error())}));
++    }
++    if (static_cast<std::size_t>(configuration.frame.integrator) >= kIntegratorCount)
+     {
+-        return std::unexpected(std::move(reference.error()));
++        return std::unexpected(lgp::framework::MakeError("Update", "Invalid integrator: UnknownIntegrator"));
++    }
++    if (configuration.frame.integrator == Integrator::VelocityVerlet &&
++        configuration.frame.field.linearDragPerSecond != 0.0)
++    {
++        return std::unexpected(
++            lgp::framework::MakeError("Update", "Invalid integrator: VerletRequiresVelocityIndependentForce"));
+     }
+-    currentReference_ = std::move(*reference);
+     return {};
+ }
+ 
+ lgp::framework::Status Renderer::Render(lgp::framework::FrameContext const &frameContext)
+ {
+-    if (frameContext.frameSlot >= frameSlots_.size())
+-    {
+-        return std::unexpected(lgp::framework::MakeError("Render", "The Chapter 34 frame slot is out of range."));
+-    }
+-
+     gpu::LabConfiguration const configuration = ActiveConfiguration();
+-    FrameSlotResources &slot = frameSlots_[frameContext.frameSlot];
++    ID3D12GraphicsCommandList7 &commandList = *frameContext.commandList;
+ 
+-    // The honest baseline: the CPU reference already advanced the system and compacted the live set. Upload the
+-    // final state and the compacted slot list and draw them directly, one instanced quad per live particle.
+-    if (auto status = gpu::WriteBuffer(slot.stateA, std::span<gpu::GpuParticle const>{currentReference_.state});
+-        !status)
+-    {
+-        return status;
+-    }
++    ID3D12DescriptorHeap *const heaps[]{frameContext.shaderVisibleCbvSrvUavHeap};
++    commandList.SetDescriptorHeaps(1U, heaps);
++    commandList.SetComputeRootSignature(computeRootSignature_.Get());
++    commandList.SetComputeRootDescriptorTable(ComputeUavTable, descriptors_.GpuHandle(0U));
+ 
+-    std::vector<std::uint32_t> slotList(static_cast<std::size_t>(gpu::kMaximumLabCapacity) + 1U, kInvalidParticleId);
+-    for (std::size_t index = 0U; index < currentReference_.compactedSlots.size(); ++index)
+-    {
+-        slotList[index] = currentReference_.compactedSlots[index];
+-    }
+-    if (auto status = gpu::WriteBuffer(slot.slots, std::span<std::uint32_t const>{slotList}); !status)
++    // Reset: bring every buffer into unordered-access state and clear it.
+     {
+-        return status;
++        gpu::BufferBarrierState const before =
++            resourcesInitialized_ ? gpu::ComputeUnorderedAccessState() : gpu::NoAccessState();
++        std::vector<D3D12_BUFFER_BARRIER> barriers{
++            gpu::MakeBufferBarrier(*stateA_.Get(), before, gpu::ComputeUnorderedAccessState()),
++            gpu::MakeBufferBarrier(*stateB_.Get(), before, gpu::ComputeUnorderedAccessState()),
++            gpu::MakeBufferBarrier(*counters_.Get(), before, gpu::ComputeUnorderedAccessState()),
++            gpu::MakeBufferBarrier(*compactedSlots_.Get(), before, gpu::ComputeUnorderedAccessState()),
++            gpu::MakeBufferBarrier(*compactedIdentities_.Get(), before, gpu::ComputeUnorderedAccessState()),
++            gpu::MakeBufferBarrier(*indirectArgs_.Get(), before, gpu::ComputeUnorderedAccessState()),
++            gpu::MakeBufferBarrier(*indirectCount_.Get(), before, gpu::ComputeUnorderedAccessState()),
++            gpu::MakeBufferBarrier(*checksum_.Get(), before, gpu::ComputeUnorderedAccessState()),
++        };
++        gpu::SubmitBufferBarriers(commandList, barriers);
++        resourcesInitialized_ = true;
+     }
+ 
+-    std::uint32_t const instanceCount = currentReference_.indirectArguments.instanceCount;
++    SetLabConstants(commandList, configuration, 0U, 1U, 0U);
++    commandList.SetPipelineState(initPipeline_.Get());
++    commandList.Dispatch(1U, 1U, 1U);
+ 
+-    ID3D12GraphicsCommandList7 &commandList = *frameContext.commandList;
+-    std::vector<D3D12_TEXTURE_BARRIER> barriers{
++    // No live set exists yet: emission, simulation and compaction arrive in later checkpoints. Present an empty
++    // frame so the reset pass is exercised on the GPU while the picture is still honestly black.
++    std::vector<D3D12_TEXTURE_BARRIER> textureBarriers{
+         gpu::MakeTextureBarrier(*frameContext.renderTarget, gpu::FrameStartState(frameContext),
+                                 gpu::RenderTargetState()),
+     };
+-    gpu::SubmitTextureBarriers(commandList, barriers);
++    gpu::SubmitTextureBarriers(commandList, textureBarriers);
+ 
+     float const clearColor[]{0.0F, 0.0F, 0.0F, 1.0F};
+     commandList.ClearRenderTargetView(frameContext.renderTargetView, clearColor, 0U, nullptr);
+     commandList.OMSetRenderTargets(1U, &frameContext.renderTargetView, FALSE, nullptr);
+     commandList.RSSetViewports(1U, &frameContext.viewport);
+     commandList.RSSetScissorRects(1U, &frameContext.scissorRect);
+-    commandList.IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+-    commandList.SetGraphicsRootSignature(graphicsRootSignature_.Get());
+-
+-    ID3D12DescriptorHeap *const heaps[]{frameContext.shaderVisibleCbvSrvUavHeap};
+-    commandList.SetDescriptorHeaps(1U, heaps);
+-    commandList.SetGraphicsRootDescriptorTable(DrawSrvTable, slot.descriptors.GpuHandle(0U));
+-
+-    DrawConstants drawConstants{};
+-    drawConstants.drawStateSlot = 0U;
+-    drawConstants.viewScale = configuration.viewScale;
+-    drawConstants.quadHalfExtent = configuration.quadHalfExtent;
+-    commandList.SetGraphicsRoot32BitConstants(DrawConstantsParam, sizeof(DrawConstants) / sizeof(std::uint32_t),
+-                                              &drawConstants, 0U);
+-    commandList.SetPipelineState(graphicsPipeline_.Get());
+-    if (instanceCount > 0U)
+-    {
+-        commandList.DrawInstanced(gpu::kVertexCountPerParticle, instanceCount, 0U, 0U);
+-    }
+ 
+-    barriers = {
++    textureBarriers = {
+         gpu::MakeTextureBarrier(*frameContext.renderTarget, gpu::RenderTargetState(), gpu::FrameEndState(frameContext)),
+     };
+-    gpu::SubmitTextureBarriers(commandList, barriers);
++    gpu::SubmitTextureBarriers(commandList, textureBarriers);
++
++    // Copy the reset evidence out: the cleared state image and the zeroed counters.
++    {
++        std::vector<D3D12_BUFFER_BARRIER> barriers{
++            gpu::MakeBufferBarrier(*stateA_.Get(), gpu::ComputeUnorderedAccessState(), gpu::CopySourceState()),
++            gpu::MakeBufferBarrier(*counters_.Get(), gpu::ComputeUnorderedAccessState(), gpu::CopySourceState()),
++        };
++        gpu::SubmitBufferBarriers(commandList, barriers);
++    }
++    commandList.CopyBufferRegion(stateReadback_.Get(), 0U, stateA_.Get(), 0U,
++                                 static_cast<std::uint64_t>(configuration.capacity) * sizeof(gpu::GpuParticle));
++    commandList.CopyBufferRegion(countersReadback_.Get(), 0U, counters_.Get(), 0U, counters_.size_in_bytes());
++    {
++        std::vector<D3D12_BUFFER_BARRIER> barriers{
++            gpu::MakeBufferBarrier(*stateA_.Get(), gpu::CopySourceState(), gpu::ComputeUnorderedAccessState()),
++            gpu::MakeBufferBarrier(*counters_.Get(), gpu::CopySourceState(), gpu::ComputeUnorderedAccessState()),
++        };
++        gpu::SubmitBufferBarriers(commandList, barriers);
++    }
+     return {};
+ }
+ 
+ std::expected<gpu::FrameReadback, lgp::framework::Error> Renderer::ReadBackOutputs()
+ {
+-    // The Starter runs none of the GPU compute stages: its evidence is the CPU reference it drew. The stage
+-    // partition says so honestly, which is the contrast the Solution's full pipeline is measured against.
+-    gpu::FrameReadback readback = currentReference_;
+-    StagePartition partition{};
+-    auto record = [&partition](FrameStage stage, bool submitted)
++    auto const idle = deviceResources_->WaitForGpuIdle();
++    if (!idle)
+     {
+-        if (submitted)
+-        {
+-            partition.submittedMask |= StageBit(stage);
+-        }
+-        else
+-        {
+-            partition.skippedMask |= StageBit(stage);
+-        }
+-    };
+-    record(FrameStage::Reset, false);
+-    record(FrameStage::Emission, false);
+-    record(FrameStage::Simulation, false);
+-    record(FrameStage::Compaction, false);
+-    record(FrameStage::IndirectArguments, false);
+-    record(FrameStage::Render, readback.emittedCount > 0U);
+-    record(FrameStage::Readback, true);
++        return std::unexpected(std::move(idle.error()));
++    }
++
++    gpu::LabConfiguration const configuration = ActiveConfiguration();
++    auto const *counters = reinterpret_cast<std::uint32_t const *>(countersReadback_.mapped_data());
++    auto const *state = reinterpret_cast<gpu::GpuParticle const *>(stateReadback_.mapped_data());
++    if (counters == nullptr || state == nullptr)
++    {
++        return std::unexpected(
++            lgp::framework::MakeError("ReadBackOutputs", "The Chapter 34 readbacks are not mapped."));
++    }
++
++    gpu::FrameReadback readback{};
++    readback.requested = counters[1];
++    readback.spawned = counters[2];
++    readback.dropped = counters[3];
++    readback.died = counters[4];
++    readback.contact = counters[5];
++    readback.liveCount = counters[6];
++    readback.emittedCount = counters[7];
++
++    readback.state.assign(state, state + configuration.capacity);
++    readback.readbackChecksum = gpu::ChecksumGpuState(readback.state);
++
++    // Only the reset pass has run. Report that honestly rather than borrowing the shared partition, which assumes
++    // the whole frame executed: emission, simulation, compaction, indirect arguments and the draw are skipped.
++    StagePartition partition{};
++    partition.submittedMask = StageBit(FrameStage::Reset) | StageBit(FrameStage::Readback);
++    partition.skippedMask = StageBit(FrameStage::Emission) | StageBit(FrameStage::Simulation) |
++                            StageBit(FrameStage::Compaction) | StageBit(FrameStage::IndirectArguments) |
++                            StageBit(FrameStage::Render);
+     partition.recordedMask = partition.submittedMask | partition.skippedMask | partition.unavailableMask;
+     readback.stagePartition = partition;
+-    readback.indirectArguments = {};
+-    readback.executedCommandCount = 0U;
++
+     readback.guardsIntact = false;
+-    readback.barriersModelled = false;
++    readback.barriersModelled = true;
+     return readback;
+ }
+ 
+-void Renderer::Shutdown(lgp::framework::DeviceResources &deviceResources) noexcept
++void Renderer::DestroyResources(lgp::framework::DeviceResources &deviceResources) noexcept
+ {
+-    for (FrameSlotResources &slot : frameSlots_)
++    if (descriptors_)
+     {
+-        if (slot.descriptors)
+-        {
+-            deviceResources.shader_visible_cbv_srv_uav_heap().Free(slot.descriptors);
+-            slot.descriptors = {};
+-        }
++        deviceResources.shader_visible_cbv_srv_uav_heap().Free(descriptors_);
++        descriptors_ = {};
+     }
+-    frameSlots_.clear();
+-    graphicsPipeline_.Reset();
+-    graphicsRootSignature_.Reset();
+-    vertexShader_ = {};
+-    pixelShader_ = {};
++    stateA_ = {};
++    stateB_ = {};
++    counters_ = {};
++    compactedSlots_ = {};
++    compactedIdentities_ = {};
++    indirectArgs_ = {};
++    indirectCount_ = {};
++    checksum_ = {};
++    stateReadback_ = {};
++    countersReadback_ = {};
++    compactedSlotsReadback_ = {};
++    compactedIdentitiesReadback_ = {};
++    indirectArgsReadback_ = {};
++    indirectCountReadback_ = {};
++    checksumReadback_ = {};
++}
++
++void Renderer::Shutdown(lgp::framework::DeviceResources &deviceResources) noexcept
++{
++    DestroyResources(deviceResources);
++    initPipeline_.Reset();
++    computeRootSignature_.Reset();
++    initShader_ = {};
++    resourcesInitialized_ = false;
+     deviceResources_ = nullptr;
+ }
+ 
+diff --git a/chapters/gpu-particle-systems/Starter/Renderer.hpp b/chapters/gpu-particle-systems/Starter/Renderer.hpp
+index cea8c3b..83bdd97 100644
+--- a/chapters/gpu-particle-systems/Starter/Renderer.hpp
++++ b/chapters/gpu-particle-systems/Starter/Renderer.hpp
+@@ -37,29 +37,44 @@ class Renderer final : public lgp::framework::IChapterRenderer
+     [[nodiscard]] std::expected<gpu::FrameReadback, lgp::framework::Error> ReadBackOutputs();
+ 
+   private:
+-    struct FrameSlotResources final
+-    {
+-        gpu::BufferResource stateA{};
+-        gpu::BufferResource stateB{};
+-        gpu::BufferResource slots{};
+-        lgp::framework::DescriptorAllocation descriptors{};
+-    };
+-
+     [[nodiscard]] lgp::framework::Status CreateShaders();
+-    [[nodiscard]] lgp::framework::Status CreateRootSignature();
+-    [[nodiscard]] lgp::framework::Status CreatePipeline();
++    [[nodiscard]] lgp::framework::Status CreateRootSignatures();
++    [[nodiscard]] lgp::framework::Status CreatePipelines();
+     [[nodiscard]] lgp::framework::Status CreateResources();
++    void DestroyResources(lgp::framework::DeviceResources &deviceResources) noexcept;
+     [[nodiscard]] gpu::LabConfiguration ActiveConfiguration() const noexcept;
+ 
++    void SetLabConstants(ID3D12GraphicsCommandList7 &commandList, gpu::LabConfiguration const &configuration,
++                         std::uint32_t readSlot, std::uint32_t writeSlot, std::uint32_t requested) const noexcept;
++
+     lgp::framework::DeviceResources *deviceResources_{};
+-    lgp::framework::CompiledShader vertexShader_{};
+-    lgp::framework::CompiledShader pixelShader_{};
+-    Microsoft::WRL::ComPtr<ID3D12RootSignature> graphicsRootSignature_{};
+-    Microsoft::WRL::ComPtr<ID3D12PipelineState> graphicsPipeline_{};
+-    std::vector<FrameSlotResources> frameSlots_{};
++
++    lgp::framework::CompiledShader initShader_{};
++
++    Microsoft::WRL::ComPtr<ID3D12RootSignature> computeRootSignature_{};
++    Microsoft::WRL::ComPtr<ID3D12PipelineState> initPipeline_{};
++
++    gpu::BufferResource stateA_{};
++    gpu::BufferResource stateB_{};
++    gpu::BufferResource counters_{};
++    gpu::BufferResource compactedSlots_{};
++    gpu::BufferResource compactedIdentities_{};
++    gpu::BufferResource indirectArgs_{};
++    gpu::BufferResource indirectCount_{};
++    gpu::BufferResource checksum_{};
++    gpu::BufferResource stateReadback_{};
++    gpu::BufferResource countersReadback_{};
++    gpu::BufferResource compactedSlotsReadback_{};
++    gpu::BufferResource compactedIdentitiesReadback_{};
++    gpu::BufferResource indirectArgsReadback_{};
++    gpu::BufferResource indirectCountReadback_{};
++    gpu::BufferResource checksumReadback_{};
++    lgp::framework::DescriptorAllocation descriptors_{};
++
++    std::uint32_t allocatedCapacity_{};
++    bool resourcesInitialized_{false};
+ 
+     std::optional<gpu::LabConfiguration> headlessConfiguration_{};
+-    gpu::FrameReadback currentReference_{};
+     bool headless_{false};
+ };
+ 
