@@ -1,0 +1,99 @@
+diff --git a/chapters/gpu-pressure-projection/Starter/Main.cpp b/chapters/gpu-pressure-projection/Starter/Main.cpp
+index d9e6b95..0986656 100644
+--- a/chapters/gpu-pressure-projection/Starter/Main.cpp
++++ b/chapters/gpu-pressure-projection/Starter/Main.cpp
+@@ -5,9 +5,9 @@
+ 
+ auto wmain(int argc, wchar_t **argv) -> int
+ {
+-    ch37::projection::starter::Renderer renderer{};
++    ch37::projection::solution::Renderer renderer{};
+     lgp::framework::ApplicationConfiguration config{};
+-    config.title = L"Ch37 GPU Pressure Projection Starter";
++    config.title = L"Ch37 GPU Pressure Projection Solution";
+     config.enableDebugLayer = false;
+     auto result = lgp::framework::RunApplication(config, argc, argv, renderer);
+     if (!result)
+diff --git a/chapters/gpu-pressure-projection/Starter/Renderer.hpp b/chapters/gpu-pressure-projection/Starter/Renderer.hpp
+index e858cca..fa0491a 100644
+--- a/chapters/gpu-pressure-projection/Starter/Renderer.hpp
++++ b/chapters/gpu-pressure-projection/Starter/Renderer.hpp
+@@ -6,7 +6,7 @@
+ #include <optional>
+ #include <vector>
+ 
+-namespace ch37::projection::starter
++namespace ch37::projection::solution
+ {
+ class Renderer final : public lgp::framework::IChapterRenderer
+ {
+@@ -39,4 +39,4 @@ class Renderer final : public lgp::framework::IChapterRenderer
+     bool rendered_{};
+     bool headlessCli_{};
+ };
+-} // namespace ch37::projection::starter
++} // namespace ch37::projection::solution
+diff --git a/chapters/gpu-pressure-projection/Starter/Renderer.cpp b/chapters/gpu-pressure-projection/Starter/Renderer.cpp
+index 7c255ad..0645207 100644
+--- a/chapters/gpu-pressure-projection/Starter/Renderer.cpp
++++ b/chapters/gpu-pressure-projection/Starter/Renderer.cpp
+@@ -11,7 +11,7 @@
+ #include <string>
+ #include <utility>
+ 
+-namespace ch37::projection::starter
++namespace ch37::projection::solution
+ {
+ namespace
+ {
+@@ -350,22 +350,21 @@ auto Renderer::Render(lgp::framework::FrameContext const &frame) -> Status
+     dispatch(PressureGhost, (config.grid.nx + 9U) / 8U, (config.grid.ny + 9U) / 8U);
+     dispatch(GradientX, (config.grid.nx + 10U) / 8U, (config.grid.ny + 9U) / 8U);
+     dispatch(GradientY, (config.grid.nx + 9U) / 8U, (config.grid.ny + 10U) / 8U);
+-    gpu::Barrier(list, *slot.work[2].Get(), compute, uav, D3D12_BARRIER_SYNC_PIXEL_SHADING,
++    gpu::Barrier(list, *slot.work[0].Get(), compute, uav, D3D12_BARRIER_SYNC_PIXEL_SHADING,
+                  D3D12_BARRIER_ACCESS_SHADER_RESOURCE);
+     gpu::BeginDraw(frame);
+     list.SetGraphicsRootSignature(graphicsRoot_.Get());
+     list.SetGraphicsRoot32BitConstants(0U, 13U, &params, 0U);
+-    list.SetGraphicsRootShaderResourceView(1U, slot.work[2].Get()->GetGPUVirtualAddress());
++    list.SetGraphicsRootShaderResourceView(1U, slot.work[0].Get()->GetGPUVirtualAddress());
+     list.SetPipelineState(graphics_.Get());
+     list.DrawInstanced(3U, 1U, 0U, 0U);
+     gpu::EndDraw(frame);
+-    gpu::Barrier(list, *slot.work[2].Get(), D3D12_BARRIER_SYNC_PIXEL_SHADING, D3D12_BARRIER_ACCESS_SHADER_RESOURCE,
+-                 compute, uav);
+     constexpr std::array<std::size_t, 4> outputs{0U, 6U, 7U, 8U};
+     for (std::size_t i = 0; i < outputs.size(); ++i)
+     {
+         auto index = outputs[i];
+-        gpu::Barrier(list, *slot.work[index].Get(), compute, uav, D3D12_BARRIER_SYNC_COPY,
++        gpu::Barrier(list, *slot.work[index].Get(), index == 0U ? D3D12_BARRIER_SYNC_PIXEL_SHADING : compute,
++                     index == 0U ? D3D12_BARRIER_ACCESS_SHADER_RESOURCE : uav, D3D12_BARRIER_SYNC_COPY,
+                      D3D12_BARRIER_ACCESS_COPY_SOURCE);
+         list.CopyBufferRegion(slot.readback[i].Get(), 0U, slot.work[index].Get(), 0U, kWorkSizes[index]);
+     }
+@@ -460,7 +459,7 @@ void Renderer::Shutdown(lgp::framework::DeviceResources &) noexcept
+         auto imageRange = ImageRange(*resources_, lastSlot_);
+         if (result && imageRange)
+         {
+-            std::printf("Ch37 checkpoint 3 GPU method=%u iterations=%u converged=%u "
++            std::printf("Ch37 Solution GPU method=%u iterations=%u converged=%u "
+                         "divergenceBefore=%.8g divergenceAfter=%.8g residual=%.8g imageRange=%u\n",
+                         static_cast<unsigned>(Active().settings.method), result->projection.iterations,
+                         static_cast<unsigned>(result->projection.converged), result->projection.divergenceBefore,
+@@ -468,7 +467,7 @@ void Renderer::Shutdown(lgp::framework::DeviceResources &) noexcept
+         }
+         else
+         {
+-            std::fprintf(stderr, "Ch37 checkpoint 3 GPU readback: %s\n",
++            std::fprintf(stderr, "Ch37 Solution GPU readback: %s\n",
+                          result ? "render-target readback failed"
+                                 : lgp::framework::FormatError(result.error()).c_str());
+         }
+@@ -484,4 +483,4 @@ void Renderer::Shutdown(lgp::framework::DeviceResources &) noexcept
+     resources_ = nullptr;
+     rendered_ = false;
+ }
+-} // namespace ch37::projection::starter
++} // namespace ch37::projection::solution

@@ -1,0 +1,624 @@
+diff --git a/chapters/gpu-pressure-projection/Starter/Renderer.hpp b/chapters/gpu-pressure-projection/Starter/Renderer.hpp
+index 4e8959d..28c31a9 100644
+--- a/chapters/gpu-pressure-projection/Starter/Renderer.hpp
++++ b/chapters/gpu-pressure-projection/Starter/Renderer.hpp
+@@ -24,8 +24,8 @@ class Renderer final : public lgp::framework::IChapterRenderer
+     struct Slot final
+     {
+         std::array<gpu::Buffer, 2> inputs{};
+-        std::array<gpu::Buffer, 3> work{};
+-        std::array<gpu::Buffer, 3> readback{};
++        std::array<gpu::Buffer, 9> work{};
++        std::array<gpu::Buffer, 4> readback{};
+         bool used{};
+     };
+     [[nodiscard]] auto Active() const -> gpu::Configuration;
+@@ -33,7 +33,8 @@ class Renderer final : public lgp::framework::IChapterRenderer
+     std::optional<gpu::Configuration> headless_{};
+     std::vector<Slot> slots_{};
+     Microsoft::WRL::ComPtr<ID3D12RootSignature> root_{}, graphicsRoot_{};
+-    Microsoft::WRL::ComPtr<ID3D12PipelineState> pipeline_{}, graphics_{};
++    std::array<Microsoft::WRL::ComPtr<ID3D12PipelineState>, 9> pipelines_{};
++    Microsoft::WRL::ComPtr<ID3D12PipelineState> graphics_{};
+     std::uint32_t lastSlot_{};
+     bool rendered_{};
+     bool headlessCli_{};
+diff --git a/chapters/gpu-pressure-projection/Starter/Renderer.cpp b/chapters/gpu-pressure-projection/Starter/Renderer.cpp
+index 2dd9760..8134309 100644
+--- a/chapters/gpu-pressure-projection/Starter/Renderer.cpp
++++ b/chapters/gpu-pressure-projection/Starter/Renderer.cpp
+@@ -19,14 +19,33 @@ using lgp::framework::MakeError;
+ using lgp::framework::Status;
+ constexpr std::uint64_t kCells = 66U * 66U * sizeof(float);
+ constexpr std::uint64_t kFaces = 67U * 66U * sizeof(float);
+-constexpr std::array<std::uint64_t, 3> kWorkSizes{kCells, kFaces, kFaces};
++constexpr std::uint64_t kHistory = (gpu::kMaxGpuIterations + 8U) * sizeof(float);
++constexpr std::array<std::uint64_t, 9> kWorkSizes{kCells, kCells, kCells, kCells,  kCells,
++                                                  kCells, kFaces, kFaces, kHistory};
+ struct Parameters final
+ {
+     std::uint32_t nx, ny;
+     float h, dt;
+-    std::uint32_t boundary, screenWidth, screenHeight;
++    std::uint32_t boundary, method, stop, limit;
++    float tolerance;
++    std::uint32_t iteration, colour, screenWidth, screenHeight;
+ };
+-static_assert(sizeof(Parameters) == 28U);
++static_assert(sizeof(Parameters) == 52U);
++enum Stage : std::size_t
++{
++    Source,
++    InitializeStage,
++    Jacobi,
++    CopyPressure,
++    TrueResidual,
++    ReduceResidual,
++    PressureGhost,
++    GradientX,
++    GradientY
++};
++constexpr std::array<wchar_t const *, 9> kStages{L"SourceCS",        L"InitializeCS",   L"JacobiCS",
++                                                 L"CopyPressureCS",  L"TrueResidualCS", L"ReduceResidualCS",
++                                                 L"PressureGhostCS", L"GradientXCS",    L"GradientYCS"};
+ 
+ void Upload(gpu::Buffer &buffer, Field const &field)
+ {
+@@ -77,7 +96,12 @@ auto ReadField(gpu::Buffer const &buffer, Grid grid, Layout layout) -> std::expe
+ 
+ auto Renderer::Active() const -> gpu::Configuration
+ {
+-    return headless_.value_or(gpu::DefaultConfiguration());
++    auto config = headless_.value_or(gpu::DefaultConfiguration());
++    if (!headless_)
++    {
++        config.settings = {Method::Jacobi, Stop::FixedIterations, 64U, 1.0e-4};
++    }
++    return config;
+ }
+ 
+ auto Renderer::Initialize(lgp::framework::ApplicationInitContext const &context) -> Status
+@@ -90,21 +114,16 @@ auto Renderer::Initialize(lgp::framework::ApplicationInitContext const &context)
+         return std::unexpected(std::move(compiler.error()));
+     }
+     auto const path = std::filesystem::path{__FILE__}.parent_path() / "ProjectionParallel.hlsl";
+-    auto shader = gpu::Compile(*compiler, path, L"DivergenceCS", L"cs_6_0");
+-    if (!shader)
+-    {
+-        return std::unexpected(std::move(shader.error()));
+-    }
+-    std::array<D3D12_ROOT_PARAMETER, 6> parameters{};
++    std::array<D3D12_ROOT_PARAMETER, 12> parameters{};
+     parameters[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+     parameters[0].Constants.ShaderRegister = 0U;
+-    parameters[0].Constants.Num32BitValues = 7U;
++    parameters[0].Constants.Num32BitValues = 13U;
+     for (UINT i = 0; i < 2U; ++i)
+     {
+         parameters[i + 1U].ParameterType = D3D12_ROOT_PARAMETER_TYPE_SRV;
+         parameters[i + 1U].Descriptor.ShaderRegister = i;
+     }
+-    for (UINT i = 0; i < 3U; ++i)
++    for (UINT i = 0; i < 9U; ++i)
+     {
+         parameters[i + 3U].ParameterType = D3D12_ROOT_PARAMETER_TYPE_UAV;
+         parameters[i + 3U].Descriptor.ShaderRegister = i;
+@@ -118,16 +137,24 @@ auto Renderer::Initialize(lgp::framework::ApplicationInitContext const &context)
+         return std::unexpected(std::move(root.error()));
+     }
+     root_ = std::move(*root);
+-    auto pipeline = gpu::MakeCompute(*resources_->device(), *root_.Get(), *shader);
+-    if (!pipeline)
++    for (std::size_t i = 0; i < pipelines_.size(); ++i)
+     {
+-        return std::unexpected(std::move(pipeline.error()));
++        auto compiled = gpu::Compile(*compiler, path, kStages[i], L"cs_6_0");
++        if (!compiled)
++        {
++            return std::unexpected(std::move(compiled.error()));
++        }
++        auto pipeline = gpu::MakeCompute(*resources_->device(), *root_.Get(), *compiled);
++        if (!pipeline)
++        {
++            return std::unexpected(std::move(pipeline.error()));
++        }
++        pipelines_[i] = std::move(*pipeline);
+     }
+-    pipeline_ = std::move(*pipeline);
+     std::array<D3D12_ROOT_PARAMETER, 2> draw{};
+     draw[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+     draw[0].Constants.ShaderRegister = 0U;
+-    draw[0].Constants.Num32BitValues = 7U;
++    draw[0].Constants.Num32BitValues = 13U;
+     draw[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+     draw[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_SRV;
+     draw[1].Descriptor.ShaderRegister = 2U;
+@@ -190,7 +217,8 @@ auto Renderer::Initialize(lgp::framework::ApplicationInitContext const &context)
+         }
+         for (std::size_t i = 0; i < slot.readback.size(); ++i)
+         {
+-            if (auto s = create(slot.readback[i], kWorkSizes[i], D3D12_HEAP_TYPE_READBACK, true); !s)
++            auto bytes = kWorkSizes[std::array<std::size_t, 4>{0U, 6U, 7U, 8U}[i]];
++            if (auto s = create(slot.readback[i], bytes, D3D12_HEAP_TYPE_READBACK, true); !s)
+             {
+                 return s;
+             }
+@@ -223,6 +251,10 @@ auto Renderer::Render(lgp::framework::FrameContext const &frame) -> Status
+     {
+         return status;
+     }
++    if (config.settings.method != Method::Jacobi)
++    {
++        return std::unexpected(MakeError("Ch37 checkpoint 1", "Only Jacobi is implemented."));
++    }
+     auto &slot = slots_[frame.frameSlot];
+     Upload(slot.inputs[0], config.velocity.x);
+     Upload(slot.inputs[1], config.velocity.y);
+@@ -231,7 +263,7 @@ auto Renderer::Render(lgp::framework::FrameContext const &frame) -> Status
+     constexpr auto uav = D3D12_BARRIER_ACCESS_UNORDERED_ACCESS;
+     for (std::size_t i = 0; i < slot.work.size(); ++i)
+     {
+-        bool copied = true;
++        bool copied = i == 0U || i == 6U || i == 7U || i == 8U;
+         auto beforeSync = D3D12_BARRIER_SYNC_NONE;
+         auto beforeAccess = D3D12_BARRIER_ACCESS_NO_ACCESS;
+         if (slot.used)
+@@ -247,35 +279,72 @@ auto Renderer::Render(lgp::framework::FrameContext const &frame) -> Status
+                       static_cast<float>(config.grid.h),
+                       static_cast<float>(config.dt),
+                       static_cast<std::uint32_t>(config.boundary),
++                      static_cast<std::uint32_t>(config.settings.method),
++                      static_cast<std::uint32_t>(config.settings.stop),
++                      config.settings.maxIterations,
++                      static_cast<float>(config.settings.tolerance),
++                      0U,
++                      0U,
+                       static_cast<std::uint32_t>(frame.viewport.Width),
+                       static_cast<std::uint32_t>(frame.viewport.Height)};
+     list.SetComputeRootSignature(root_.Get());
+-    list.SetComputeRoot32BitConstants(0U, 7U, &params, 0U);
+     for (UINT i = 0; i < 2U; ++i)
+     {
+         list.SetComputeRootShaderResourceView(i + 1U, slot.inputs[i].Get()->GetGPUVirtualAddress());
+     }
+-    for (UINT i = 0; i < 3U; ++i)
++    for (UINT i = 0; i < 9U; ++i)
+     {
+         list.SetComputeRootUnorderedAccessView(i + 3U, slot.work[i].Get()->GetGPUVirtualAddress());
+     }
+-    list.SetPipelineState(pipeline_.Get());
+-    list.Dispatch((config.grid.nx + 10U) / 8U, (config.grid.ny + 10U) / 8U, 1U);
+-    gpu::Barrier(list, *slot.work[0].Get(), compute, uav, D3D12_BARRIER_SYNC_PIXEL_SHADING,
++    auto syncWork = [&]()
++    {
++        // Enhanced UAV barriers establish device-wide ordering between per-cell passes and reductions.
++        for (auto &buffer : slot.work)
++        {
++            gpu::Barrier(list, *buffer.Get(), compute, uav, compute, uav);
++        }
++    };
++    auto dispatch = [&](Stage stage, std::uint32_t width, std::uint32_t height)
++    {
++        list.SetComputeRoot32BitConstants(0U, 13U, &params, 0U);
++        list.SetPipelineState(pipelines_[stage].Get());
++        list.Dispatch(width, height, 1U);
++        syncWork();
++    };
++    auto cellsX = (config.grid.nx + 7U) / 8U;
++    auto cellsY = (config.grid.ny + 7U) / 8U;
++    dispatch(Source, cellsX, cellsY);
++    dispatch(InitializeStage, 1U, 1U);
++    // Record a bounded schedule once; GPU convergence flags make later passes no-ops.
++    for (std::uint32_t iteration = 0; iteration < config.settings.maxIterations; ++iteration)
++    {
++        params.iteration = iteration;
++        dispatch(Jacobi, cellsX, cellsY);
++        dispatch(CopyPressure, cellsX, cellsY);
++        dispatch(TrueResidual, cellsX, cellsY);
++        dispatch(ReduceResidual, 1U, 1U);
++    }
++    dispatch(PressureGhost, (config.grid.nx + 9U) / 8U, (config.grid.ny + 9U) / 8U);
++    dispatch(GradientX, (config.grid.nx + 10U) / 8U, (config.grid.ny + 9U) / 8U);
++    dispatch(GradientY, (config.grid.nx + 9U) / 8U, (config.grid.ny + 10U) / 8U);
++    gpu::Barrier(list, *slot.work[2].Get(), compute, uav, D3D12_BARRIER_SYNC_PIXEL_SHADING,
+                  D3D12_BARRIER_ACCESS_SHADER_RESOURCE);
+     gpu::BeginDraw(frame);
+     list.SetGraphicsRootSignature(graphicsRoot_.Get());
+-    list.SetGraphicsRoot32BitConstants(0U, 7U, &params, 0U);
+-    list.SetGraphicsRootShaderResourceView(1U, slot.work[0].Get()->GetGPUVirtualAddress());
++    list.SetGraphicsRoot32BitConstants(0U, 13U, &params, 0U);
++    list.SetGraphicsRootShaderResourceView(1U, slot.work[2].Get()->GetGPUVirtualAddress());
+     list.SetPipelineState(graphics_.Get());
+     list.DrawInstanced(3U, 1U, 0U, 0U);
+     gpu::EndDraw(frame);
+-    for (std::size_t i = 0; i < slot.work.size(); ++i)
++    gpu::Barrier(list, *slot.work[2].Get(), D3D12_BARRIER_SYNC_PIXEL_SHADING, D3D12_BARRIER_ACCESS_SHADER_RESOURCE,
++                 compute, uav);
++    constexpr std::array<std::size_t, 4> outputs{0U, 6U, 7U, 8U};
++    for (std::size_t i = 0; i < outputs.size(); ++i)
+     {
+-        gpu::Barrier(list, *slot.work[i].Get(), i == 0U ? D3D12_BARRIER_SYNC_PIXEL_SHADING : compute,
+-                     i == 0U ? D3D12_BARRIER_ACCESS_SHADER_RESOURCE : uav, D3D12_BARRIER_SYNC_COPY,
++        auto index = outputs[i];
++        gpu::Barrier(list, *slot.work[index].Get(), compute, uav, D3D12_BARRIER_SYNC_COPY,
+                      D3D12_BARRIER_ACCESS_COPY_SOURCE);
+-        list.CopyBufferRegion(slot.readback[i].Get(), 0U, slot.work[i].Get(), 0U, kWorkSizes[i]);
++        list.CopyBufferRegion(slot.readback[i].Get(), 0U, slot.work[index].Get(), 0U, kWorkSizes[index]);
+     }
+     lastSlot_ = frame.frameSlot;
+     rendered_ = true;
+@@ -295,24 +364,31 @@ auto Renderer::ReadBackOutputs() -> std::expected<gpu::Readback, lgp::framework:
+     }
+     auto config = Active();
+     auto const &slot = slots_[lastSlot_];
+-    auto divergence = *MakeField(config.grid, Layout::Cell);
+-    auto const stride = config.grid.nx + 2U;
+-    for (std::uint32_t y = 0; y < config.grid.ny; ++y)
++    auto getHistory = [&](std::size_t i)
+     {
+-        for (std::uint32_t x = 0; x < config.grid.nx; ++x)
+-        {
+-            auto i = (y + 1U) * stride + x + 1U;
+-            float value{};
+-            std::memcpy(&value, slot.readback[0].Data() + i * sizeof(float), sizeof(float));
+-            if (!std::isfinite(value))
+-            {
+-                return std::unexpected(MakeError("Ch37 baseline", "GPU divergence was nonfinite."));
+-            }
+-            divergence.values[i] = value;
+-        }
++        float v{};
++        std::memcpy(&v, slot.readback[3].Data() + i * sizeof(float), sizeof(float));
++        return v;
++    };
++    auto const iterationsFloat = getHistory(config.settings.maxIterations + 1U);
++    auto const flag = getHistory(config.settings.maxIterations + 2U);
++    if (!std::isfinite(iterationsFloat) || iterationsFloat < 0.0F ||
++        iterationsFloat > static_cast<float>(config.settings.maxIterations) || flag < 0.0F)
++    {
++        return std::unexpected(MakeError("Ch37 readback", "GPU solver breakdown or incompatible source."));
++    }
++    auto const iterations = static_cast<std::uint32_t>(iterationsFloat);
++    if (config.settings.stop == Stop::Tolerance && flag == 0.0F)
++    {
++        return std::unexpected(MakeError("Ch37 readback", "GPU solver did not converge within the iteration cap."));
+     }
++    auto p = ReadField(slot.readback[0], config.grid, Layout::Cell);
+     auto u = ReadField(slot.readback[1], config.grid, Layout::XFace);
+     auto v = ReadField(slot.readback[2], config.grid, Layout::YFace);
++    if (!p)
++    {
++        return std::unexpected(std::move(p.error()));
++    }
+     if (!u)
+     {
+         return std::unexpected(std::move(u.error()));
+@@ -321,22 +397,37 @@ auto Renderer::ReadBackOutputs() -> std::expected<gpu::Readback, lgp::framework:
+     {
+         return std::unexpected(std::move(v.error()));
+     }
+-    auto beforeRms = RootMeanSquare(config.grid, divergence);
++    std::vector<double> history;
++    history.reserve(iterations + 1U);
++    for (std::uint32_t i = 0; i <= iterations; ++i)
++    {
++        double value = getHistory(i);
++        if (!std::isfinite(value))
++        {
++            return std::unexpected(MakeError("Ch37 readback", "Nonfinite GPU residual."));
++        }
++        history.push_back(value);
++    }
++    auto before = Divergence(config.grid, config.velocity, config.boundary);
+     auto after = Divergence(config.grid, Velocity{*u, *v}, config.boundary);
+-    if (!beforeRms || !after)
++    if (!before || !after)
+     {
+         return std::unexpected(MakeError("Ch37 readback", "Invalid GPU velocity."));
+     }
++    auto beforeRms = RootMeanSquare(config.grid, *before);
+     auto afterRms = RootMeanSquare(config.grid, *after);
+-    if (!afterRms)
++    if (!beforeRms || !afterRms)
+     {
+         return std::unexpected(MakeError("Ch37 readback", "Invalid divergence."));
+     }
+-    auto p = *MakeField(config.grid, Layout::Cell);
+-    return gpu::Readback{
+-        {std::move(p), {std::move(*u), std::move(*v)}, 0U, false, {*beforeRms / config.dt}, *beforeRms, *afterRms},
+-        true,
+-        std::move(divergence)};
++    return gpu::Readback{{std::move(*p),
++                          {std::move(*u), std::move(*v)},
++                          iterations,
++                          flag == 1.0F,
++                          std::move(history),
++                          *beforeRms,
++                          *afterRms},
++                         true};
+ }
+ void Renderer::Shutdown(lgp::framework::DeviceResources &) noexcept
+ {
+@@ -346,13 +437,15 @@ void Renderer::Shutdown(lgp::framework::DeviceResources &) noexcept
+         auto imageRange = ImageRange(*resources_, lastSlot_);
+         if (result && imageRange)
+         {
+-            std::printf("Ch37 Starter baseline iterations=0 divergenceBefore=%.8g divergenceAfter=%.8g "
+-                        "imageRange=%u\n",
+-                        result->projection.divergenceBefore, result->projection.divergenceAfter, *imageRange);
++            std::printf("Ch37 checkpoint 1 GPU method=%u iterations=%u converged=%u "
++                        "divergenceBefore=%.8g divergenceAfter=%.8g residual=%.8g imageRange=%u\n",
++                        static_cast<unsigned>(Active().settings.method), result->projection.iterations,
++                        static_cast<unsigned>(result->projection.converged), result->projection.divergenceBefore,
++                        result->projection.divergenceAfter, result->projection.residualHistory.back(), *imageRange);
+         }
+         else
+         {
+-            std::fprintf(stderr, "Ch37 Starter GPU readback: %s\n",
++            std::fprintf(stderr, "Ch37 checkpoint 1 GPU readback: %s\n",
+                          result ? "render-target readback failed"
+                                 : lgp::framework::FormatError(result.error()).c_str());
+         }
+@@ -360,8 +453,11 @@ void Renderer::Shutdown(lgp::framework::DeviceResources &) noexcept
+     slots_.clear();
+     root_.Reset();
+     graphicsRoot_.Reset();
+-    pipeline_.Reset();
+     graphics_.Reset();
++    for (auto &pipeline : pipelines_)
++    {
++        pipeline.Reset();
++    }
+     resources_ = nullptr;
+     rendered_ = false;
+ }
+diff --git a/chapters/gpu-pressure-projection/Starter/ProjectionParallel.hlsl b/chapters/gpu-pressure-projection/Starter/ProjectionParallel.hlsl
+index bca0ace..4ef0ada 100644
+--- a/chapters/gpu-pressure-projection/Starter/ProjectionParallel.hlsl
++++ b/chapters/gpu-pressure-projection/Starter/ProjectionParallel.hlsl
+@@ -2,14 +2,23 @@ cbuffer Parameters : register(b0)
+ {
+     uint nx, ny;
+     float h, dt;
+-    uint boundaryMode, screenWidth, screenHeight;
++    uint boundaryMode, method, stopMode, limit;
++    float tolerance;
++    uint iteration, colour, screenWidth, screenHeight;
+ };
++
+ StructuredBuffer<float> inputX : register(t0);
+ StructuredBuffer<float> inputY : register(t1);
+ StructuredBuffer<float> preview : register(t2);
+-RWStructuredBuffer<float> divergence : register(u0);
+-RWStructuredBuffer<float> normalizedX : register(u1);
+-RWStructuredBuffer<float> normalizedY : register(u2);
++RWStructuredBuffer<float> pressure : register(u0);
++RWStructuredBuffer<float> scratch : register(u1);
++RWStructuredBuffer<float> source : register(u2);
++RWStructuredBuffer<float> residual : register(u3);
++RWStructuredBuffer<float> direction : register(u4);
++RWStructuredBuffer<float> applied : register(u5);
++RWStructuredBuffer<float> outputX : register(u6);
++RWStructuredBuffer<float> outputY : register(u7);
++RWStructuredBuffer<float> history : register(u8);
+ 
+ uint Cell(int x, int y)
+ {
+@@ -23,10 +32,11 @@ uint YFace(int x, int y)
+ {
+     return uint(y + 1) * (nx + 2) + uint(x + 1);
+ }
+-int Wrap(int v, int count)
++int Wrap(int value, int size)
+ {
+-    return (v % count + count) % count;
++    return (value % size + size) % size;
+ }
++
+ float FaceX(int x, int y)
+ {
+     if (boundaryMode == 0 && (x == 0 || x == int(nx)))
+@@ -44,28 +54,171 @@ float FaceY(int x, int y)
+     return inputY[YFace(x, y)];
+ }
+ 
+-[numthreads(8, 8, 1)]
+-void DivergenceCS(uint2 cell : SV_DispatchThreadID)
++float PressureAt(int x, int y, int cx, int cy, uint field)
+ {
+-    int x = int(cell.x) - 1, y = int(cell.y) - 1;
+-    if (cell.x < nx && cell.y < ny)
+-    {
+-        int cx = int(cell.x), cy = int(cell.y);
+-        divergence[Cell(cx, cy)] = (FaceX(cx + 1, cy) - FaceX(cx, cy) + FaceY(cx, cy + 1) - FaceY(cx, cy)) / h;
+-    }
+-    if (cell.x < nx + 3 && cell.y < ny + 2)
++    if (x < 0 || y < 0 || x >= int(nx) || y >= int(ny))
+     {
+-        int sx = boundaryMode == 2 ? Wrap(x, int(nx)) : clamp(x, 0, int(nx));
+-        int sy = boundaryMode == 2 ? Wrap(y, int(ny)) : clamp(y, 0, int(ny) - 1);
+-        normalizedX[XFace(x, y)] = FaceX(sx, sy);
++        if (boundaryMode == 0)
++        {
++            x = cx;
++            y = cy;
++        }
++        else if (boundaryMode == 1)
++            return 0.0;
++        else
++        {
++            x = Wrap(x, int(nx));
++            y = Wrap(y, int(ny));
++        }
+     }
+-    if (cell.x < nx + 2 && cell.y < ny + 3)
+-    {
+-        int sx = boundaryMode == 2 ? Wrap(x, int(nx)) : clamp(x, 0, int(nx) - 1);
+-        int sy = boundaryMode == 2 ? Wrap(y, int(ny)) : clamp(y, 0, int(ny));
+-        normalizedY[YFace(x, y)] = FaceY(sx, sy);
+-    }
+-} float4 FullscreenVS(uint id : SV_VertexID)
++    uint i = Cell(x, y);
++    if (field == 0)
++        return pressure[i];
++    return direction[i];
++}
++float Operator(int x, int y, uint field)
++{
++    float centre = PressureAt(x, y, x, y, field);
++    float sum = PressureAt(x - 1, y, x, y, field) + PressureAt(x + 1, y, x, y, field) +
++                PressureAt(x, y - 1, x, y, field) + PressureAt(x, y + 1, x, y, field);
++    return (4.0 * centre - sum) / (h * h);
++}
++float Diagonal(int x, int y)
++{
++    uint walls = uint(x == 0) + uint(y == 0) + uint(x + 1 == int(nx)) + uint(y + 1 == int(ny));
++    return (4.0 - (boundaryMode == 0 ? float(walls) : 0.0)) / (h * h);
++}
++bool Active()
++{
++    float initial = history[0];
++    float state = history[limit + 2];
++    return initial > 0.0 && state >= 0.0 && (state == 0.0 || (stopMode == 0 && method != 2));
++}
++
++[numthreads(8, 8, 1)]
++void SourceCS(uint2 cell : SV_DispatchThreadID)
++{
++    if (cell.x >= nx || cell.y >= ny)
++        return;
++    int x = int(cell.x), y = int(cell.y);
++    uint i = Cell(x, y);
++    source[i] = -(FaceX(x + 1, y) - FaceX(x, y) + FaceY(x, y + 1) - FaceY(x, y)) / (h * dt);
++    pressure[i] = 0.0;
++    scratch[i] = 0.0;
++}
++
++[numthreads(1, 1, 1)]
++void InitializeCS()
++{
++    float sum = 0.0, squares = 0.0;
++    for (int y = 0; y < int(ny); ++y)
++        for (int x = 0; x < int(nx); ++x)
++        {
++            float b = source[Cell(x, y)];
++            sum += b;
++            squares += b * b;
++        }
++    float initial = sqrt(squares / float(nx * ny));
++    float mean = sum / float(nx * ny);
++    history[0] = initial;
++    history[limit + 1] = 0.0;
++    history[limit + 2] = initial == 0.0 ? 1.0 : 0.0;
++    if (!isfinite(initial) || (boundaryMode != 1 && abs(mean) > 1.0e-6 * initial))
++        history[limit + 2] = -1.0;
++    float norm = 0.0;
++    for (int y = 0; y < int(ny); ++y)
++        for (int x = 0; x < int(nx); ++x)
++        {
++            uint i = Cell(x, y);
++            float b = source[i] - (boundaryMode == 1 ? 0.0 : mean);
++            source[i] = b;
++            residual[i] = b;
++            direction[i] = b;
++            norm += b * b;
++        }
++    history[limit + 3] = norm;
++}
++
++[numthreads(8, 8, 1)]
++void JacobiCS(uint2 cell : SV_DispatchThreadID)
++{
++    if (cell.x >= nx || cell.y >= ny || !Active())
++        return;
++    int x = int(cell.x), y = int(cell.y);
++    uint i = Cell(x, y);
++    scratch[i] = pressure[i] + (source[i] - Operator(x, y, 0)) / Diagonal(x, y);
++}
++[numthreads(8, 8, 1)]
++void CopyPressureCS(uint2 cell : SV_DispatchThreadID)
++{
++    if (cell.x >= nx || cell.y >= ny || !Active())
++        return;
++    pressure[Cell(int(cell.x), int(cell.y))] = scratch[Cell(int(cell.x), int(cell.y))];
++}
++[numthreads(8, 8, 1)]
++void TrueResidualCS(uint2 cell : SV_DispatchThreadID)
++{
++    if (cell.x >= nx || cell.y >= ny || !Active())
++        return;
++    int x = int(cell.x), y = int(cell.y);
++    scratch[Cell(x, y)] = source[Cell(x, y)] - Operator(x, y, 0);
++}
++[numthreads(1, 1, 1)]
++void ReduceResidualCS()
++{
++    if (!Active())
++        return;
++    float sum = 0.0;
++    for (int y = 0; y < int(ny); ++y)
++        for (int x = 0; x < int(nx); ++x)
++        {
++            float r = scratch[Cell(x, y)];
++            sum += r * r;
++        }
++    float rms = sqrt(sum / float(nx * ny));
++    history[iteration + 1] = rms;
++    history[limit + 1] = float(iteration + 1);
++    history[limit + 2] = !isfinite(rms) ? -1.0 : (rms <= tolerance * history[0] ? 1.0 : 0.0);
++}
++
++[numthreads(8, 8, 1)]
++void PressureGhostCS(uint2 cell : SV_DispatchThreadID)
++{
++    if (cell.x >= nx + 2 || cell.y >= ny + 2)
++        return;
++    int x = int(cell.x) - 1, y = int(cell.y) - 1;
++    if (x >= 0 && y >= 0 && x < int(nx) && y < int(ny))
++        return;
++    pressure[Cell(x, y)] = PressureAt(x, y, clamp(x, 0, int(nx) - 1), clamp(y, 0, int(ny) - 1), 0);
++}
++[numthreads(8, 8, 1)]
++void GradientXCS(uint2 cell : SV_DispatchThreadID)
++{
++    if (cell.x >= nx + 3 || cell.y >= ny + 2)
++        return;
++    int x = int(cell.x) - 1, y = int(cell.y) - 1;
++    int sx = boundaryMode == 2 ? Wrap(x, int(nx)) : clamp(x, 0, int(nx));
++    int sy = boundaryMode == 2 ? Wrap(y, int(ny)) : clamp(y, 0, int(ny) - 1);
++    float value = FaceX(sx, sy);
++    if ((sx > 0 && sx < int(nx)) || boundaryMode != 0)
++        value -= dt * (PressureAt(sx, sy, sx, sy, 0) - PressureAt(sx - 1, sy, sx - 1, sy, 0)) / h;
++    outputX[XFace(x, y)] = value;
++}
++[numthreads(8, 8, 1)]
++void GradientYCS(uint2 cell : SV_DispatchThreadID)
++{
++    if (cell.x >= nx + 2 || cell.y >= ny + 3)
++        return;
++    int x = int(cell.x) - 1, y = int(cell.y) - 1;
++    int sx = boundaryMode == 2 ? Wrap(x, int(nx)) : clamp(x, 0, int(nx) - 1);
++    int sy = boundaryMode == 2 ? Wrap(y, int(ny)) : clamp(y, 0, int(ny));
++    float value = FaceY(sx, sy);
++    if ((sy > 0 && sy < int(ny)) || boundaryMode != 0)
++        value -= dt * (PressureAt(sx, sy, sx, sy, 0) - PressureAt(sx, sy - 1, sx, sy - 1, 0)) / h;
++    outputY[YFace(x, y)] = value;
++}
++
++float4 FullscreenVS(uint id : SV_VertexID)
+     : SV_POSITION
+ {
+     float2 uv = float2((id << 1) & 2, id & 2);
+@@ -75,8 +228,8 @@ float4 HeatPS(float4 position : SV_POSITION) : SV_Target
+ {
+     int x = clamp(int(position.x * float(nx) / float(screenWidth)), 0, int(nx) - 1);
+     int y = clamp(int(position.y * float(ny) / float(screenHeight)), 0, int(ny) - 1);
+-    float d = preview[Cell(x, y)];
+-    float magnitude = saturate(abs(d) * 3.0);
+-    return d >= 0.0 ? float4(0.1 + magnitude, 0.1 + 0.3 * magnitude, 0.1, 1)
+-                    : float4(0.1, 0.1 + 0.3 * magnitude, 0.1 + magnitude, 1);
++    float p = preview[Cell(x, y)];
++    float magnitude = saturate(abs(p) * 2.0);
++    return p >= 0.0 ? float4(0.08 + magnitude, 0.08 + 0.3 * magnitude, 0.12, 1)
++                    : float4(0.08, 0.12 + 0.4 * magnitude, 0.1 + magnitude, 1);
+ }
