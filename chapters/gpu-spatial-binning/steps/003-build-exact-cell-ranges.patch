@@ -1,0 +1,79 @@
+--- a/chapters/gpu-spatial-binning/Starter/Main.cpp
++++ b/chapters/gpu-spatial-binning/Starter/Main.cpp
+@@ -6,8 +6,8 @@
+ 
+ auto wmain(int argc, wchar_t **argv) -> int
+ {
+-    std::puts("Ch35 checkpoint 2: a padded GPU bitonic network sorts (cell key, stable identity).");
+-    std::puts("The vertex shader draws sorted GPU records; ranges and queries follow.");
++    std::puts("Ch35 checkpoint 3: GPU-sorted records now construct exact half-open cell ranges.");
++    std::puts("Empty cells carry the sorted-record-count sentinel; queries follow.");
+     ch35::spatial::starter::Renderer renderer{};
+     lgp::framework::ApplicationConfiguration configuration{};
+     configuration.title = L"Ch35 GPU Spatial Binning Starter";
+--- a/chapters/gpu-spatial-binning/Starter/Renderer.cpp
++++ b/chapters/gpu-spatial-binning/Starter/Renderer.cpp
+@@ -180,6 +180,10 @@
+     {
+         return status;
+     }
++    if (auto status = Compile(*compiler, path, L"RangesCS", L"cs_6_0", rangeShader_); !status)
++    {
++        return status;
++    }
+     if (auto status = Compile(*compiler, path, L"PointVS", L"vs_6_0", vertexShader_); !status)
+     {
+         return status;
+@@ -219,6 +223,10 @@
+         return status;
+     }
+     if (auto status = ComputePipeline(device, *computeRoot_.Get(), sortShader_, sortPipeline_); !status)
++    {
++        return status;
++    }
++    if (auto status = ComputePipeline(device, *computeRoot_.Get(), rangeShader_, rangePipeline_); !status)
+     {
+         return status;
+     }
+@@ -379,6 +387,9 @@
+     uavBarrier();
+     list.SetPipelineState(sortPipeline_.Get());
+     list.Dispatch(1U, 1U, 1U);
++    uavBarrier();
++    list.SetPipelineState(rangePipeline_.Get());
++    list.Dispatch((cells + 255U) / 256U, 1U, 1U);
+     gpu::BufferBarrier(list, *slot.output.Get(), D3D12_BARRIER_SYNC_COMPUTE_SHADING,
+                        D3D12_BARRIER_ACCESS_UNORDERED_ACCESS, D3D12_BARRIER_SYNC_VERTEX_SHADING,
+                        D3D12_BARRIER_ACCESS_SHADER_RESOURCE);
+--- a/chapters/gpu-spatial-binning/Starter/SpatialLab.hlsl
++++ b/chapters/gpu-spatial-binning/Starter/SpatialLab.hlsl
+@@ -152,6 +152,29 @@
+     sorted[lane] = sharedRecords[lane];
+ }
+ 
++[numthreads(256, 1, 1)]
++void RangesCS(uint cell : SV_DispatchThreadID)
++{
++    if (cell >= cellCount)
++        return;
++    uint count = 0u;
++    while (count < recordCapacity && sorted[count].key != INVALID)
++        ++count;
++    CellRange range;
++    range.start = count;
++    range.end = count;
++    for (uint index = 0u; index < count; ++index)
++    {
++        if (sorted[index].key == cell)
++        {
++            if (range.start == count)
++                range.start = index;
++            range.end = index + 1u;
++        }
++    }
++    ranges[cell] = range;
++}
++
+ cbuffer DrawConstants : register(b1)
+ {
+     float viewScale;

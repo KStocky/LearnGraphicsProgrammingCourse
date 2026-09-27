@@ -1,0 +1,122 @@
+--- a/chapters/gpu-spatial-binning/Starter/Main.cpp
++++ b/chapters/gpu-spatial-binning/Starter/Main.cpp
+@@ -6,8 +6,8 @@
+ 
+ auto wmain(int argc, wchar_t **argv) -> int
+ {
+-    std::puts("Ch35 checkpoint 1: GPU keys and source-order gathering feed a visible point draw.");
+-    std::puts("Sorting, cell ranges and neighbor queries are not dispatched yet.");
++    std::puts("Ch35 checkpoint 2: a padded GPU bitonic network sorts (cell key, stable identity).");
++    std::puts("The vertex shader draws sorted GPU records; ranges and queries follow.");
+     ch35::spatial::starter::Renderer renderer{};
+     lgp::framework::ApplicationConfiguration configuration{};
+     configuration.title = L"Ch35 GPU Spatial Binning Starter";
+--- a/chapters/gpu-spatial-binning/Starter/Renderer.cpp
++++ b/chapters/gpu-spatial-binning/Starter/Renderer.cpp
+@@ -176,6 +176,10 @@
+     {
+         return status;
+     }
++    if (auto status = Compile(*compiler, path, L"SortCS", L"cs_6_0", sortShader_); !status)
++    {
++        return status;
++    }
+     if (auto status = Compile(*compiler, path, L"PointVS", L"vs_6_0", vertexShader_); !status)
+     {
+         return status;
+@@ -211,6 +215,10 @@
+         return status;
+     }
+     if (auto status = ComputePipeline(device, *computeRoot_.Get(), keyShader_, keyPipeline_); !status)
++    {
++        return status;
++    }
++    if (auto status = ComputePipeline(device, *computeRoot_.Get(), sortShader_, sortPipeline_); !status)
+     {
+         return status;
+     }
+@@ -329,13 +337,14 @@
+     std::copy(configuration.queryIds.begin(), configuration.queryIds.end(), ids.begin());
+     std::memcpy(slot.ids.mapped_data(), ids.data(), sizeof(ids));
+ 
++    auto const cells = *ValidateGrid(configuration.grid);
+     LabConstants constants{};
+     constants.inputCount = static_cast<std::uint32_t>(configuration.particles.size());
+     constants.recordCapacity = configuration.recordCapacity;
+     constants.dimensionsX = configuration.grid.dimensions.x;
+     constants.dimensionsY = configuration.grid.dimensions.y;
+     constants.dimensionsZ = configuration.grid.dimensions.z;
+-    constants.cellCount = *ValidateGrid(configuration.grid);
++    constants.cellCount = cells;
+     constants.queryCount = static_cast<std::uint32_t>(configuration.queryIds.size());
+     constants.queryCapacity = configuration.queryCapacity;
+     constants.outputCapacity = configuration.outputCapacity;
+@@ -360,6 +369,15 @@
+         list.SetComputeRootUnorderedAccessView(index + 3U, slot.output.Get()->GetGPUVirtualAddress() + offsets[index]);
+     }
+     list.SetPipelineState(keyPipeline_.Get());
++    list.Dispatch(1U, 1U, 1U);
++    auto uavBarrier = [&]()
++    {
++        gpu::BufferBarrier(list, *slot.output.Get(), D3D12_BARRIER_SYNC_COMPUTE_SHADING,
++                           D3D12_BARRIER_ACCESS_UNORDERED_ACCESS, D3D12_BARRIER_SYNC_COMPUTE_SHADING,
++                           D3D12_BARRIER_ACCESS_UNORDERED_ACCESS);
++    };
++    uavBarrier();
++    list.SetPipelineState(sortPipeline_.Get());
+     list.Dispatch(1U, 1U, 1U);
+     gpu::BufferBarrier(list, *slot.output.Get(), D3D12_BARRIER_SYNC_COMPUTE_SHADING,
+                        D3D12_BARRIER_ACCESS_UNORDERED_ACCESS, D3D12_BARRIER_SYNC_VERTEX_SHADING,
+@@ -378,7 +396,7 @@
+     list.SetGraphicsRootSignature(graphicsRoot_.Get());
+     std::array<float, 2U> const drawConstants{configuration.viewScale, configuration.pointHalfExtent};
+     list.SetGraphicsRoot32BitConstants(0U, static_cast<UINT>(drawConstants.size()), drawConstants.data(), 0U);
+-    list.SetGraphicsRootShaderResourceView(1U, slot.output.Get()->GetGPUVirtualAddress() + Layout::keyed);
++    list.SetGraphicsRootShaderResourceView(1U, slot.output.Get()->GetGPUVirtualAddress() + Layout::sorted);
+     list.SetPipelineState(graphicsPipeline_.Get());
+     if (configuration.recordCapacity != 0U)
+     {
+--- a/chapters/gpu-spatial-binning/Starter/SpatialLab.hlsl
++++ b/chapters/gpu-spatial-binning/Starter/SpatialLab.hlsl
+@@ -117,6 +117,41 @@
+     keyed[lane] = result;
+ }
+ 
++groupshared Record sharedRecords[256];
++
++bool Greater(Record a, Record b)
++{
++    return a.key > b.key || (a.key == b.key && a.identity > b.identity);
++}
++
++// All 256 lanes participate, including (INVALID,INVALID) padding.
++[numthreads(256, 1, 1)]
++void SortCS(uint lane : SV_GroupIndex)
++{
++    sharedRecords[lane] = keyed[lane];
++    GroupMemoryBarrierWithGroupSync();
++    for (uint width = 2u; width <= 256u; width <<= 1u)
++    {
++        for (uint stride = width >> 1u; stride != 0u; stride >>= 1u)
++        {
++            uint peer = lane ^ stride;
++            if (peer > lane)
++            {
++                Record a = sharedRecords[lane];
++                Record b = sharedRecords[peer];
++                bool ascending = (lane & width) == 0u;
++                if (Greater(a, b) == ascending)
++                {
++                    sharedRecords[lane] = b;
++                    sharedRecords[peer] = a;
++                }
++            }
++            GroupMemoryBarrierWithGroupSync();
++        }
++    }
++    sorted[lane] = sharedRecords[lane];
++}
++
+ cbuffer DrawConstants : register(b1)
+ {
+     float viewScale;

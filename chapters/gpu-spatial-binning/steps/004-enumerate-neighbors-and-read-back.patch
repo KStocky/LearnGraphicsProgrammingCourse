@@ -1,0 +1,282 @@
+--- a/chapters/gpu-spatial-binning/Starter/Main.cpp
++++ b/chapters/gpu-spatial-binning/Starter/Main.cpp
+@@ -6,11 +6,11 @@
+ 
+ auto wmain(int argc, wchar_t **argv) -> int
+ {
+-    std::puts("Ch35 checkpoint 3: GPU-sorted records now construct exact half-open cell ranges.");
+-    std::puts("Empty cells carry the sorted-record-count sentinel; queries follow.");
+-    ch35::spatial::starter::Renderer renderer{};
++    std::puts("Ch35 Solution: GPU builds bounded keys, bitonic-sorts (key, identity), constructs exact cell");
++    std::puts("ranges and enumerates clamped neighbor stencils before drawing the GPU-sorted records.");
++    ch35::spatial::solution::Renderer renderer{};
+     lgp::framework::ApplicationConfiguration configuration{};
+-    configuration.title = L"Ch35 GPU Spatial Binning Starter";
++    configuration.title = L"Ch35 GPU Spatial Binning Solution";
+     configuration.width = 1280U;
+     configuration.height = 720U;
+     configuration.enableDebugLayer = false;
+--- a/chapters/gpu-spatial-binning/Starter/Renderer.hpp
++++ b/chapters/gpu-spatial-binning/Starter/Renderer.hpp
+@@ -6,7 +6,7 @@
+ 
+ #include <optional>
+ 
+-namespace ch35::spatial::starter
++namespace ch35::spatial::solution
+ {
+ class Renderer final : public lgp::framework::IChapterRenderer
+ {
+@@ -54,4 +54,4 @@
+     Microsoft::WRL::ComPtr<ID3D12PipelineState> queryPipeline_{};
+     Microsoft::WRL::ComPtr<ID3D12PipelineState> graphicsPipeline_{};
+ };
+-} // namespace ch35::spatial::starter
++} // namespace ch35::spatial::solution
+--- a/chapters/gpu-spatial-binning/Starter/Renderer.cpp
++++ b/chapters/gpu-spatial-binning/Starter/Renderer.cpp
+@@ -10,7 +10,7 @@
+ #include <string>
+ #include <utility>
+ 
+-namespace ch35::spatial::starter
++namespace ch35::spatial::solution
+ {
+ namespace
+ {
+@@ -184,6 +184,10 @@
+     {
+         return status;
+     }
++    if (auto status = Compile(*compiler, path, L"QueryCS", L"cs_6_0", queryShader_); !status)
++    {
++        return status;
++    }
+     if (auto status = Compile(*compiler, path, L"PointVS", L"vs_6_0", vertexShader_); !status)
+     {
+         return status;
+@@ -227,6 +231,10 @@
+         return status;
+     }
+     if (auto status = ComputePipeline(device, *computeRoot_.Get(), rangeShader_, rangePipeline_); !status)
++    {
++        return status;
++    }
++    if (auto status = ComputePipeline(device, *computeRoot_.Get(), queryShader_, queryPipeline_); !status)
+     {
+         return status;
+     }
+@@ -362,8 +370,8 @@
+     constants.cellSize = static_cast<float>(configuration.grid.cellSize);
+     constants.radius = static_cast<float>(configuration.radius);
+ 
+-    gpu::BufferBarrier(list, *slot.output.Get(), slot.initialized ? D3D12_BARRIER_SYNC_VERTEX_SHADING : D3D12_BARRIER_SYNC_NONE,
+-                       slot.initialized ? D3D12_BARRIER_ACCESS_SHADER_RESOURCE : D3D12_BARRIER_ACCESS_NO_ACCESS,
++    gpu::BufferBarrier(list, *slot.output.Get(), slot.initialized ? D3D12_BARRIER_SYNC_COPY : D3D12_BARRIER_SYNC_NONE,
++                       slot.initialized ? D3D12_BARRIER_ACCESS_COPY_SOURCE : D3D12_BARRIER_ACCESS_NO_ACCESS,
+                        D3D12_BARRIER_SYNC_COMPUTE_SHADING, D3D12_BARRIER_ACCESS_UNORDERED_ACCESS);
+     slot.initialized = true;
+     list.SetComputeRootSignature(computeRoot_.Get());
+@@ -390,6 +398,9 @@
+     uavBarrier();
+     list.SetPipelineState(rangePipeline_.Get());
+     list.Dispatch((cells + 255U) / 256U, 1U, 1U);
++    uavBarrier();
++    list.SetPipelineState(queryPipeline_.Get());
++    list.Dispatch(1U, 1U, 1U);
+     gpu::BufferBarrier(list, *slot.output.Get(), D3D12_BARRIER_SYNC_COMPUTE_SHADING,
+                        D3D12_BARRIER_ACCESS_UNORDERED_ACCESS, D3D12_BARRIER_SYNC_VERTEX_SHADING,
+                        D3D12_BARRIER_ACCESS_SHADER_RESOURCE);
+@@ -418,12 +429,61 @@
+         {D3D12_BARRIER_SYNC_RENDER_TARGET, D3D12_BARRIER_ACCESS_RENDER_TARGET, D3D12_BARRIER_LAYOUT_RENDER_TARGET},
+         {D3D12_BARRIER_SYNC_NONE, D3D12_BARRIER_ACCESS_NO_ACCESS,
+          frame.headless ? D3D12_BARRIER_LAYOUT_COMMON : D3D12_BARRIER_LAYOUT_PRESENT});
++    gpu::BufferBarrier(list, *slot.output.Get(), D3D12_BARRIER_SYNC_VERTEX_SHADING,
++                       D3D12_BARRIER_ACCESS_SHADER_RESOURCE, D3D12_BARRIER_SYNC_COPY, D3D12_BARRIER_ACCESS_COPY_SOURCE);
++    list.CopyBufferRegion(slot.readback.Get(), 0U, slot.output.Get(), 0U, Layout::bytes);
+     return {};
+ }
+ 
+ auto Renderer::ReadBackOutputs() -> std::expected<gpu::FrameReadback, lgp::framework::Error>
+ {
+-    return std::unexpected(MakeError("ReadBackOutputs", "Neighbor readback is introduced in checkpoint 4."));
++    auto const idle = resources_->WaitForGpuIdle();
++    if (!idle)
++    {
++        return std::unexpected(std::move(idle.error()));
++    }
++    auto const configuration = ActiveConfiguration();
++    auto const *data = slots_[lastFrameSlot_].readback.mapped_data();
++    gpu::FrameReadback result{};
++    result.stats = Load<gpu::GpuStats>(data, Layout::stats);
++    if (result.stats.emittedCount > configuration.recordCapacity ||
++        result.stats.outputCount > configuration.outputCapacity)
++    {
++        return std::unexpected(MakeError("ReadBackOutputs", "GPU produced an out-of-bounds count."));
++    }
++    for (std::uint32_t index = 0U; index < result.stats.emittedCount; ++index)
++    {
++        result.records.push_back(Load<gpu::GpuRecord>(data, Layout::sorted + sizeof(gpu::GpuRecord) * index));
++    }
++    result.paddingIntact = true;
++    for (std::uint32_t index = result.stats.emittedCount; index < kMaximumRecords; ++index)
++    {
++        auto const record = Load<gpu::GpuRecord>(data, Layout::sorted + sizeof(gpu::GpuRecord) * index);
++        if (record.key != kInvalidCell || record.identity != kInvalidParticleId)
++        {
++            result.paddingIntact = false;
++        }
++    }
++    auto const cells = *ValidateGrid(configuration.grid);
++    for (std::uint32_t index = 0U; index < cells; ++index)
++    {
++        result.ranges.push_back(Load<gpu::GpuRange>(data, Layout::ranges + sizeof(gpu::GpuRange) * index));
++    }
++    auto const stored =
++        std::min(static_cast<std::uint32_t>(configuration.queryIds.size()), configuration.queryCapacity);
++    for (std::uint32_t index = 0U; index < stored; ++index)
++    {
++        result.queries.push_back(Load<gpu::GpuQuery>(data, Layout::queries + sizeof(gpu::GpuQuery) * index));
++    }
++    for (std::uint32_t index = 0U; index < result.stats.outputCount; ++index)
++    {
++        result.neighbors.push_back(Load<std::uint32_t>(data, Layout::neighbors + sizeof(std::uint32_t) * index));
++    }
++    result.outputGuardIntact =
++        Load<std::uint32_t>(data, Layout::neighbors + sizeof(std::uint32_t) * configuration.outputCapacity) ==
++        kInvalidParticleId;
++    result.gpuComputed = true;
++    return result;
+ }
+ 
+ void Renderer::ConfigureHeadlessTest(gpu::LabConfiguration const &configuration)
+@@ -443,4 +503,4 @@
+     graphicsRoot_.Reset();
+     resources_ = nullptr;
+ }
+-} // namespace ch35::spatial::starter
++} // namespace ch35::spatial::solution
+--- a/chapters/gpu-spatial-binning/Starter/SpatialLab.hlsl
++++ b/chapters/gpu-spatial-binning/Starter/SpatialLab.hlsl
+@@ -175,6 +175,121 @@
+     ranges[cell] = range;
+ }
+ 
++groupshared uint acceptedByQuery[256];
++groupshared uint candidatesByQuery[256];
++
++void Visit(Record query, bool writeOutputs, uint first, uint permitted,
++           out uint candidates, out uint accepted)
++{
++    candidates = 0u;
++    accepted = 0u;
++    uint3 cell = uint3(query.key % dimensions.x,
++                       (query.key / dimensions.x) % dimensions.y,
++                       query.key / (dimensions.x * dimensions.y));
++    for (int z = -1; z <= 1; ++z)
++    {
++        for (int y = -1; y <= 1; ++y)
++        {
++            for (int x = -1; x <= 1; ++x)
++            {
++                int3 next = int3(cell) + int3(x, y, z);
++                if (any(next < 0) || any(next >= int3(dimensions)))
++                    continue;
++                uint key = uint(next.x) + dimensions.x * (uint(next.y) + dimensions.y * uint(next.z));
++                CellRange range = ranges[key];
++                for (uint index = range.start; index < range.end; ++index)
++                {
++                    Record other = sorted[index];
++                    ++candidates;
++                    float3 difference = other.position - query.position;
++                    if (other.identity != query.identity && dot(difference, difference) <= radius * radius)
++                    {
++                        if (writeOutputs && accepted < permitted)
++                            neighbors[first + accepted] = other.identity;
++                        ++accepted;
++                    }
++                }
++            }
++        }
++    }
++}
++
++[numthreads(256, 1, 1)]
++void QueryCS(uint lane : SV_GroupIndex)
++{
++    uint candidates = 0u;
++    uint accepted = 0u;
++    Record query = EmptyRecord();
++    if (lane < queryCount)
++    {
++        uint identity = queryIds[lane];
++        for (uint index = 0u; index < recordCapacity; ++index)
++        {
++            Record current = sorted[index];
++            if (current.key != INVALID && current.identity == identity)
++                query = current;
++        }
++        if (query.key != INVALID)
++            Visit(query, false, 0u, 0u, candidates, accepted);
++    }
++    acceptedByQuery[lane] = accepted;
++    candidatesByQuery[lane] = candidates;
++    GroupMemoryBarrierWithGroupSync();
++
++    if (lane < queryCount && lane < queryCapacity)
++    {
++        uint prefix = 0u;
++        for (uint index = 0u; index < lane; ++index)
++            prefix += acceptedByQuery[index];
++        QueryRow row;
++        row.identity = queryIds[lane];
++        row.start = min(prefix, outputCapacity);
++        row.end = min(prefix + accepted, outputCapacity);
++        row.candidateCount = candidates;
++        row.acceptedCount = accepted;
++        row.overflowCount = accepted - (row.end - row.start);
++        rows[lane] = row;
++        if (query.key != INVALID && row.end > row.start)
++        {
++            uint ignoredCandidates;
++            uint ignoredAccepted;
++            Visit(query, true, row.start, row.end - row.start, ignoredCandidates, ignoredAccepted);
++        }
++    }
++    if (lane == 0u)
++    {
++        Statistics result = (Statistics)0;
++        for (uint index = 0u; index < inputCount; ++index)
++        {
++            if (inputs[index].alive != 0u)
++            {
++                ++result.liveCount;
++                if (GridKey(inputs[index].position) == INVALID)
++                    ++result.outsideCount;
++            }
++        }
++        for (uint index = 0u; index < recordCapacity; ++index)
++        {
++            if (sorted[index].key != INVALID)
++                ++result.emittedCount;
++        }
++        result.recordOverflowCount = result.liveCount - result.outsideCount - result.emittedCount;
++        result.queryOverflowCount = queryCount - min(queryCount, queryCapacity);
++        for (uint index = 0u; index < queryCount; ++index)
++        {
++            result.candidateCount += candidatesByQuery[index];
++            result.acceptedCount += acceptedByQuery[index];
++        }
++        uint storedAccepted = 0u;
++        for (uint index = 0u; index < min(queryCount, queryCapacity); ++index)
++            storedAccepted += acceptedByQuery[index];
++        result.outputCount = min(storedAccepted, outputCapacity);
++        result.outputOverflowCount = storedAccepted - result.outputCount;
++        statistics[0] = result;
++        neighbors[outputCapacity] = INVALID;
++    }
++}
++
+ cbuffer DrawConstants : register(b1)
+ {
+     float viewScale;
