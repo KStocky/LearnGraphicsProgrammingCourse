@@ -1,0 +1,201 @@
+--- a/chapters/eulerian-fluid-advection/Starter/Main.cpp
++++ b/chapters/eulerian-fluid-advection/Starter/Main.cpp
+@@ -4,10 +4,10 @@
+ 
+ auto wmain(int argc, wchar_t **argv) -> int
+ {
+-    std::puts("Ch36 checkpoint 3: GPU MAC-face transport and uniform forces.");
+-    ch36::fluid::starter::Renderer renderer{};
++    std::puts("Ch36 Solution: GPU MAC-face velocity transport and force-driven scalar advection.");
++    ch36::fluid::solution::Renderer renderer{};
+     lgp::framework::ApplicationConfiguration config{};
+-    config.title = L"Ch36 Eulerian Fluid Advection Starter";
++    config.title = L"Ch36 Eulerian Fluid Advection Solution";
+     config.enableDebugLayer = false;
+     auto result = lgp::framework::RunApplication(config, argc, argv, renderer);
+     if (!result)
+--- a/chapters/eulerian-fluid-advection/Starter/Renderer.hpp
++++ b/chapters/eulerian-fluid-advection/Starter/Renderer.hpp
+@@ -4,7 +4,7 @@
+ 
+ #include <optional>
+ 
+-namespace ch36::fluid::starter
++namespace ch36::fluid::solution
+ {
+ class Renderer final : public lgp::framework::IChapterRenderer
+ {
+@@ -21,8 +21,8 @@
+   private:
+     struct Slot final
+     {
+-        gpu::Buffer scalar{}, u{}, v{}, prediction{}, reverse{}, corrected{}, final{};
+-        gpu::Buffer uIntermediate{}, vIntermediate{}, uFinal{}, vFinal{};
++        gpu::Buffer scalar{}, u{}, v{}, prediction{}, reverse{}, corrected{}, final{}, readback{};
++        gpu::Buffer uIntermediate{}, vIntermediate{}, uFinal{}, vFinal{}, uReadback{}, vReadback{};
+         bool used{};
+     };
+     [[nodiscard]] auto Active() const -> gpu::LabConfiguration;
+@@ -31,9 +31,10 @@
+     lgp::framework::DeviceResources *resources_{};
+     std::optional<gpu::LabConfiguration> headless_{};
+     std::vector<Slot> slots_{};
++    std::uint32_t lastSlot_{};
+     bool rendered_{};
+     Microsoft::WRL::ComPtr<ID3D12RootSignature> computeRoot_{}, graphicsRoot_{};
+     Microsoft::WRL::ComPtr<ID3D12PipelineState> forward_{}, reverse_{}, correct_{}, ghosts_{}, graphics_{};
+     Microsoft::WRL::ComPtr<ID3D12PipelineState> transportU_{}, transportV_{}, velocityGhosts_{};
+ };
+-} // namespace ch36::fluid::starter
++} // namespace ch36::fluid::solution
+--- a/chapters/eulerian-fluid-advection/Starter/Renderer.cpp
++++ b/chapters/eulerian-fluid-advection/Starter/Renderer.cpp
+@@ -10,7 +10,7 @@
+ #include <string>
+ #include <utility>
+ 
+-namespace ch36::fluid::starter
++namespace ch36::fluid::solution
+ {
+ namespace
+ {
+@@ -200,11 +200,22 @@
+                 return s;
+             }
+         }
++        if (auto s = create(slot.readback, kOutputBytes, D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_FLAG_NONE, true); !s)
++        {
++            return s;
++        }
+         for (auto *buffer : {&slot.uIntermediate, &slot.vIntermediate, &slot.uFinal, &slot.vFinal})
+         {
+             if (auto s = create(*buffer, kScalarBytes, D3D12_HEAP_TYPE_DEFAULT,
+                                 D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, false);
+                 !s)
++            {
++                return s;
++            }
++        }
++        for (auto *buffer : {&slot.uReadback, &slot.vReadback})
++        {
++            if (auto s = create(*buffer, kScalarBytes, D3D12_HEAP_TYPE_READBACK, D3D12_RESOURCE_FLAG_NONE, true); !s)
+             {
+                 return s;
+             }
+@@ -258,15 +269,16 @@
+     transition(slot.prediction, slot.used ? compute : noSync, slot.used ? srv : none, compute, uav);
+     transition(slot.reverse, slot.used ? compute : noSync, slot.used ? srv : none, compute, uav);
+     transition(slot.corrected, slot.used ? compute : noSync, slot.used ? srv : none, compute, uav);
+-    transition(slot.final, slot.used ? D3D12_BARRIER_SYNC_PIXEL_SHADING : noSync,
+-               slot.used ? srv : none, compute, uav);
++    transition(slot.final, slot.used ? D3D12_BARRIER_SYNC_COPY : noSync,
++               slot.used ? D3D12_BARRIER_ACCESS_COPY_SOURCE : none, compute, uav);
+     for (auto *buffer : {&slot.uIntermediate, &slot.vIntermediate})
+     {
+         transition(*buffer, slot.used ? compute : noSync, slot.used ? srv : none, compute, uav);
+     }
+     for (auto *buffer : {&slot.uFinal, &slot.vFinal})
+     {
+-        transition(*buffer, slot.used ? compute : noSync, slot.used ? srv : none, compute, uav);
++        transition(*buffer, slot.used ? D3D12_BARRIER_SYNC_COPY : noSync,
++                   slot.used ? D3D12_BARRIER_ACCESS_COPY_SOURCE : none, compute, uav);
+     }
+     slot.used = true;
+     Parameters const parameters{config.grid.width,
+@@ -328,17 +340,85 @@
+     list.SetPipelineState(graphics_.Get());
+     list.DrawInstanced(3U, 1U, 0U, 0U);
+     gpu::EndDraw(frame);
+-    for (auto *buffer : {&slot.uFinal, &slot.vFinal})
+-    {
+-        transition(*buffer, compute, uav, compute, srv);
+-    }
++    transition(slot.final, D3D12_BARRIER_SYNC_PIXEL_SHADING, srv, D3D12_BARRIER_SYNC_COPY,
++               D3D12_BARRIER_ACCESS_COPY_SOURCE);
++    list.CopyBufferRegion(slot.readback.Get(), 0U, slot.final.Get(), 0U, kOutputBytes);
++    for (auto [output, readback] : {std::pair{&slot.uFinal, &slot.uReadback}, std::pair{&slot.vFinal, &slot.vReadback}})
++    {
++        transition(*output, compute, uav, D3D12_BARRIER_SYNC_COPY, D3D12_BARRIER_ACCESS_COPY_SOURCE);
++        list.CopyBufferRegion(readback->Get(), 0U, output->Get(), 0U, kScalarBytes);
++    }
++    lastSlot_ = frame.frameSlot;
+     rendered_ = true;
+     return {};
+ }
+ 
+ auto Renderer::ReadBackOutputs() -> std::expected<gpu::FrameReadback, lgp::framework::Error>
+ {
+-    return std::unexpected(MakeError("Ch36 readback", "GPU readback is introduced in checkpoint 4."));
++    if (!rendered_ || !resources_)
++    {
++        return std::unexpected(MakeError("Ch36 readback", "No rendered frame."));
++    }
++    auto idle = resources_->WaitForGpuIdle();
++    if (!idle)
++    {
++        return std::unexpected(std::move(idle.error()));
++    }
++    auto const config = Active();
++    auto result = *MakeField(config.grid, Layout::Cell);
++    std::uint32_t clamped = 0U;
++    auto const *data = slots_[lastSlot_].readback.Data();
++    for (std::uint32_t y = 0U; y < config.grid.height + 2U; ++y)
++    {
++        for (std::uint32_t x = 0U; x < config.grid.width + 2U; ++x)
++        {
++            auto const index = y * (config.grid.width + 2U) + x;
++            std::array<float, 2U> pair{};
++            std::memcpy(pair.data(), data + index * sizeof(pair), sizeof(pair));
++            if (!std::isfinite(pair[0]) || !std::isfinite(pair[1]))
++            {
++                return std::unexpected(MakeError("Ch36 readback", "GPU produced nonfinite output."));
++            }
++            result.values[index] = pair[0];
++            if (x > 0U && x <= config.grid.width && y > 0U && y <= config.grid.height)
++            {
++                clamped += static_cast<std::uint32_t>(pair[1] != 0.0F);
++            }
++        }
++    }
++    auto diagnostics = gpu::Diagnostics(config.grid, config.scalar, result, clamped, true);
++    auto readVelocity = [&](Layout layout, gpu::Buffer const &buffer) -> std::expected<Field, lgp::framework::Error>
++    {
++        auto field = *MakeField(config.grid, layout);
++        for (std::size_t i = 0U; i < field.values.size(); ++i)
++        {
++            float value{};
++            std::memcpy(&value, buffer.Data() + i * sizeof(float), sizeof(float));
++            if (!std::isfinite(value))
++            {
++                return std::unexpected(MakeError("Ch36 readback", "GPU produced nonfinite face velocity."));
++            }
++            field.values[i] = value;
++        }
++        return field;
++    };
++    auto u = readVelocity(Layout::XFace, slots_[lastSlot_].uReadback);
++    if (!u)
++    {
++        return std::unexpected(std::move(u.error()));
++    }
++    auto v = readVelocity(Layout::YFace, slots_[lastSlot_].vReadback);
++    if (!v)
++    {
++        return std::unexpected(std::move(v.error()));
++    }
++    diagnostics.velocity = {std::move(*u), std::move(*v)};
++    if (!std::isfinite(diagnostics.advection.sourceMass) || !std::isfinite(diagnostics.advection.sourceEnergy) ||
++        !std::isfinite(diagnostics.advection.outputMass) || !std::isfinite(diagnostics.advection.outputEnergy))
++    {
++        return std::unexpected(MakeError("Ch36 readback", "Nonfinite field diagnostics."));
++    }
++    return diagnostics;
+ }
+ void Renderer::ConfigureHeadlessTest(gpu::LabConfiguration const &configuration)
+ {
+@@ -360,4 +440,4 @@
+     resources_ = nullptr;
+     rendered_ = false;
+ }
+-} // namespace ch36::fluid::starter
++} // namespace ch36::fluid::solution

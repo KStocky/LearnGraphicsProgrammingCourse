@@ -1,0 +1,286 @@
+--- a/chapters/eulerian-fluid-advection/Starter/Main.cpp
++++ b/chapters/eulerian-fluid-advection/Starter/Main.cpp
+@@ -4,7 +4,7 @@
+ 
+ auto wmain(int argc, wchar_t **argv) -> int
+ {
+-    std::puts("Ch36 checkpoint 2: bounded corrected scalar transport on the GPU.");
++    std::puts("Ch36 checkpoint 3: GPU MAC-face transport and uniform forces.");
+     ch36::fluid::starter::Renderer renderer{};
+     lgp::framework::ApplicationConfiguration config{};
+     config.title = L"Ch36 Eulerian Fluid Advection Starter";
+--- a/chapters/eulerian-fluid-advection/Starter/Renderer.hpp
++++ b/chapters/eulerian-fluid-advection/Starter/Renderer.hpp
+@@ -22,6 +22,7 @@
+     struct Slot final
+     {
+         gpu::Buffer scalar{}, u{}, v{}, prediction{}, reverse{}, corrected{}, final{};
++        gpu::Buffer uIntermediate{}, vIntermediate{}, uFinal{}, vFinal{};
+         bool used{};
+     };
+     [[nodiscard]] auto Active() const -> gpu::LabConfiguration;
+@@ -33,5 +34,6 @@
+     bool rendered_{};
+     Microsoft::WRL::ComPtr<ID3D12RootSignature> computeRoot_{}, graphicsRoot_{};
+     Microsoft::WRL::ComPtr<ID3D12PipelineState> forward_{}, reverse_{}, correct_{}, ghosts_{}, graphics_{};
++    Microsoft::WRL::ComPtr<ID3D12PipelineState> transportU_{}, transportV_{}, velocityGhosts_{};
+ };
+ } // namespace ch36::fluid::starter
+--- a/chapters/eulerian-fluid-advection/Starter/Renderer.cpp
++++ b/chapters/eulerian-fluid-advection/Starter/Renderer.cpp
+@@ -49,17 +49,17 @@
+         return std::unexpected(std::move(compiler.error()));
+     }
+     auto const path = std::filesystem::path{__FILE__}.parent_path() / "FluidLab.hlsl";
+-    std::array<lgp::framework::CompiledShader, 6U> shaders{};
+-    constexpr wchar_t const *names[]{L"ForwardCS", L"ReverseCS", L"CorrectCS", L"GhostCS",
+-                                     L"FullscreenVS", L"TracerPS"};
++    std::array<lgp::framework::CompiledShader, 9U> shaders{};
++    constexpr wchar_t const *names[]{L"ForwardCS",    L"ReverseCS",       L"CorrectCS",    L"GhostCS", L"TransportUCS",
++                                     L"TransportVCS", L"VelocityGhostCS", L"FullscreenVS", L"TracerPS"};
+     for (std::size_t i = 0U; i < shaders.size(); ++i)
+     {
+         auto const *target = L"ps_6_0";
+-        if (i < 4U)
++        if (i < 7U)
+         {
+             target = L"cs_6_0";
+         }
+-        else if (i == 4U)
++        else if (i == 7U)
+         {
+             target = L"vs_6_0";
+         }
+@@ -71,19 +71,19 @@
+         shaders[i] = std::move(*compiled);
+     }
+     auto &device = *resources_->device();
+-    std::array<D3D12_ROOT_PARAMETER, 9U> params{};
++    std::array<D3D12_ROOT_PARAMETER, 13U> params{};
+     params[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+     params[0].Constants.ShaderRegister = 0U;
+     params[0].Constants.Num32BitValues = 10U;
+-    for (UINT i = 0U; i < 6U; ++i)
++    for (UINT i = 0U; i < 8U; ++i)
+     {
+         params[i + 1U].ParameterType = D3D12_ROOT_PARAMETER_TYPE_SRV;
+         params[i + 1U].Descriptor.ShaderRegister = i;
+     }
+-    for (UINT i = 0U; i < 2U; ++i)
+-    {
+-        params[i + 7U].ParameterType = D3D12_ROOT_PARAMETER_TYPE_UAV;
+-        params[i + 7U].Descriptor.ShaderRegister = i;
++    for (UINT i = 0U; i < 4U; ++i)
++    {
++        params[i + 9U].ParameterType = D3D12_ROOT_PARAMETER_TYPE_UAV;
++        params[i + 9U].Descriptor.ShaderRegister = i;
+     }
+     D3D12_ROOT_SIGNATURE_DESC desc{};
+     desc.NumParameters = static_cast<UINT>(params.size());
+@@ -117,6 +117,18 @@
+         return s;
+     }
+     if (auto s = build(3U, ghosts_); !s)
++    {
++        return s;
++    }
++    if (auto s = build(4U, transportU_); !s)
++    {
++        return s;
++    }
++    if (auto s = build(5U, transportV_); !s)
++    {
++        return s;
++    }
++    if (auto s = build(6U, velocityGhosts_); !s)
+     {
+         return s;
+     }
+@@ -138,7 +150,7 @@
+     }
+     graphicsRoot_ = std::move(*root);
+     auto pipeline =
+-        gpu::MakeGraphics(device, *graphicsRoot_.Get(), shaders[4], shaders[5], resources_->back_buffer_format());
++        gpu::MakeGraphics(device, *graphicsRoot_.Get(), shaders[7], shaders[8], resources_->back_buffer_format());
+     if (!pipeline)
+     {
+         return std::unexpected(std::move(pipeline.error()));
+@@ -182,6 +194,15 @@
+         for (auto *buffer : {&slot.corrected, &slot.final})
+         {
+             if (auto s = create(*buffer, kOutputBytes, D3D12_HEAP_TYPE_DEFAULT,
++                                D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, false);
++                !s)
++            {
++                return s;
++            }
++        }
++        for (auto *buffer : {&slot.uIntermediate, &slot.vIntermediate, &slot.uFinal, &slot.vFinal})
++        {
++            if (auto s = create(*buffer, kScalarBytes, D3D12_HEAP_TYPE_DEFAULT,
+                                 D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, false);
+                 !s)
+             {
+@@ -239,6 +260,14 @@
+     transition(slot.corrected, slot.used ? compute : noSync, slot.used ? srv : none, compute, uav);
+     transition(slot.final, slot.used ? D3D12_BARRIER_SYNC_PIXEL_SHADING : noSync,
+                slot.used ? srv : none, compute, uav);
++    for (auto *buffer : {&slot.uIntermediate, &slot.vIntermediate})
++    {
++        transition(*buffer, slot.used ? compute : noSync, slot.used ? srv : none, compute, uav);
++    }
++    for (auto *buffer : {&slot.uFinal, &slot.vFinal})
++    {
++        transition(*buffer, slot.used ? compute : noSync, slot.used ? srv : none, compute, uav);
++    }
+     slot.used = true;
+     Parameters const parameters{config.grid.width,
+                                 config.grid.height,
+@@ -260,23 +289,37 @@
+     bind(3U, slot.prediction);
+     bind(4U, slot.reverse);
+     bind(5U, slot.corrected);
++    bind(6U, slot.uIntermediate);
++    bind(7U, slot.vIntermediate);
+     auto const groupsX = (config.grid.width + 7U) / 8U;
+     auto const groupsY = (config.grid.height + 7U) / 8U;
+-    list.SetComputeRootUnorderedAccessView(7U, slot.prediction.Get()->GetGPUVirtualAddress());
+-    list.SetComputeRootUnorderedAccessView(8U, slot.corrected.Get()->GetGPUVirtualAddress());
++    list.SetComputeRootUnorderedAccessView(9U, slot.prediction.Get()->GetGPUVirtualAddress());
++    list.SetComputeRootUnorderedAccessView(10U, slot.corrected.Get()->GetGPUVirtualAddress());
++    list.SetComputeRootUnorderedAccessView(11U, slot.uIntermediate.Get()->GetGPUVirtualAddress());
++    list.SetComputeRootUnorderedAccessView(12U, slot.vIntermediate.Get()->GetGPUVirtualAddress());
+     list.SetPipelineState(forward_.Get());
+     list.Dispatch(groupsX, groupsY, 1U);
+     transition(slot.prediction, compute, uav, compute, srv);
+-    list.SetComputeRootUnorderedAccessView(7U, slot.reverse.Get()->GetGPUVirtualAddress());
++    list.SetComputeRootUnorderedAccessView(9U, slot.reverse.Get()->GetGPUVirtualAddress());
+     list.SetPipelineState(reverse_.Get());
+     list.Dispatch(groupsX, groupsY, 1U);
+     transition(slot.reverse, compute, uav, compute, srv);
+     list.SetPipelineState(correct_.Get());
+     list.Dispatch(groupsX, groupsY, 1U);
+     transition(slot.corrected, compute, uav, compute, srv);
+-    list.SetComputeRootUnorderedAccessView(8U, slot.final.Get()->GetGPUVirtualAddress());
++    list.SetComputeRootUnorderedAccessView(10U, slot.final.Get()->GetGPUVirtualAddress());
+     list.SetPipelineState(ghosts_.Get());
+     list.Dispatch((config.grid.width + 9U) / 8U, (config.grid.height + 9U) / 8U, 1U);
++    list.SetPipelineState(transportU_.Get());
++    list.Dispatch((config.grid.width + 8U) / 8U, groupsY, 1U);
++    list.SetPipelineState(transportV_.Get());
++    list.Dispatch(groupsX, (config.grid.height + 8U) / 8U, 1U);
++    transition(slot.uIntermediate, compute, uav, compute, srv);
++    transition(slot.vIntermediate, compute, uav, compute, srv);
++    list.SetComputeRootUnorderedAccessView(11U, slot.uFinal.Get()->GetGPUVirtualAddress());
++    list.SetComputeRootUnorderedAccessView(12U, slot.vFinal.Get()->GetGPUVirtualAddress());
++    list.SetPipelineState(velocityGhosts_.Get());
++    list.Dispatch((config.grid.width + 10U) / 8U, (config.grid.height + 10U) / 8U, 1U);
+     transition(slot.final, compute, uav, D3D12_BARRIER_SYNC_PIXEL_SHADING, srv);
+     gpu::BeginDraw(frame);
+     list.SetGraphicsRootSignature(graphicsRoot_.Get());
+@@ -285,6 +328,10 @@
+     list.SetPipelineState(graphics_.Get());
+     list.DrawInstanced(3U, 1U, 0U, 0U);
+     gpu::EndDraw(frame);
++    for (auto *buffer : {&slot.uFinal, &slot.vFinal})
++    {
++        transition(*buffer, compute, uav, compute, srv);
++    }
+     rendered_ = true;
+     return {};
+ }
+@@ -305,6 +352,9 @@
+     correct_.Reset();
+     ghosts_.Reset();
+     graphics_.Reset();
++    transportU_.Reset();
++    transportV_.Reset();
++    velocityGhosts_.Reset();
+     computeRoot_.Reset();
+     graphicsRoot_.Reset();
+     resources_ = nullptr;
+--- a/chapters/eulerian-fluid-advection/Starter/FluidLab.hlsl
++++ b/chapters/eulerian-fluid-advection/Starter/FluidLab.hlsl
+@@ -18,8 +18,12 @@
+ StructuredBuffer<float> prediction : register(t3);
+ StructuredBuffer<float> reverseField : register(t4);
+ StructuredBuffer<float2> outputField : register(t5);
++StructuredBuffer<float> transportedU : register(t6);
++StructuredBuffer<float> transportedV : register(t7);
+ RWStructuredBuffer<float> intermediate : register(u0);
+ RWStructuredBuffer<float2> resultField : register(u1);
++RWStructuredBuffer<float> velocityU : register(u2);
++RWStructuredBuffer<float> velocityV : register(u3);
+ 
+ int Wrap(int index, int count)
+ {
+@@ -48,8 +52,8 @@
+     }
+     uint address = uint(y + 1) * uint(nx + 2) + uint(x + 1);
+     if (kind == 0u) return sourceScalar[address];
+-    if (kind == 1u) return sourceU[address];
+-    if (kind == 2u) return sourceV[address];
++    if (kind == 1u) return sourceU[address] + accelerationX * timeStep;
++    if (kind == 2u) return sourceV[address] + accelerationY * timeStep;
+     return prediction[address];
+ }
+ 
+@@ -129,6 +133,58 @@
+     resultField[thread.y * (width + 2u) + thread.x] = value;
+ }
+ 
++[numthreads(8, 8, 1)]
++void TransportUCS(uint2 face : SV_DispatchThreadID)
++{
++    if (face.x > width || face.y >= height) return;
++    float2 centre = float2(float(face.x), float(face.y) + 0.5) * cellSize;
++    float2 velocity = float2(SampleField(1u, centre), SampleField(2u, centre));
++    velocityU[(face.y + 1u) * (width + 3u) + face.x + 1u] =
++        SampleField(1u, centre - timeStep * velocity);
++}
++
++[numthreads(8, 8, 1)]
++void TransportVCS(uint2 face : SV_DispatchThreadID)
++{
++    if (face.x >= width || face.y > height) return;
++    float2 centre = float2(float(face.x) + 0.5, float(face.y)) * cellSize;
++    float2 velocity = float2(SampleField(1u, centre), SampleField(2u, centre));
++    velocityV[(face.y + 1u) * (width + 2u) + face.x + 1u] =
++        SampleField(2u, centre - timeStep * velocity);
++}
++
++int2 FaceSource(int2 face, uint kind)
++{
++    int nx = int(width) + (kind == 1u ? 1 : 0);
++    int ny = int(height) + (kind == 2u ? 1 : 0);
++    if (boundaryMode == 2u)
++        return int2(Wrap(face.x, int(width)), Wrap(face.y, int(height)));
++    return clamp(face, int2(0, 0), int2(nx - 1, ny - 1));
++}
++
++[numthreads(8, 8, 1)]
++void VelocityGhostCS(uint2 cell : SV_DispatchThreadID)
++{
++    if (cell.x < width + 3u && cell.y < height + 2u)
++    {
++        int2 face = int2(cell) - 1;
++        int2 source = FaceSource(face, 1u);
++        float value = transportedU[uint(source.y + 1) * (width + 3u) + uint(source.x + 1)];
++        if (boundaryMode == 0u && (source.x == 0 || source.x == int(width)))
++            value = 0.0;
++        velocityU[cell.y * (width + 3u) + cell.x] = value;
++    }
++    if (cell.x < width + 2u && cell.y < height + 3u)
++    {
++        int2 face = int2(cell) - 1;
++        int2 source = FaceSource(face, 2u);
++        float value = transportedV[uint(source.y + 1) * (width + 2u) + uint(source.x + 1)];
++        if (boundaryMode == 0u && (source.y == 0 || source.y == int(height)))
++            value = 0.0;
++        velocityV[cell.y * (width + 2u) + cell.x] = value;
++    }
++}
++
+ float4 FullscreenVS(uint vertex : SV_VertexID) : SV_Position
+ {
+     float2 p = float2(vertex == 2u ? 3.0 : -1.0, vertex == 1u ? 3.0 : -1.0);

@@ -64,7 +64,8 @@ set(
     screen-space-reflections-and-indirect-lighting
     dxr-foundations
     gpu-particle-systems
-    gpu-spatial-binning)
+    gpu-spatial-binning
+    eulerian-fluid-advection)
 
 foreach(chapter IN LISTS LGP_SELECTED_CHAPTERS)
     if(NOT chapter IN_LIST LGP_IMPLEMENTED_CHAPTERS)
@@ -80,7 +81,7 @@ function(lgp_chapter_is_selected chapter result)
     endif()
 endfunction()
 
-set(LGP_COURSE_VERSION "course-v2026.09.27.1" CACHE STRING "Published course version" FORCE)
+set(LGP_COURSE_VERSION "course-v2026.09.27.2" CACHE STRING "Published course version" FORCE)
 set(CMAKE_CXX_STANDARD 23)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)

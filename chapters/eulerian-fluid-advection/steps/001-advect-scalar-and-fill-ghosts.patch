@@ -1,0 +1,518 @@
+--- a/chapters/eulerian-fluid-advection/Starter/Main.cpp
++++ b/chapters/eulerian-fluid-advection/Starter/Main.cpp
+@@ -4,7 +4,7 @@
+ 
+ auto wmain(int argc, wchar_t **argv) -> int
+ {
+-    std::puts("Ch36 Starter: CPU-derived initial tracer, no GPU advection.");
++    std::puts("Ch36 checkpoint 1: GPU semi-Lagrangian scalar transport and ghost boundaries.");
+     ch36::fluid::starter::Renderer renderer{};
+     lgp::framework::ApplicationConfiguration config{};
+     config.title = L"Ch36 Eulerian Fluid Advection Starter";
+--- a/chapters/eulerian-fluid-advection/Starter/Renderer.hpp
++++ b/chapters/eulerian-fluid-advection/Starter/Renderer.hpp
+@@ -16,16 +16,22 @@
+     [[nodiscard]] auto Render(lgp::framework::FrameContext const &) -> lgp::framework::Status override;
+     void Shutdown(lgp::framework::DeviceResources &) noexcept override;
+     void ConfigureHeadlessTest(gpu::LabConfiguration const &configuration);
+-    [[nodiscard]] auto ReadBackOutputs() const -> std::expected<gpu::FrameReadback, lgp::framework::Error>;
++    [[nodiscard]] auto ReadBackOutputs() -> std::expected<gpu::FrameReadback, lgp::framework::Error>;
+ 
+   private:
++    struct Slot final
++    {
++        gpu::Buffer scalar{}, u{}, v{}, prediction{}, final{};
++        bool used{};
++    };
+     [[nodiscard]] auto Active() const -> gpu::LabConfiguration;
++    [[nodiscard]] auto CreatePipelines() -> lgp::framework::Status;
++    [[nodiscard]] auto CreateResources() -> lgp::framework::Status;
+     lgp::framework::DeviceResources *resources_{};
+     std::optional<gpu::LabConfiguration> headless_{};
+-    std::vector<gpu::Buffer> drawSlots_{};
+-    Field baseline_{};
++    std::vector<Slot> slots_{};
+     bool rendered_{};
+-    Microsoft::WRL::ComPtr<ID3D12RootSignature> root_{};
+-    Microsoft::WRL::ComPtr<ID3D12PipelineState> pipeline_{};
++    Microsoft::WRL::ComPtr<ID3D12RootSignature> computeRoot_{}, graphicsRoot_{};
++    Microsoft::WRL::ComPtr<ID3D12PipelineState> forward_{}, ghosts_{}, graphics_{};
+ };
+ } // namespace ch36::fluid::starter
+--- a/chapters/eulerian-fluid-advection/Starter/Renderer.cpp
++++ b/chapters/eulerian-fluid-advection/Starter/Renderer.cpp
+@@ -4,72 +4,189 @@
+ 
+ #include <algorithm>
+ #include <array>
++#include <cmath>
++#include <cstring>
+ #include <filesystem>
++#include <string>
+ #include <utility>
+ 
+ namespace ch36::fluid::starter
++{
++namespace
+ {
+ using lgp::framework::MakeError;
+ using lgp::framework::Status;
++constexpr std::uint64_t kScalarBytes = 67U * 67U * sizeof(float);
++constexpr std::uint64_t kOutputBytes = 67U * 67U * sizeof(float) * 2U;
++struct Parameters final
++{
++    std::uint32_t width{}, height{};
++    float cellSize{}, timeStep{};
++    std::uint32_t boundary{}, corrected{}, screenWidth{}, screenHeight{};
++    float accelerationX{}, accelerationY{};
++};
++static_assert(sizeof(Parameters) == 40U);
++
++void Upload(gpu::Buffer &buffer, Field const &field)
++{
++    auto *destination = reinterpret_cast<float *>(buffer.Data());
++    std::transform(field.values.begin(), field.values.end(), destination,
++                   [](double value) { return static_cast<float>(value); });
++}
++
++} // namespace
+ 
+ auto Renderer::Active() const -> gpu::LabConfiguration
+ {
+     return headless_.value_or(gpu::DefaultConfiguration());
+ }
+-auto Renderer::Initialize(lgp::framework::ApplicationInitContext const &context) -> Status
+-{
+-    resources_ = &context.deviceResources;
++
++auto Renderer::CreatePipelines() -> Status
++{
+     auto compiler = lgp::framework::ShaderCompiler::Create();
+     if (!compiler)
+     {
+         return std::unexpected(std::move(compiler.error()));
+     }
+     auto const path = std::filesystem::path{__FILE__}.parent_path() / "FluidLab.hlsl";
+-    auto vertex = gpu::Compile(*compiler, path, L"FullscreenVS", L"vs_6_0");
+-    if (!vertex)
+-    {
+-        return std::unexpected(std::move(vertex.error()));
+-    }
+-    auto pixel = gpu::Compile(*compiler, path, L"TracerPS", L"ps_6_0");
+-    if (!pixel)
+-    {
+-        return std::unexpected(std::move(pixel.error()));
+-    }
+-    std::array<D3D12_ROOT_PARAMETER, 2U> params{};
++    std::array<lgp::framework::CompiledShader, 4U> shaders{};
++    constexpr wchar_t const *names[]{L"ForwardCS", L"GhostCS", L"FullscreenVS", L"TracerPS"};
++    for (std::size_t i = 0U; i < shaders.size(); ++i)
++    {
++        auto const *target = L"ps_6_0";
++        if (i < 2U)
++        {
++            target = L"cs_6_0";
++        }
++        else if (i == 2U)
++        {
++            target = L"vs_6_0";
++        }
++        auto compiled = gpu::Compile(*compiler, path, names[i], target);
++        if (!compiled)
++        {
++            return std::unexpected(std::move(compiled.error()));
++        }
++        shaders[i] = std::move(*compiled);
++    }
++    auto &device = *resources_->device();
++    std::array<D3D12_ROOT_PARAMETER, 7U> params{};
+     params[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+     params[0].Constants.ShaderRegister = 0U;
+-    params[0].Constants.Num32BitValues = 4U;
+-    params[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_SRV;
+-    params[1].Descriptor.ShaderRegister = 0U;
+-    params[1].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
++    params[0].Constants.Num32BitValues = 10U;
++    for (UINT i = 0U; i < 4U; ++i)
++    {
++        params[i + 1U].ParameterType = D3D12_ROOT_PARAMETER_TYPE_SRV;
++        params[i + 1U].Descriptor.ShaderRegister = i;
++    }
++    for (UINT i = 0U; i < 2U; ++i)
++    {
++        params[i + 5U].ParameterType = D3D12_ROOT_PARAMETER_TYPE_UAV;
++        params[i + 5U].Descriptor.ShaderRegister = i;
++    }
+     D3D12_ROOT_SIGNATURE_DESC desc{};
+     desc.NumParameters = static_cast<UINT>(params.size());
+     desc.pParameters = params.data();
++    auto root = gpu::MakeRoot(device, desc);
++    if (!root)
++    {
++        return std::unexpected(std::move(root.error()));
++    }
++    computeRoot_ = std::move(*root);
++    auto build = [&](std::size_t i, Microsoft::WRL::ComPtr<ID3D12PipelineState> &pipeline) -> Status
++    {
++        auto created = gpu::MakeCompute(device, *computeRoot_.Get(), shaders[i]);
++        if (!created)
++        {
++            return std::unexpected(std::move(created.error()));
++        }
++        pipeline = std::move(*created);
++        return {};
++    };
++    if (auto s = build(0U, forward_); !s)
++    {
++        return s;
++    }
++    if (auto s = build(1U, ghosts_); !s)
++    {
++        return s;
++    }
++    std::array<D3D12_ROOT_PARAMETER, 2U> draw{};
++    draw[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
++    draw[0].Constants.ShaderRegister = 0U;
++    draw[0].Constants.Num32BitValues = 8U;
++    draw[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
++    draw[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_SRV;
++    draw[1].Descriptor.ShaderRegister = 5U;
++    draw[1].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
++    desc.NumParameters = static_cast<UINT>(draw.size());
++    desc.pParameters = draw.data();
+     desc.Flags = D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT;
+-    auto root = gpu::MakeRoot(*resources_->device(), desc);
++    root = gpu::MakeRoot(device, desc);
+     if (!root)
+     {
+         return std::unexpected(std::move(root.error()));
+     }
+-    root_ = std::move(*root);
++    graphicsRoot_ = std::move(*root);
+     auto pipeline =
+-        gpu::MakeGraphics(*resources_->device(), *root_.Get(), *vertex, *pixel, resources_->back_buffer_format());
++        gpu::MakeGraphics(device, *graphicsRoot_.Get(), shaders[2], shaders[3], resources_->back_buffer_format());
+     if (!pipeline)
+     {
+         return std::unexpected(std::move(pipeline.error()));
+     }
+-    pipeline_ = std::move(*pipeline);
+-    for (std::uint32_t i = 0U; i < resources_->back_buffer_count(); ++i)
+-    {
+-        auto buffer = gpu::MakeBuffer(*resources_->device(), 67U * 67U * sizeof(float), D3D12_HEAP_TYPE_UPLOAD,
+-                                      D3D12_RESOURCE_FLAG_NONE, true);
+-        if (!buffer)
+-        {
+-            return std::unexpected(std::move(buffer.error()));
+-        }
+-        drawSlots_.push_back(std::move(*buffer));
+-    }
+-    return {};
++    graphics_ = std::move(*pipeline);
++    return {};
++}
++
++auto Renderer::CreateResources() -> Status
++{
++    slots_.resize(resources_->back_buffer_count());
++    for (auto &slot : slots_)
++    {
++        auto create = [&](gpu::Buffer &buffer, std::uint64_t bytes, D3D12_HEAP_TYPE heap, D3D12_RESOURCE_FLAGS flags,
++                          bool mapped) -> Status
++        {
++            auto made = gpu::MakeBuffer(*resources_->device(), bytes, heap, flags, mapped);
++            if (!made)
++            {
++                return std::unexpected(std::move(made.error()));
++            }
++            buffer = std::move(*made);
++            return {};
++        };
++        for (auto *buffer : {&slot.scalar, &slot.u, &slot.v})
++        {
++            if (auto s = create(*buffer, kScalarBytes, D3D12_HEAP_TYPE_UPLOAD, D3D12_RESOURCE_FLAG_NONE, true); !s)
++            {
++                return s;
++            }
++        }
++        for (auto *buffer : {&slot.prediction})
++        {
++            if (auto s = create(*buffer, kScalarBytes, D3D12_HEAP_TYPE_DEFAULT,
++                                D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, false);
++                !s)
++            {
++                return s;
++            }
++        }
++        if (auto s = create(slot.final, kOutputBytes, D3D12_HEAP_TYPE_DEFAULT,
++                            D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, false); !s)
++        {
++            return s;
++        }
++    }
++    return {};
++}
++
++auto Renderer::Initialize(lgp::framework::ApplicationInitContext const &context) -> Status
++{
++    resources_ = &context.deviceResources;
++    if (auto s = CreatePipelines(); !s)
++    {
++        return s;
++    }
++    return CreateResources();
+ }
+ auto Renderer::OnResize(lgp::framework::DeviceResources &, lgp::framework::Extent2D) -> Status
+ {
+@@ -77,60 +194,79 @@
+ }
+ auto Renderer::Update(lgp::framework::UpdateContext const &) -> Status
+ {
++    return gpu::ValidateConfiguration(Active());
++}
++
++auto Renderer::Render(lgp::framework::FrameContext const &frame) -> Status
++{
++    if (frame.frameSlot >= slots_.size())
++    {
++        return std::unexpected(MakeError("Ch36 Render", "Frame slot out of range."));
++    }
+     auto const config = Active();
+     if (auto s = gpu::ValidateConfiguration(config); !s)
+     {
+         return s;
+     }
+-    baseline_ = config.scalar;
+-    auto filled = FillGhosts(config.grid, baseline_, config.boundary);
+-    if (!filled)
+-    {
+-        return std::unexpected(MakeError("Ch36 Starter", "Could not fill baseline ghosts."));
+-    }
+-    return {};
+-}
+-auto Renderer::Render(lgp::framework::FrameContext const &frame) -> Status
+-{
+-    if (frame.frameSlot >= drawSlots_.size() || baseline_.values.empty())
+-    {
+-        return std::unexpected(MakeError("Ch36 Starter", "Update required or frame slot out of range."));
+-    }
+-    auto const config = Active();
+-    auto *mapped = reinterpret_cast<float *>(drawSlots_[frame.frameSlot].Data());
+-    std::transform(baseline_.values.begin(), baseline_.values.end(), mapped,
+-                   [](double value) { return static_cast<float>(value); });
++    auto &slot = slots_[frame.frameSlot];
++    Upload(slot.scalar, config.scalar);
++    Upload(slot.u, config.velocityX);
++    Upload(slot.v, config.velocityY);
++    auto &list = *frame.commandList;
++    auto transition = [&](gpu::Buffer &buffer, D3D12_BARRIER_SYNC beforeSync, D3D12_BARRIER_ACCESS before,
++                          D3D12_BARRIER_SYNC afterSync, D3D12_BARRIER_ACCESS after)
++    { gpu::Barrier(list, *buffer.Get(), beforeSync, before, afterSync, after); };
++    constexpr auto compute = D3D12_BARRIER_SYNC_COMPUTE_SHADING;
++    constexpr auto uav = D3D12_BARRIER_ACCESS_UNORDERED_ACCESS;
++    constexpr auto srv = D3D12_BARRIER_ACCESS_SHADER_RESOURCE;
++    constexpr auto none = D3D12_BARRIER_ACCESS_NO_ACCESS;
++    constexpr auto noSync = D3D12_BARRIER_SYNC_NONE;
++    transition(slot.prediction, slot.used ? compute : noSync, slot.used ? srv : none, compute, uav);
++    transition(slot.final, slot.used ? D3D12_BARRIER_SYNC_PIXEL_SHADING : noSync,
++               slot.used ? srv : none, compute, uav);
++    slot.used = true;
++    Parameters const parameters{config.grid.width,
++                                config.grid.height,
++                                static_cast<float>(config.grid.cellSize),
++                                static_cast<float>(config.timeStep),
++                                static_cast<std::uint32_t>(config.boundary),
++                                static_cast<std::uint32_t>(config.method == AdvectionMethod::Corrected),
++                                frame.viewport.Width > 0 ? static_cast<std::uint32_t>(frame.viewport.Width) : 1U,
++                                frame.viewport.Height > 0 ? static_cast<std::uint32_t>(frame.viewport.Height) : 1U,
++                                static_cast<float>(config.accelerationX),
++                                static_cast<float>(config.accelerationY)};
++    list.SetComputeRootSignature(computeRoot_.Get());
++    list.SetComputeRoot32BitConstants(0U, 10U, &parameters, 0U);
++    auto bind = [&](UINT index, gpu::Buffer &buffer)
++    { list.SetComputeRootShaderResourceView(index + 1U, buffer.Get()->GetGPUVirtualAddress()); };
++    bind(0U, slot.scalar);
++    bind(1U, slot.u);
++    bind(2U, slot.v);
++    bind(3U, slot.prediction);
++    auto const groupsX = (config.grid.width + 7U) / 8U;
++    auto const groupsY = (config.grid.height + 7U) / 8U;
++    list.SetComputeRootUnorderedAccessView(5U, slot.prediction.Get()->GetGPUVirtualAddress());
++    list.SetComputeRootUnorderedAccessView(6U, slot.final.Get()->GetGPUVirtualAddress());
++    list.SetPipelineState(forward_.Get());
++    list.Dispatch(groupsX, groupsY, 1U);
++    transition(slot.prediction, compute, uav, compute, srv);
++    list.SetPipelineState(ghosts_.Get());
++    list.Dispatch((config.grid.width + 9U) / 8U, (config.grid.height + 9U) / 8U, 1U);
++    transition(slot.final, compute, uav, D3D12_BARRIER_SYNC_PIXEL_SHADING, srv);
+     gpu::BeginDraw(frame);
+-    auto &list = *frame.commandList;
+-    list.SetGraphicsRootSignature(root_.Get());
+-    std::array<std::uint32_t, 4U> const parameters{config.grid.width, config.grid.height,
+-                                                   std::max(1U, static_cast<std::uint32_t>(frame.viewport.Width)),
+-                                                   std::max(1U, static_cast<std::uint32_t>(frame.viewport.Height))};
+-    list.SetGraphicsRoot32BitConstants(0U, 4U, parameters.data(), 0U);
+-    list.SetGraphicsRootShaderResourceView(1U, drawSlots_[frame.frameSlot].Get()->GetGPUVirtualAddress());
+-    list.SetPipelineState(pipeline_.Get());
++    list.SetGraphicsRootSignature(graphicsRoot_.Get());
++    list.SetGraphicsRoot32BitConstants(0U, 8U, &parameters, 0U);
++    list.SetGraphicsRootShaderResourceView(1U, slot.final.Get()->GetGPUVirtualAddress());
++    list.SetPipelineState(graphics_.Get());
+     list.DrawInstanced(3U, 1U, 0U, 0U);
+     gpu::EndDraw(frame);
+     rendered_ = true;
+     return {};
+ }
+-auto Renderer::ReadBackOutputs() const -> std::expected<gpu::FrameReadback, lgp::framework::Error>
+-{
+-    if (!rendered_)
+-    {
+-        return std::unexpected(MakeError("Ch36 Starter", "No baseline frame."));
+-    }
+-    auto const config = Active();
+-    auto result = gpu::Diagnostics(config.grid, config.scalar, baseline_, 0U, false);
+-    result.velocity = {config.velocityX, config.velocityY};
+-    for (auto *field : {&result.velocity.x, &result.velocity.y})
+-    {
+-        if (auto filled = FillGhosts(config.grid, *field, config.boundary); !filled)
+-        {
+-            return std::unexpected(MakeError("Ch36 Starter", "Invalid baseline face velocity."));
+-        }
+-    }
+-    return result;
++
++auto Renderer::ReadBackOutputs() -> std::expected<gpu::FrameReadback, lgp::framework::Error>
++{
++    return std::unexpected(MakeError("Ch36 readback", "GPU readback is introduced in checkpoint 4."));
+ }
+ void Renderer::ConfigureHeadlessTest(gpu::LabConfiguration const &configuration)
+ {
+@@ -138,9 +274,12 @@
+ }
+ void Renderer::Shutdown(lgp::framework::DeviceResources &) noexcept
+ {
+-    drawSlots_.clear();
+-    pipeline_.Reset();
+-    root_.Reset();
++    slots_.clear();
++    forward_.Reset();
++    ghosts_.Reset();
++    graphics_.Reset();
++    computeRoot_.Reset();
++    graphicsRoot_.Reset();
+     resources_ = nullptr;
+     rendered_ = false;
+ }
+--- a/chapters/eulerian-fluid-advection/Starter/FluidLab.hlsl
++++ b/chapters/eulerian-fluid-advection/Starter/FluidLab.hlsl
+@@ -2,10 +2,101 @@
+ {
+     uint width;
+     uint height;
++    float cellSize;
++    float timeStep;
++    uint boundaryMode;
++    uint correctedMode;
+     uint screenWidth;
+     uint screenHeight;
++    float accelerationX;
++    float accelerationY;
+ };
+-StructuredBuffer<float> initialTracer : register(t0);
++
++StructuredBuffer<float> sourceScalar : register(t0);
++StructuredBuffer<float> sourceU : register(t1);
++StructuredBuffer<float> sourceV : register(t2);
++StructuredBuffer<float> prediction : register(t3);
++StructuredBuffer<float2> outputField : register(t5);
++RWStructuredBuffer<float> intermediate : register(u0);
++RWStructuredBuffer<float2> resultField : register(u1);
++
++int Wrap(int index, int count)
++{
++    return (index % count + count) % count;
++}
++
++// Map a ghost access to a physical interior sample. For periodic face fields,
++// the last face aliases face zero; solid walls erase only normal face velocity.
++float Fetch(uint kind, int x, int y)
++{
++    int nx = int(width) + (kind == 1u ? 1 : 0);
++    int ny = int(height) + (kind == 2u ? 1 : 0);
++    if (boundaryMode == 2u)
++    {
++        x = Wrap(x, int(width));
++        y = Wrap(y, int(height));
++    }
++    else
++    {
++        x = clamp(x, 0, nx - 1);
++        y = clamp(y, 0, ny - 1);
++        if (boundaryMode == 0u &&
++            ((kind == 1u && (x == 0 || x == nx - 1)) ||
++             (kind == 2u && (y == 0 || y == ny - 1))))
++            return 0.0;
++    }
++    uint address = uint(y + 1) * uint(nx + 2) + uint(x + 1);
++    if (kind == 0u) return sourceScalar[address];
++    if (kind == 1u) return sourceU[address];
++    if (kind == 2u) return sourceV[address];
++    return prediction[address];
++}
++
++float SampleField(uint kind, float2 world)
++{
++    float2 offset = float2(kind == 1u ? 0.0 : 0.5, kind == 2u ? 0.0 : 0.5);
++    float2 p = world / cellSize - offset;
++    int2 lower = int2(floor(p));
++    float2 fraction = p - floor(p);
++    float a = lerp(Fetch(kind, lower.x, lower.y), Fetch(kind, lower.x + 1, lower.y), fraction.x);
++    float b = lerp(Fetch(kind, lower.x, lower.y + 1), Fetch(kind, lower.x + 1, lower.y + 1), fraction.x);
++    return lerp(a, b, fraction.y);
++}
++
++float2 Departure(int2 cell, float direction)
++{
++    float2 centre = (float2(cell) + 0.5) * cellSize;
++    float2 velocity = float2(SampleField(1u, centre), SampleField(2u, centre));
++    return centre - direction * timeStep * velocity;
++}
++
++[numthreads(8, 8, 1)]
++void ForwardCS(uint2 cell : SV_DispatchThreadID)
++{
++    if (cell.x >= width || cell.y >= height) return;
++    intermediate[(cell.y + 1u) * (width + 2u) + cell.x + 1u] =
++        SampleField(0u, Departure(int2(cell), 1.0));
++}
++
++[numthreads(8, 8, 1)]
++void GhostCS(uint2 thread : SV_DispatchThreadID)
++{
++    if (thread.x >= width + 2u || thread.y >= height + 2u) return;
++    int x = int(thread.x) - 1;
++    int y = int(thread.y) - 1;
++    if (boundaryMode == 2u)
++    {
++        x = Wrap(x, int(width));
++        y = Wrap(y, int(height));
++    }
++    else
++    {
++        x = clamp(x, 0, int(width) - 1);
++        y = clamp(y, 0, int(height) - 1);
++    }
++    float2 value = float2(prediction[uint(y + 1) * (width + 2u) + uint(x + 1)], 0.0);
++    resultField[thread.y * (width + 2u) + thread.x] = value;
++}
+ 
+ float4 FullscreenVS(uint vertex : SV_VertexID) : SV_Position
+ {
+@@ -17,6 +108,6 @@
+ {
+     uint x = min(uint(position.x * float(width) / float(screenWidth)), width - 1u);
+     uint y = min(uint(position.y * float(height) / float(screenHeight)), height - 1u);
+-    float density = saturate(initialTracer[(y + 1u) * (width + 2u) + x + 1u]);
++    float density = saturate(outputField[(y + 1u) * (width + 2u) + x + 1u].x);
+     return float4(density * 0.25, density * 0.65, density, 1.0);
+ }

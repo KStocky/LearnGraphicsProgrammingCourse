@@ -1,0 +1,232 @@
+--- a/chapters/eulerian-fluid-advection/Starter/Main.cpp
++++ b/chapters/eulerian-fluid-advection/Starter/Main.cpp
+@@ -4,7 +4,7 @@
+ 
+ auto wmain(int argc, wchar_t **argv) -> int
+ {
+-    std::puts("Ch36 checkpoint 1: GPU semi-Lagrangian scalar transport and ghost boundaries.");
++    std::puts("Ch36 checkpoint 2: bounded corrected scalar transport on the GPU.");
+     ch36::fluid::starter::Renderer renderer{};
+     lgp::framework::ApplicationConfiguration config{};
+     config.title = L"Ch36 Eulerian Fluid Advection Starter";
+--- a/chapters/eulerian-fluid-advection/Starter/Renderer.hpp
++++ b/chapters/eulerian-fluid-advection/Starter/Renderer.hpp
+@@ -21,7 +21,7 @@
+   private:
+     struct Slot final
+     {
+-        gpu::Buffer scalar{}, u{}, v{}, prediction{}, final{};
++        gpu::Buffer scalar{}, u{}, v{}, prediction{}, reverse{}, corrected{}, final{};
+         bool used{};
+     };
+     [[nodiscard]] auto Active() const -> gpu::LabConfiguration;
+@@ -32,6 +32,6 @@
+     std::vector<Slot> slots_{};
+     bool rendered_{};
+     Microsoft::WRL::ComPtr<ID3D12RootSignature> computeRoot_{}, graphicsRoot_{};
+-    Microsoft::WRL::ComPtr<ID3D12PipelineState> forward_{}, ghosts_{}, graphics_{};
++    Microsoft::WRL::ComPtr<ID3D12PipelineState> forward_{}, reverse_{}, correct_{}, ghosts_{}, graphics_{};
+ };
+ } // namespace ch36::fluid::starter
+--- a/chapters/eulerian-fluid-advection/Starter/Renderer.cpp
++++ b/chapters/eulerian-fluid-advection/Starter/Renderer.cpp
+@@ -49,16 +49,17 @@
+         return std::unexpected(std::move(compiler.error()));
+     }
+     auto const path = std::filesystem::path{__FILE__}.parent_path() / "FluidLab.hlsl";
+-    std::array<lgp::framework::CompiledShader, 4U> shaders{};
+-    constexpr wchar_t const *names[]{L"ForwardCS", L"GhostCS", L"FullscreenVS", L"TracerPS"};
++    std::array<lgp::framework::CompiledShader, 6U> shaders{};
++    constexpr wchar_t const *names[]{L"ForwardCS", L"ReverseCS", L"CorrectCS", L"GhostCS",
++                                     L"FullscreenVS", L"TracerPS"};
+     for (std::size_t i = 0U; i < shaders.size(); ++i)
+     {
+         auto const *target = L"ps_6_0";
+-        if (i < 2U)
++        if (i < 4U)
+         {
+             target = L"cs_6_0";
+         }
+-        else if (i == 2U)
++        else if (i == 4U)
+         {
+             target = L"vs_6_0";
+         }
+@@ -70,19 +71,19 @@
+         shaders[i] = std::move(*compiled);
+     }
+     auto &device = *resources_->device();
+-    std::array<D3D12_ROOT_PARAMETER, 7U> params{};
++    std::array<D3D12_ROOT_PARAMETER, 9U> params{};
+     params[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+     params[0].Constants.ShaderRegister = 0U;
+     params[0].Constants.Num32BitValues = 10U;
+-    for (UINT i = 0U; i < 4U; ++i)
++    for (UINT i = 0U; i < 6U; ++i)
+     {
+         params[i + 1U].ParameterType = D3D12_ROOT_PARAMETER_TYPE_SRV;
+         params[i + 1U].Descriptor.ShaderRegister = i;
+     }
+     for (UINT i = 0U; i < 2U; ++i)
+     {
+-        params[i + 5U].ParameterType = D3D12_ROOT_PARAMETER_TYPE_UAV;
+-        params[i + 5U].Descriptor.ShaderRegister = i;
++        params[i + 7U].ParameterType = D3D12_ROOT_PARAMETER_TYPE_UAV;
++        params[i + 7U].Descriptor.ShaderRegister = i;
+     }
+     D3D12_ROOT_SIGNATURE_DESC desc{};
+     desc.NumParameters = static_cast<UINT>(params.size());
+@@ -107,7 +108,15 @@
+     {
+         return s;
+     }
+-    if (auto s = build(1U, ghosts_); !s)
++    if (auto s = build(1U, reverse_); !s)
++    {
++        return s;
++    }
++    if (auto s = build(2U, correct_); !s)
++    {
++        return s;
++    }
++    if (auto s = build(3U, ghosts_); !s)
+     {
+         return s;
+     }
+@@ -129,7 +138,7 @@
+     }
+     graphicsRoot_ = std::move(*root);
+     auto pipeline =
+-        gpu::MakeGraphics(device, *graphicsRoot_.Get(), shaders[2], shaders[3], resources_->back_buffer_format());
++        gpu::MakeGraphics(device, *graphicsRoot_.Get(), shaders[4], shaders[5], resources_->back_buffer_format());
+     if (!pipeline)
+     {
+         return std::unexpected(std::move(pipeline.error()));
+@@ -161,7 +170,7 @@
+                 return s;
+             }
+         }
+-        for (auto *buffer : {&slot.prediction})
++        for (auto *buffer : {&slot.prediction, &slot.reverse})
+         {
+             if (auto s = create(*buffer, kScalarBytes, D3D12_HEAP_TYPE_DEFAULT,
+                                 D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, false);
+@@ -170,10 +179,14 @@
+                 return s;
+             }
+         }
+-        if (auto s = create(slot.final, kOutputBytes, D3D12_HEAP_TYPE_DEFAULT,
+-                            D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, false); !s)
+-        {
+-            return s;
++        for (auto *buffer : {&slot.corrected, &slot.final})
++        {
++            if (auto s = create(*buffer, kOutputBytes, D3D12_HEAP_TYPE_DEFAULT,
++                                D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS, false);
++                !s)
++            {
++                return s;
++            }
+         }
+     }
+     return {};
+@@ -222,6 +235,8 @@
+     constexpr auto none = D3D12_BARRIER_ACCESS_NO_ACCESS;
+     constexpr auto noSync = D3D12_BARRIER_SYNC_NONE;
+     transition(slot.prediction, slot.used ? compute : noSync, slot.used ? srv : none, compute, uav);
++    transition(slot.reverse, slot.used ? compute : noSync, slot.used ? srv : none, compute, uav);
++    transition(slot.corrected, slot.used ? compute : noSync, slot.used ? srv : none, compute, uav);
+     transition(slot.final, slot.used ? D3D12_BARRIER_SYNC_PIXEL_SHADING : noSync,
+                slot.used ? srv : none, compute, uav);
+     slot.used = true;
+@@ -243,13 +258,23 @@
+     bind(1U, slot.u);
+     bind(2U, slot.v);
+     bind(3U, slot.prediction);
++    bind(4U, slot.reverse);
++    bind(5U, slot.corrected);
+     auto const groupsX = (config.grid.width + 7U) / 8U;
+     auto const groupsY = (config.grid.height + 7U) / 8U;
+-    list.SetComputeRootUnorderedAccessView(5U, slot.prediction.Get()->GetGPUVirtualAddress());
+-    list.SetComputeRootUnorderedAccessView(6U, slot.final.Get()->GetGPUVirtualAddress());
++    list.SetComputeRootUnorderedAccessView(7U, slot.prediction.Get()->GetGPUVirtualAddress());
++    list.SetComputeRootUnorderedAccessView(8U, slot.corrected.Get()->GetGPUVirtualAddress());
+     list.SetPipelineState(forward_.Get());
+     list.Dispatch(groupsX, groupsY, 1U);
+     transition(slot.prediction, compute, uav, compute, srv);
++    list.SetComputeRootUnorderedAccessView(7U, slot.reverse.Get()->GetGPUVirtualAddress());
++    list.SetPipelineState(reverse_.Get());
++    list.Dispatch(groupsX, groupsY, 1U);
++    transition(slot.reverse, compute, uav, compute, srv);
++    list.SetPipelineState(correct_.Get());
++    list.Dispatch(groupsX, groupsY, 1U);
++    transition(slot.corrected, compute, uav, compute, srv);
++    list.SetComputeRootUnorderedAccessView(8U, slot.final.Get()->GetGPUVirtualAddress());
+     list.SetPipelineState(ghosts_.Get());
+     list.Dispatch((config.grid.width + 9U) / 8U, (config.grid.height + 9U) / 8U, 1U);
+     transition(slot.final, compute, uav, D3D12_BARRIER_SYNC_PIXEL_SHADING, srv);
+@@ -276,6 +301,8 @@
+ {
+     slots_.clear();
+     forward_.Reset();
++    reverse_.Reset();
++    correct_.Reset();
+     ghosts_.Reset();
+     graphics_.Reset();
+     computeRoot_.Reset();
+--- a/chapters/eulerian-fluid-advection/Starter/FluidLab.hlsl
++++ b/chapters/eulerian-fluid-advection/Starter/FluidLab.hlsl
+@@ -16,6 +16,7 @@
+ StructuredBuffer<float> sourceU : register(t1);
+ StructuredBuffer<float> sourceV : register(t2);
+ StructuredBuffer<float> prediction : register(t3);
++StructuredBuffer<float> reverseField : register(t4);
+ StructuredBuffer<float2> outputField : register(t5);
+ RWStructuredBuffer<float> intermediate : register(u0);
+ RWStructuredBuffer<float2> resultField : register(u1);
+@@ -79,6 +80,36 @@
+ }
+ 
+ [numthreads(8, 8, 1)]
++void ReverseCS(uint2 cell : SV_DispatchThreadID)
++{
++    if (cell.x >= width || cell.y >= height) return;
++    intermediate[(cell.y + 1u) * (width + 2u) + cell.x + 1u] =
++        SampleField(3u, Departure(int2(cell), -1.0));
++}
++
++[numthreads(8, 8, 1)]
++void CorrectCS(uint2 cell : SV_DispatchThreadID)
++{
++    if (cell.x >= width || cell.y >= height) return;
++    uint index = (cell.y + 1u) * (width + 2u) + cell.x + 1u;
++    float value = prediction[index];
++    float clamped = 0.0;
++    if (correctedMode != 0u)
++    {
++        float2 p = Departure(int2(cell), 1.0) / cellSize - 0.5;
++        int2 lower = int2(floor(p));
++        float a = Fetch(0u, lower.x, lower.y);
++        float b = Fetch(0u, lower.x + 1, lower.y);
++        float c = Fetch(0u, lower.x, lower.y + 1);
++        float d = Fetch(0u, lower.x + 1, lower.y + 1);
++        float candidate = value + 0.5 * (sourceScalar[index] - reverseField[index]);
++        value = clamp(candidate, min(min(a, b), min(c, d)), max(max(a, b), max(c, d)));
++        clamped = candidate != value ? 1.0 : 0.0;
++    }
++    resultField[index] = float2(value, clamped);
++}
++
++[numthreads(8, 8, 1)]
+ void GhostCS(uint2 thread : SV_DispatchThreadID)
+ {
+     if (thread.x >= width + 2u || thread.y >= height + 2u) return;
+@@ -94,7 +125,7 @@
+         x = clamp(x, 0, int(width) - 1);
+         y = clamp(y, 0, int(height) - 1);
+     }
+-    float2 value = float2(prediction[uint(y + 1) * (width + 2u) + uint(x + 1)], 0.0);
++    float2 value = outputField[uint(y + 1) * (width + 2u) + uint(x + 1)];
+     resultField[thread.y * (width + 2u) + thread.x] = value;
+ }
+ 
