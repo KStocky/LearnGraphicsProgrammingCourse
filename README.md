@@ -1,10 +1,10 @@
 # Learn Graphics Programming
 
-Published learner version: `course-v2026.09.28.1`
+Published learner version: `course-v2026.09.28.2`
 
 This is a complete standalone learner repository. It contains the framework,
 Starter and Solution projects, assets, and cumulative teaching patches for every
-chapter available in `course-v2026.09.28.1`. It does not require a checkout of the private
+chapter available in `course-v2026.09.28.2`. It does not require a checkout of the private
 authoring repository.
 
 ## Requirements
@@ -64,10 +64,11 @@ not included in this learner distribution.
 - [Filtered and Stochastic Soft Shadows](chapters/filtered-and-stochastic-soft-shadows)
 - [Screen-Space Reflections and Indirect Lighting](chapters/screen-space-reflections-and-indirect-lighting)
 - [DXR Foundations: Acceleration Structures and Ray Dispatch](chapters/dxr-foundations)
+- [Volumetric Fog and Light Shafts](chapters/volumetric-fog-and-light-shafts)
 - [GPU Particle Systems](chapters/gpu-particle-systems)
 - [GPU Spatial Binning, Sorting, and Neighbor Search](chapters/gpu-spatial-binning)
 - [Eulerian Fluid Advection and Boundaries](chapters/eulerian-fluid-advection)
 - [GPU Pressure Projection and Linear Solvers](chapters/gpu-pressure-projection)
 
-The matching course site and tagged source archive use the same `course-v2026.09.28.1`
+The matching course site and tagged source archive use the same `course-v2026.09.28.2`
 identifier. Report learner-facing problems in this repository's Issues page.

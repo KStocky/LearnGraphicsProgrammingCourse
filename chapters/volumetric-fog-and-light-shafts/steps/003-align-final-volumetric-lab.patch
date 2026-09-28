@@ -1,0 +1,66 @@
+diff --git a/chapters/volumetric-fog-and-light-shafts/Starter/Main.cpp b/chapters/volumetric-fog-and-light-shafts/Starter/Main.cpp
+--- a/chapters/volumetric-fog-and-light-shafts/Starter/Main.cpp
++++ b/chapters/volumetric-fog-and-light-shafts/Starter/Main.cpp
+@@ -3,9 +3,9 @@
+ #include <lgp/framework/error.hpp>
+ int wmain(int argc, wchar_t **argv)
+ {
+-    ch39::fog::starter::Renderer renderer{};
++    ch39::fog::solution::Renderer renderer{};
+     lgp::framework::ApplicationConfiguration config{};
+-    config.title = L"Synthetic bounded fog - homogeneous unshadowed Starter";
++    config.title = L"Synthetic bounded fog and shadowed single-scattering shafts - Solution";
+     auto result = lgp::framework::RunApplication(config, argc, argv, renderer);
+     if (!result)
+     {
+diff --git a/chapters/volumetric-fog-and-light-shafts/Starter/Renderer.hpp b/chapters/volumetric-fog-and-light-shafts/Starter/Renderer.hpp
+--- a/chapters/volumetric-fog-and-light-shafts/Starter/Renderer.hpp
++++ b/chapters/volumetric-fog-and-light-shafts/Starter/Renderer.hpp
+@@ -1,7 +1,7 @@
+ #pragma once
+ #include "../Common/GpuSupport.hpp"
+ #include <optional>
+-namespace ch39::fog::starter
++namespace ch39::fog::solution
+ {
+ class Renderer final : public lgp::framework::IChapterRenderer
+ {
+@@ -23,4 +23,4 @@
+     std::optional<gpu::Configuration> test_{};
+     bool headless_{};
+ };
+-} // namespace ch39::fog::starter
++} // namespace ch39::fog::solution
+diff --git a/chapters/volumetric-fog-and-light-shafts/Starter/Renderer.cpp b/chapters/volumetric-fog-and-light-shafts/Starter/Renderer.cpp
+--- a/chapters/volumetric-fog-and-light-shafts/Starter/Renderer.cpp
++++ b/chapters/volumetric-fog-and-light-shafts/Starter/Renderer.cpp
+@@ -3,7 +3,7 @@
+ #include <exception>
+ #include <filesystem>
+ #include <lgp/framework/error.hpp>
+-namespace ch39::fog::starter
++namespace ch39::fog::solution
+ {
+ lgp::framework::Status Renderer::Initialize(lgp::framework::ApplicationInitContext const &context)
+ {
+@@ -41,7 +41,7 @@
+             if (result)
+             {
+                 std::printf(
+-                    "Starter: bounded synthetic froxels / circular blocker shafts / jitter / validated history: "
++                    "Solution: bounded synthetic froxels / circular blocker shafts / jitter / validated history: "
+                     "center %.4f outside %.4f T %.4f accepted %.0f\n",
+                     result->Pixel(16, 16, 0), result->Pixel(2, 2, 0), result->Pixel(16, 16, 1),
+                     result->Pixel(16, 16, 3));
+@@ -54,9 +54,9 @@
+     }
+     catch (std::exception const &error)
+     {
+-        std::fprintf(stderr, "Synthetic fog Starter headless readback failed: %s\n", error.what());
++        std::fprintf(stderr, "Synthetic fog Solution headless readback failed: %s\n", error.what());
+     }
+     volume_.Shutdown();
+     resources_ = nullptr;
+ }
+-} // namespace ch39::fog::starter
++} // namespace ch39::fog::solution

@@ -1,0 +1,61 @@
+diff --git a/chapters/volumetric-fog-and-light-shafts/Starter/Renderer.cpp b/chapters/volumetric-fog-and-light-shafts/Starter/Renderer.cpp
+--- a/chapters/volumetric-fog-and-light-shafts/Starter/Renderer.cpp
++++ b/chapters/volumetric-fog-and-light-shafts/Starter/Renderer.cpp
+@@ -40,8 +40,11 @@
+             auto result = ReadBackOutputs();
+             if (result)
+             {
+-                std::printf("Starter: shadowed synthetic froxels center %.4f outside %.4f T %.4f (no history)\n",
+-                            result->Pixel(16, 16, 0), result->Pixel(2, 2, 0), result->Pixel(16, 16, 1));
++                std::printf(
++                    "Starter: bounded synthetic froxels / circular blocker shafts / jitter / validated history: "
++                    "center %.4f outside %.4f T %.4f accepted %.0f\n",
++                    result->Pixel(16, 16, 0), result->Pixel(2, 2, 0), result->Pixel(16, 16, 1),
++                    result->Pixel(16, 16, 3));
+             }
+             else
+             {
+diff --git a/chapters/volumetric-fog-and-light-shafts/Starter/FogLab.hlsl b/chapters/volumetric-fog-and-light-shafts/Starter/FogLab.hlsl
+--- a/chapters/volumetric-fog-and-light-shafts/Starter/FogLab.hlsl
++++ b/chapters/volumetric-fog-and-light-shafts/Starter/FogLab.hlsl
+@@ -58,7 +58,27 @@
+         radiance += transmittance * opacity * albedo * cell.y;
+         transmittance *= 1.0 - opacity;
+     }
+-    integrated[index] = float4(radiance, transmittance, 0.0, 0.0);
++    float accepted = 0.0, rejected = 0.0;
++    if (historyValid != 0)
++    {
++        // No camera/geometry reprojection exists in this fixed-ray lab:
++        // even an in-bounds shifted sample belongs to a different froxel.
++        if (historyShiftX == 0.0)
++        {
++            float4 previous = oldHistory[index];
++            if (historyCompatible != 0.0 && all(isfinite(previous)) && previous.x >= 0.0 &&
++                previous.y >= 0.0 && previous.y <= 1.0 &&
++                abs(previous.z - distance) <= 0.05 && previous.w == signature)
++            {
++                radiance = lerp(radiance, previous.x, 0.75);
++                transmittance = lerp(transmittance, previous.y, 0.75);
++                accepted = 1.0;
++            }
++            else rejected = 1.0;
++        }
++        else rejected = 1.0;
++    }
++    integrated[index] = float4(radiance, transmittance, rejected, accepted);
+     newHistory[index] = float4(radiance, transmittance, distance, signature);
+ }
+ float4 FullscreenVS(uint id : SV_VertexID) : SV_POSITION
+@@ -71,7 +91,11 @@
+     uint2 pixel = min(uint2(position.xy * float2(width, height) /
+                             max(float2(screenWidth, screenHeight), 1.0)), uint2(width - 1, height - 1));
+     float4 fog = preview[pixel.y * width + pixel.x];
++    // Two froxels at top-left report red for rejected history, green for accepted.
++    if (pixel.x < 2 && pixel.y < 2)
++        return float4(fog.z, fog.w, 0, 1);
+     float mapped = fog.x / (1.0 + fog.x);
++    // Synthetic blue surface attenuated by Beer-Lambert; warm scattering adds shafts.
+     return float4(saturate(0.06 * fog.y + 0.7 * mapped),
+                   saturate(0.15 * fog.y + 0.50 * mapped),
+                   saturate(0.35 * fog.y + 0.18 * mapped), 1);
