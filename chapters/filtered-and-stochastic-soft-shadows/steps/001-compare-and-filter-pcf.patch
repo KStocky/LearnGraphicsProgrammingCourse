@@ -1,0 +1,125 @@
+diff --git a/chapters/filtered-and-stochastic-soft-shadows/Starter/Renderer.hpp b/chapters/filtered-and-stochastic-soft-shadows/Starter/Renderer.hpp
+--- a/chapters/filtered-and-stochastic-soft-shadows/Starter/Renderer.hpp
++++ b/chapters/filtered-and-stochastic-soft-shadows/Starter/Renderer.hpp
+@@ -26,6 +26,7 @@
+     };
+     lgp::framework::DeviceResources *resources_{};
+     std::optional<gpu::Configuration> testConfig_{};
++    gpu::Configuration interactive_{gpu::Technique::Pcf};
+     std::vector<Slot> slots_{};
+     Microsoft::WRL::ComPtr<ID3D12RootSignature> computeRoot_{}, graphicsRoot_{};
+     Microsoft::WRL::ComPtr<ID3D12PipelineState> generate_{}, shade_{}, graphics_{};
+diff --git a/chapters/filtered-and-stochastic-soft-shadows/Starter/Renderer.cpp b/chapters/filtered-and-stochastic-soft-shadows/Starter/Renderer.cpp
+--- a/chapters/filtered-and-stochastic-soft-shadows/Starter/Renderer.cpp
++++ b/chapters/filtered-and-stochastic-soft-shadows/Starter/Renderer.cpp
+@@ -33,9 +33,9 @@
+     {
+         return status;
+     }
+-    if (config.technique != gpu::Technique::Hard)
+-    {
+-        return std::unexpected(MakeError("Soft shadow Starter", "Only Hard comparison is implemented in Starter."));
++    if (config.technique != gpu::Technique::Hard && config.technique != gpu::Technique::Pcf)
++    {
++        return std::unexpected(MakeError("Soft shadow Starter", "Only Hard and PCF are implemented in Starter."));
+     }
+     return {};
+ }
+@@ -163,9 +163,20 @@
+ {
+     return {};
+ }
+-Status Renderer::Update(lgp::framework::UpdateContext const &)
+-{
+-    return ValidateStarter(testConfig_.value_or(gpu::Configuration{}));
++Status Renderer::Update(lgp::framework::UpdateContext const &context)
++{
++    if (!testConfig_)
++    {
++        if (context.input.WasKeyPressed('1'))
++        {
++            interactive_.technique = gpu::Technique::Hard;
++        }
++        if (context.input.WasKeyPressed('2'))
++        {
++            interactive_.technique = gpu::Technique::Pcf;
++        }
++    }
++    return ValidateStarter(testConfig_.value_or(interactive_));
+ }
+ void Renderer::ConfigureHeadlessTest(gpu::Configuration const &config)
+ {
+@@ -178,7 +189,7 @@
+     {
+         return std::unexpected(MakeError("Soft shadow render", "Invalid frame slot."));
+     }
+-    auto const config = testConfig_.value_or(gpu::Configuration{});
++    auto const config = testConfig_.value_or(interactive_);
+     if (auto result = ValidateStarter(config); !result)
+     {
+         return result;
+@@ -260,7 +271,7 @@
+         auto result = ReadBackOutputs();
+         if (result)
+         {
+-            std::printf("Soft shadow Starter synthetic-depth hard comparison: center=%.3f outside=%.3f\n",
++            std::printf("Soft shadow Starter synthetic-depth PCF visibility: center=%.3f outside=%.3f\n",
+                         result->visibility[32U * gpu::kResolution + 32U],
+                         result->visibility[32U * gpu::kResolution + 4U]);
+         }
+diff --git a/chapters/filtered-and-stochastic-soft-shadows/Starter/SoftShadowLab.hlsl b/chapters/filtered-and-stochastic-soft-shadows/Starter/SoftShadowLab.hlsl
+--- a/chapters/filtered-and-stochastic-soft-shadows/Starter/SoftShadowLab.hlsl
++++ b/chapters/filtered-and-stochastic-soft-shadows/Starter/SoftShadowLab.hlsl
+@@ -24,22 +24,46 @@
+         length(uv - 0.5) < 0.22 ? blockerDepth : 1.0;
+ }
+ 
++bool InFrustum(float2 uv)
++{
++    return all(uv >= 0.0) && all(uv <= 1.0);
++}
++float DepthAt(float2 uv)
++{
++    // Comparison sampler border convention: taps outside the map are lit.
++    if (!InFrustum(uv))
++        return 1.0;
++    uint2 texel = min(uint2(uv * float(resolution)), resolution - 1);
++    return shadowDepth[texel.y * resolution + texel.x];
++}
+ float CompareDepth(float2 uv)
+ {
+-    // Outside the light's frustum is lit, not a clamped copy of the border.
+-    if (any(uv < 0.0) || any(uv > 1.0))
++    return receiverDepth - bias <= DepthAt(uv) ? 1.0 : 0.0;
++}
++float Pcf(float2 uv, float radius)
++{
++    // The receiver outside the light frustum is lit even if a nearby tap
++    // happens to land inside the map.
++    if (!InFrustum(uv))
+         return 1.0;
+-    uint2 texel = min(uint2(uv * float(resolution)), resolution - 1);
+-    return receiverDepth - bias <= shadowDepth[texel.y * resolution + texel.x] ? 1.0 : 0.0;
++    float sum = 0.0;
++    [unroll] for (int y = -2; y <= 2; ++y)
++        [unroll] for (int x = -2; x <= 2; ++x)
++            sum += CompareDepth(uv + float2(x, y) * radius / (2.0 * resolution));
++    return sum / 25.0;
+ }
+-
+ [numthreads(8, 8, 1)]
+ void ShadeCS(uint2 pixel : SV_DispatchThreadID)
+ {
+     if (pixel.x >= resolution || pixel.y >= resolution)
+         return;
+     float2 uv = (float2(pixel) + 0.5) / float(resolution) + receiverUvOffset;
+-    visibility[pixel.y * resolution + pixel.x] = CompareDepth(uv);
++    float result;
++    if (method == 1)
++        result = Pcf(uv, 2.0);
++    else
++        result = CompareDepth(uv);
++    visibility[pixel.y * resolution + pixel.x] = result;
+ }
+ 
+ float4 FullscreenVS(uint id : SV_VertexID) : SV_POSITION

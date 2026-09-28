@@ -1,0 +1,68 @@
+diff --git a/chapters/filtered-and-stochastic-soft-shadows/Starter/Main.cpp b/chapters/filtered-and-stochastic-soft-shadows/Starter/Main.cpp
+--- a/chapters/filtered-and-stochastic-soft-shadows/Starter/Main.cpp
++++ b/chapters/filtered-and-stochastic-soft-shadows/Starter/Main.cpp
+@@ -5,9 +5,9 @@
+ 
+ int wmain(int argc, wchar_t **argv)
+ {
+-    ch38::soft_shadows::starter::Renderer renderer{};
++    ch38::soft_shadows::solution::Renderer renderer{};
+     lgp::framework::ApplicationConfiguration config{};
+-    config.title = L"Filtered and Stochastic Soft Shadows - Starter";
++    config.title = L"Soft Shadows - 1 Hard 2 PCF 3 PCSS 4 Area [ ] Radius";
+     auto result = lgp::framework::RunApplication(config, argc, argv, renderer);
+     if (!result)
+     {
+diff --git a/chapters/filtered-and-stochastic-soft-shadows/Starter/Renderer.hpp b/chapters/filtered-and-stochastic-soft-shadows/Starter/Renderer.hpp
+--- a/chapters/filtered-and-stochastic-soft-shadows/Starter/Renderer.hpp
++++ b/chapters/filtered-and-stochastic-soft-shadows/Starter/Renderer.hpp
+@@ -5,7 +5,7 @@
+ #include <optional>
+ #include <vector>
+ 
+-namespace ch38::soft_shadows::starter
++namespace ch38::soft_shadows::solution
+ {
+ class Renderer final : public lgp::framework::IChapterRenderer
+ {
+@@ -35,4 +35,4 @@
+     bool rendered_{};
+     bool headlessCli_{};
+ };
+-} // namespace ch38::soft_shadows::starter
++} // namespace ch38::soft_shadows::solution
+diff --git a/chapters/filtered-and-stochastic-soft-shadows/Starter/Renderer.cpp b/chapters/filtered-and-stochastic-soft-shadows/Starter/Renderer.cpp
+--- a/chapters/filtered-and-stochastic-soft-shadows/Starter/Renderer.cpp
++++ b/chapters/filtered-and-stochastic-soft-shadows/Starter/Renderer.cpp
+@@ -10,7 +10,7 @@
+ #include <filesystem>
+ #include <utility>
+ 
+-namespace ch38::soft_shadows::starter
++namespace ch38::soft_shadows::solution
+ {
+ namespace
+ {
+@@ -26,7 +26,6 @@
+     float receiverUvOffsetX, receiverUvOffsetY;
+ };
+ static_assert(sizeof(Parameters) == 10U * sizeof(std::uint32_t));
+-
+ } // namespace
+ 
+ Status Renderer::Initialize(lgp::framework::ApplicationInitContext const &context)
+@@ -285,7 +284,7 @@
+         auto result = ReadBackOutputs();
+         if (result)
+         {
+-            std::printf("Soft shadow Starter synthetic-depth area visibility: center=%.3f outside=%.3f\n",
++            std::printf("Soft shadow Solution synthetic-depth area visibility: center=%.3f outside=%.3f\n",
+                         result->visibility[32U * gpu::kResolution + 32U],
+                         result->visibility[32U * gpu::kResolution + 4U]);
+         }
+@@ -303,4 +302,4 @@
+     resources_ = nullptr;
+     rendered_ = false;
+ }
+-} // namespace ch38::soft_shadows::starter
++} // namespace ch38::soft_shadows::solution

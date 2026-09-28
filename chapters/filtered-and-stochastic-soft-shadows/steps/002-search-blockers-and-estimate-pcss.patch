@@ -1,0 +1,105 @@
+diff --git a/chapters/filtered-and-stochastic-soft-shadows/Starter/Renderer.hpp b/chapters/filtered-and-stochastic-soft-shadows/Starter/Renderer.hpp
+--- a/chapters/filtered-and-stochastic-soft-shadows/Starter/Renderer.hpp
++++ b/chapters/filtered-and-stochastic-soft-shadows/Starter/Renderer.hpp
+@@ -26,7 +26,7 @@
+     };
+     lgp::framework::DeviceResources *resources_{};
+     std::optional<gpu::Configuration> testConfig_{};
+-    gpu::Configuration interactive_{gpu::Technique::Pcf};
++    gpu::Configuration interactive_{gpu::Technique::Pcss};
+     std::vector<Slot> slots_{};
+     Microsoft::WRL::ComPtr<ID3D12RootSignature> computeRoot_{}, graphicsRoot_{};
+     Microsoft::WRL::ComPtr<ID3D12PipelineState> generate_{}, shade_{}, graphics_{};
+diff --git a/chapters/filtered-and-stochastic-soft-shadows/Starter/Renderer.cpp b/chapters/filtered-and-stochastic-soft-shadows/Starter/Renderer.cpp
+--- a/chapters/filtered-and-stochastic-soft-shadows/Starter/Renderer.cpp
++++ b/chapters/filtered-and-stochastic-soft-shadows/Starter/Renderer.cpp
+@@ -33,9 +33,10 @@
+     {
+         return status;
+     }
+-    if (config.technique != gpu::Technique::Hard && config.technique != gpu::Technique::Pcf)
+-    {
+-        return std::unexpected(MakeError("Soft shadow Starter", "Only Hard and PCF are implemented in Starter."));
++    if (config.technique != gpu::Technique::Hard && config.technique != gpu::Technique::Pcf &&
++        config.technique != gpu::Technique::Pcss)
++    {
++        return std::unexpected(MakeError("Soft shadow Starter", "Only Hard, PCF and PCSS are implemented in Starter."));
+     }
+     return {};
+ }
+@@ -174,6 +175,18 @@
+         if (context.input.WasKeyPressed('2'))
+         {
+             interactive_.technique = gpu::Technique::Pcf;
++        }
++        if (context.input.WasKeyPressed('3'))
++        {
++            interactive_.technique = gpu::Technique::Pcss;
++        }
++        if (context.input.WasKeyPressed(VK_OEM_4))
++        {
++            interactive_.lightRadius = std::max(0.0F, interactive_.lightRadius - 0.01F);
++        }
++        if (context.input.WasKeyPressed(VK_OEM_6))
++        {
++            interactive_.lightRadius = std::min(0.2F, interactive_.lightRadius + 0.01F);
+         }
+     }
+     return ValidateStarter(testConfig_.value_or(interactive_));
+@@ -271,7 +284,7 @@
+         auto result = ReadBackOutputs();
+         if (result)
+         {
+-            std::printf("Soft shadow Starter synthetic-depth PCF visibility: center=%.3f outside=%.3f\n",
++            std::printf("Soft shadow Starter synthetic-depth PCSS visibility: center=%.3f outside=%.3f\n",
+                         result->visibility[32U * gpu::kResolution + 32U],
+                         result->visibility[32U * gpu::kResolution + 4U]);
+         }
+diff --git a/chapters/filtered-and-stochastic-soft-shadows/Starter/SoftShadowLab.hlsl b/chapters/filtered-and-stochastic-soft-shadows/Starter/SoftShadowLab.hlsl
+--- a/chapters/filtered-and-stochastic-soft-shadows/Starter/SoftShadowLab.hlsl
++++ b/chapters/filtered-and-stochastic-soft-shadows/Starter/SoftShadowLab.hlsl
+@@ -52,6 +52,35 @@
+             sum += CompareDepth(uv + float2(x, y) * radius / (2.0 * resolution));
+     return sum / 25.0;
+ }
++float Pcss(float2 uv)
++{
++    if (!InFrustum(uv))
++        return 1.0;
++    if (lightRadius == 0.0)
++        return CompareDepth(uv);
++    float searchRadius = min(lightRadius * max(receiverDepth - 0.1, 0.0) /
++                                 max(receiverDepth, 0.001), 0.18);
++    float blockers = 0.0, total = 0.0;
++    [unroll] for (int y = -2; y <= 2; ++y)
++        [unroll] for (int x = -2; x <= 2; ++x)
++        {
++            float depth = DepthAt(uv + float2(x, y) * searchRadius * 0.5);
++            if (depth < receiverDepth - bias)
++            {
++                total += depth;
++                blockers += 1.0;
++            }
++        }
++    if (blockers == 0.0)
++        return 1.0;
++    float averageDepth = total / blockers;
++    // Both depths are normalized *linear* light-space distances. A blocker
++    // exactly at zero has an unbounded ideal depth ratio; clamp the finite
++    // filter radius to keep this bounded GPU demonstration well-defined.
++    float penumbra = lightRadius * max(receiverDepth - averageDepth, 0.0) /
++                     max(averageDepth, 0.001);
++    return Pcf(uv, min(penumbra * resolution, 12.0));
++}
+ [numthreads(8, 8, 1)]
+ void ShadeCS(uint2 pixel : SV_DispatchThreadID)
+ {
+@@ -61,6 +90,8 @@
+     float result;
+     if (method == 1)
+         result = Pcf(uv, 2.0);
++    else if (method == 2)
++        result = Pcss(uv);
+     else
+         result = CompareDepth(uv);
+     visibility[pixel.y * resolution + pixel.x] = result;
