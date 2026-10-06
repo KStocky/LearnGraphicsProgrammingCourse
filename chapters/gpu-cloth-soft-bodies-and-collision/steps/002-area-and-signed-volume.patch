@@ -1,0 +1,37 @@
+--- a/chapters/gpu-cloth-soft-bodies-and-collision/Starter/Renderer.hpp
++++ b/chapters/gpu-cloth-soft-bodies-and-collision/Starter/Renderer.hpp
+@@ -13,7 +13,7 @@
+ 
+ namespace ch41::cloth::LGP_CLOTH_VARIANT
+ {
+-inline constexpr Stage kStage = Stage::Distance;
++inline constexpr Stage kStage = Stage::Shape;
+ class Renderer final : public lgp::framework::IChapterRenderer
+ {
+   public:
+--- a/chapters/gpu-cloth-soft-bodies-and-collision/Starter/ClothLab.hlsl
++++ b/chapters/gpu-cloth-soft-bodies-and-collision/Starter/ClothLab.hlsl
+@@ -107,7 +107,22 @@
+ }
+ void ProjectShape(uint i, Constraint c)
+ {
+-    // Learner checkpoint: this physics stage is disabled by the trusted host kStage.
++    float value; float3 g[4];
++    if (!Evaluate(c, value, g)) return;
++    float alpha = c.compliance * complianceScale / (dt * dt);
++    float lambda = asfloat(Arena.Load(Lambda + i * 4));
++    float denominator = alpha;
++    for (uint a = 0; a < Arity(c); ++a)
++        denominator += LoadParticle(P, c.v[a]).weight * dot(g[a], g[a]);
++    float residual = value - c.rest + alpha * lambda;
++    if (denominator <= 1e-12) { if (abs(residual) > 1e-6) Error(5); return; }
++    float dl = -residual / denominator;
++    Arena.Store(Lambda + i * 4, asuint(lambda + dl));
++    for (uint b = 0; b < Arity(c); ++b)
++    {
++        Particle p = LoadParticle(P, c.v[b]);
++        if (p.weight > 0) { p.position += p.weight * dl * g[b]; StoreParticle(P, c.v[b], p); }
++    }
+ }
+ [numthreads(1, 1, 1)]
+ void BeginTick(uint3 id : SV_DispatchThreadID)

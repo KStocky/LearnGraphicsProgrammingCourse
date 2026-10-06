@@ -1,0 +1,75 @@
+--- a/chapters/gpu-cloth-soft-bodies-and-collision/Starter/Renderer.hpp
++++ b/chapters/gpu-cloth-soft-bodies-and-collision/Starter/Renderer.hpp
+@@ -13,7 +13,7 @@
+ 
+ namespace ch41::cloth::LGP_CLOTH_VARIANT
+ {
+-inline constexpr Stage kStage = Stage::Environment;
++inline constexpr Stage kStage = Stage::SelfContact;
+ class Renderer final : public lgp::framework::IChapterRenderer
+ {
+   public:
+--- a/chapters/gpu-cloth-soft-bodies-and-collision/Starter/ClothLab.hlsl
++++ b/chapters/gpu-cloth-soft-bodies-and-collision/Starter/ClothLab.hlsl
+@@ -247,11 +247,59 @@
+ [numthreads(1, 1, 1)]
+ void BinSort(uint3 id : SV_DispatchThreadID)
+ {
+-    // Learner checkpoint: this physics stage is disabled by the trusted host kStage.
++    if (stage < 4 || (flags & 2) == 0 || Arena.Load(Status) != 0) return;
++    for (uint i = 0; i < particles; ++i)
++    {
++        Particle p = LoadParticle(P, i);
++        if (!Domain(p.position)) { Error(8); return; }
++        StoreParticle(Snapshot, i, p);
++        uint2 entry = uint2(Key(Cell(p.position)), i);
++        // Stable insertion sort by cell key then stable particle identity, bounded to 32 entries.
++        uint j = i;
++        while (j > 0)
++        {
++            uint2 prev = Arena.Load2(Keys + (j - 1) * 8);
++            if (prev.x < entry.x || (prev.x == entry.x && prev.y < entry.y)) break;
++            Arena.Store2(Keys + j * 8, prev);
++            --j;
++        }
++        Arena.Store2(Keys + j * 8, entry);
++    }
+ }
+ void SelfGather(uint i)
+ {
+-    // Learner checkpoint: this physics stage is disabled by the trusted host kStage.
++    Particle p = LoadParticle(Snapshot, i);
++    int3 cell = Cell(p.position);
++    float3 correction = 0;
++    for (int z = -1; z <= 1; ++z)
++    for (int y = -1; y <= 1; ++y)
++    for (int x = -1; x <= 1; ++x)
++    {
++        int3 neighbor = cell + int3(x, y, z);
++        if (any(neighbor < 0) || any(neighbor >= 32)) continue;
++        uint key = Key(neighbor);
++        for (uint k = 0; k < particles; ++k)
++        {
++            uint2 entry = Arena.Load2(Keys + k * 8);
++            if (entry.x < key) continue;
++            if (entry.x > key) break;
++            uint j = entry.y;
++            if (j == i || Excluded(i, j)) continue;
++            uint old;
++            if (i < j) Arena.InterlockedAdd(Status + 12, 1, old);
++            Particle q = LoadParticle(Snapshot, j);
++            float3 delta = p.position - q.position;
++            float distance = length(delta);
++            float penetration = p.radius + q.radius - distance;
++            if (penetration <= 0) continue;
++            float weight = p.weight + q.weight;
++            if (weight == 0) { Error(10); return; }
++            if (i < j) Arena.InterlockedAdd(Status + 8, 1, old);
++            float3 normal = distance > 1e-7 ? delta / distance : float3(i < j ? -1.0 : 1.0, 0, 0);
++            correction += normal * (penetration * p.weight / weight);
++        }
++    }
++    if (p.weight > 0) { p.position += correction; StoreParticle(P, i, p); }
+ }
+ [numthreads(32, 1, 1)]
+ void SelfContact(uint3 id : SV_DispatchThreadID)

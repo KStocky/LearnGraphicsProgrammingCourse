@@ -1,0 +1,66 @@
+--- a/chapters/gpu-cloth-soft-bodies-and-collision/Starter/Renderer.hpp
++++ b/chapters/gpu-cloth-soft-bodies-and-collision/Starter/Renderer.hpp
+@@ -13,7 +13,7 @@
+ 
+ namespace ch41::cloth::LGP_CLOTH_VARIANT
+ {
+-inline constexpr Stage kStage = Stage::SelfContact;
++inline constexpr Stage kStage = Stage::All;
+ class Renderer final : public lgp::framework::IChapterRenderer
+ {
+   public:
+--- a/chapters/gpu-cloth-soft-bodies-and-collision/Starter/ClothLab.hlsl
++++ b/chapters/gpu-cloth-soft-bodies-and-collision/Starter/ClothLab.hlsl
+@@ -185,7 +185,51 @@
+ }
+ void TearTopology()
+ {
+-    // Learner checkpoint: this physics stage is disabled by the trusted host kStage.
++    for (uint i = 0; i < constraints; ++i)
++    {
++        Constraint c = LoadConstraint(i);
++        if (c.kind > 1 || Arena.Load(Active + i * 4) == 0) continue;
++        float strain = length(LoadParticle(P, c.v.x).position - LoadParticle(P, c.v.y).position);
++        if (strain > c.rest * c.ratio) Arena.Store(Active + i * 4, 0);
++    }
++    for (uint j = 0; j < constraints; ++j)
++    {
++        Constraint c = LoadConstraint(j);
++        if (c.kind > 1 || Arena.Load(Active + j * 4) != 0) continue;
++        for (uint t = 0; t < triangles; ++t)
++        {
++            uint4 v = Input.Load4(TriangleInput + t * 16);
++            if (Has(v, 3, c.v.x) && Has(v, 3, c.v.y)) Arena.Store(Faces + t * 4, 0);
++        }
++        for (uint t = 0; t < tetrahedra; ++t)
++        {
++            uint4 v = Input.Load4(TetInput + t * 16);
++            if (Has(v, 4, c.v.x) && Has(v, 4, c.v.y)) Arena.Store(Tets + t * 4, 0);
++        }
++    }
++    for (uint j = 0; j < constraints; ++j)
++    {
++        Constraint c = LoadConstraint(j);
++        if (c.kind == 3)
++        {
++            for (uint t = 0; t < triangles; ++t)
++            {
++                uint4 v = Input.Load4(TriangleInput + t * 16);
++                if (Arena.Load(Faces + t * 4) == 0 && Has(v, 3, c.v.x) && Has(v, 3, c.v.y) && Has(v, 3, c.v.z))
++                    Arena.Store(Active + j * 4, 0);
++            }
++        }
++        if (c.kind == 4)
++        {
++            for (uint t = 0; t < tetrahedra; ++t)
++            {
++                uint4 v = Input.Load4(TetInput + t * 16);
++                if (Arena.Load(Tets + t * 4) == 0 && Has(v, 4, c.v.x) && Has(v, 4, c.v.y) &&
++                    Has(v, 4, c.v.z) && Has(v, 4, c.v.w)) Arena.Store(Active + j * 4, 0);
++            }
++        }
++        if (Arena.Load(Active + j * 4) == 0) Arena.Store(Lambda + j * 4, 0);
++    }
+ }
+ [numthreads(1, 1, 1)]
+ void Tear(uint3 id : SV_DispatchThreadID)

@@ -1,0 +1,44 @@
+--- a/chapters/gpu-cloth-soft-bodies-and-collision/Starter/Renderer.hpp
++++ b/chapters/gpu-cloth-soft-bodies-and-collision/Starter/Renderer.hpp
+@@ -13,7 +13,7 @@
+ 
+ namespace ch41::cloth::LGP_CLOTH_VARIANT
+ {
+-inline constexpr Stage kStage = Stage::Shape;
++inline constexpr Stage kStage = Stage::Environment;
+ class Renderer final : public lgp::framework::IChapterRenderer
+ {
+   public:
+--- a/chapters/gpu-cloth-soft-bodies-and-collision/Starter/ClothLab.hlsl
++++ b/chapters/gpu-cloth-soft-bodies-and-collision/Starter/ClothLab.hlsl
+@@ -194,7 +194,29 @@
+ }
+ void ContactParticle(uint i)
+ {
+-    // Learner checkpoint: this physics stage is disabled by the trusted host kStage.
++    Particle p = LoadParticle(P, i);
++    float3 start = LoadParticle(Start, i).position;
++    for (uint collider = 0; collider < 2; ++collider)
++    {
++        float3 normal = float3(0, 1, 0);
++        float penetration = p.radius - p.position.y;
++        if (collider == 1)
++        {
++            float3 delta = p.position - float3(0, 0.55, 0);
++            float distance = length(delta);
++            penetration = 0.35 + p.radius - distance;
++            normal = distance > 1e-7 ? delta / distance : float3(0, 1, 0);
++        }
++        if (penetration <= 0) continue;
++        if (p.weight == 0) { Error(10); return; }
++        uint old; Arena.InterlockedAdd(Status + 8, 1, old);
++        p.position += normal * penetration;
++        float3 displacement = p.position - start;
++        float3 tangent = displacement - normal * dot(displacement, normal);
++        float magnitude = length(tangent);
++        if (magnitude > 1e-7) p.position -= tangent * (min(magnitude, friction * penetration) / magnitude);
++    }
++    StoreParticle(P, i, p);
+ }
+ [numthreads(32, 1, 1)]
+ void Environment(uint3 id : SV_DispatchThreadID)
