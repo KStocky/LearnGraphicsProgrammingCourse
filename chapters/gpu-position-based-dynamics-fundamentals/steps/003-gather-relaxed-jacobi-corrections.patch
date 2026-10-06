@@ -1,0 +1,35 @@
+diff --git a/chapters/gpu-position-based-dynamics-fundamentals/Starter/Renderer.hpp b/chapters/gpu-position-based-dynamics-fundamentals/Starter/Renderer.hpp
+--- a/chapters/gpu-position-based-dynamics-fundamentals/Starter/Renderer.hpp
++++ b/chapters/gpu-position-based-dynamics-fundamentals/Starter/Renderer.hpp
+@@ -5,7 +5,7 @@
+ namespace ch40::pbd::LGP_PBD_VARIANT
+ {
+ 
+-inline constexpr gpu::Stage kStage = gpu::Stage::Compliance;
++inline constexpr gpu::Stage kStage = gpu::Stage::Jacobi;
+ 
+ class Renderer final : public lgp::framework::IChapterRenderer
+ {
+diff --git a/chapters/gpu-position-based-dynamics-fundamentals/Starter/PbdLab.hlsl b/chapters/gpu-position-based-dynamics-fundamentals/Starter/PbdLab.hlsl
+--- a/chapters/gpu-position-based-dynamics-fundamentals/Starter/PbdLab.hlsl
++++ b/chapters/gpu-position-based-dynamics-fundamentals/Starter/PbdLab.hlsl
+@@ -222,7 +222,18 @@
+     if (index >= particleCount)
+         return;
+     Particle p = LoadParticle(inputOffset, index);
+-    // The Jacobi checkpoint will gather per-constraint corrections here.
++    float3 sum = 0;
++    // Deterministic ascending constraint order; input positions remain immutable.
++    for (uint edge = 0; edge < constraintCount; ++edge)
++    {
++        Constraint c = LoadConstraint(edge);
++        if (c.first == index)
++            sum += asfloat(Arena.Load3(CorrectionBase + edge * 32));
++        if (c.kind == 0 && c.second == index)
++            sum += asfloat(Arena.Load3(CorrectionBase + edge * 32 + 16));
++    }
++    if (p.weight > 0)
++        p.position += sum;
+     StoreParticle(outputOffset, index, p);
+ }
+ 

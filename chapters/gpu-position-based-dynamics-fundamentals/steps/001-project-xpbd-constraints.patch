@@ -1,0 +1,71 @@
+diff --git a/chapters/gpu-position-based-dynamics-fundamentals/Starter/Renderer.hpp b/chapters/gpu-position-based-dynamics-fundamentals/Starter/Renderer.hpp
+--- a/chapters/gpu-position-based-dynamics-fundamentals/Starter/Renderer.hpp
++++ b/chapters/gpu-position-based-dynamics-fundamentals/Starter/Renderer.hpp
+@@ -5,7 +5,7 @@
+ namespace ch40::pbd::LGP_PBD_VARIANT
+ {
+ 
+-inline constexpr gpu::Stage kStage = gpu::Stage::FreeMotion;
++inline constexpr gpu::Stage kStage = gpu::Stage::Colored;
+ 
+ class Renderer final : public lgp::framework::IChapterRenderer
+ {
+diff --git a/chapters/gpu-position-based-dynamics-fundamentals/Starter/PbdLab.hlsl b/chapters/gpu-position-based-dynamics-fundamentals/Starter/PbdLab.hlsl
+--- a/chapters/gpu-position-based-dynamics-fundamentals/Starter/PbdLab.hlsl
++++ b/chapters/gpu-position-based-dynamics-fundamentals/Starter/PbdLab.hlsl
+@@ -95,8 +95,53 @@
+ }
+ Correction ProjectConstraint(uint index, float damping)
+ {
+-    // Free motion: the learner will implement the XPBD gradient and multiplier.
+-    return (Correction)0;
++    Constraint c = LoadConstraint(index);
++    Particle first = LoadParticle(inputOffset, c.first);
++    float3 other = c.anchor;
++    float secondWeight = 0;
++    if (c.kind == 0)
++    {
++        Particle second = LoadParticle(inputOffset, c.second);
++        other = second.position;
++        secondWeight = second.weight;
++    }
++    float3 separation = first.position - other;
++    float magnitude = length(separation);
++    float value = magnitude - c.rest;
++    Correction correction = (Correction)0;
++    if (!all(isfinite(separation)) || !isfinite(magnitude))
++    {
++        Fail(11); // NonFiniteResult
++        return correction;
++    }
++    if (c.kind == 0 && magnitude <= Epsilon)
++    {
++        Fail(6); // DegenerateDistance; no undocumented direction fallback.
++        return correction;
++    }
++    float weight = first.weight + secondWeight;
++    if (weight == 0)
++    {
++        if (abs(value) > Epsilon)
++            Fail(7); // NoMovableParticle
++        return correction;
++    }
++    float alphaTilde = complianceEnabled != 0 ? c.compliance / (dt * dt) : 0;
++    float lambda = asfloat(Arena.Load(Lambdas + index * 4));
++    correction.deltaLambda = -damping * (value + alphaTilde * lambda) / (weight + alphaTilde);
++    // A satisfied zero-length attachment has no gradient, not a divide by zero.
++    float3 gradient = 0;
++    if (magnitude > Epsilon)
++        gradient = separation / magnitude;
++    correction.first = first.weight * gradient * correction.deltaLambda;
++    correction.second = -secondWeight * gradient * correction.deltaLambda;
++    if (!all(isfinite(correction.first)) || !all(isfinite(correction.second)) ||
++        !isfinite(correction.deltaLambda))
++    {
++        Fail(11);
++        return (Correction)0;
++    }
++    return correction;
+ }
+ void StoreCorrection(uint index, Correction correction)
+ {

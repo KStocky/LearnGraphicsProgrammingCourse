@@ -67,6 +67,7 @@ set(
     volumetric-fog-and-light-shafts
     gpu-particle-systems
     gpu-spatial-binning
+    gpu-position-based-dynamics-fundamentals
     eulerian-fluid-advection
     gpu-pressure-projection)
 
@@ -84,7 +85,7 @@ function(lgp_chapter_is_selected chapter result)
     endif()
 endfunction()
 
-set(LGP_COURSE_VERSION "course-v2026.10.06.4" CACHE STRING "Published course version" FORCE)
+set(LGP_COURSE_VERSION "course-v2026.10.06.5" CACHE STRING "Published course version" FORCE)
 set(CMAKE_CXX_STANDARD 23)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)

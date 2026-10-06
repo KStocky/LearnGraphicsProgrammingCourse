@@ -1,0 +1,12 @@
+diff --git a/chapters/gpu-position-based-dynamics-fundamentals/Starter/Renderer.hpp b/chapters/gpu-position-based-dynamics-fundamentals/Starter/Renderer.hpp
+--- a/chapters/gpu-position-based-dynamics-fundamentals/Starter/Renderer.hpp
++++ b/chapters/gpu-position-based-dynamics-fundamentals/Starter/Renderer.hpp
+@@ -5,7 +5,7 @@
+ namespace ch40::pbd::LGP_PBD_VARIANT
+ {
+ 
+-inline constexpr gpu::Stage kStage = gpu::Stage::Colored;
++inline constexpr gpu::Stage kStage = gpu::Stage::Compliance;
+ 
+ class Renderer final : public lgp::framework::IChapterRenderer
+ {

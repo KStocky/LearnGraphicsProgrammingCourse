@@ -1,0 +1,39 @@
+diff --git a/chapters/gpu-position-based-dynamics-fundamentals/Starter/Renderer.hpp b/chapters/gpu-position-based-dynamics-fundamentals/Starter/Renderer.hpp
+--- a/chapters/gpu-position-based-dynamics-fundamentals/Starter/Renderer.hpp
++++ b/chapters/gpu-position-based-dynamics-fundamentals/Starter/Renderer.hpp
+@@ -5,7 +5,7 @@
+ namespace ch40::pbd::LGP_PBD_VARIANT
+ {
+ 
+-inline constexpr gpu::Stage kStage = gpu::Stage::Jacobi;
++inline constexpr gpu::Stage kStage = gpu::Stage::All;
+ 
+ class Renderer final : public lgp::framework::IChapterRenderer
+ {
+diff --git a/chapters/gpu-position-based-dynamics-fundamentals/Starter/PbdLab.hlsl b/chapters/gpu-position-based-dynamics-fundamentals/Starter/PbdLab.hlsl
+--- a/chapters/gpu-position-based-dynamics-fundamentals/Starter/PbdLab.hlsl
++++ b/chapters/gpu-position-based-dynamics-fundamentals/Starter/PbdLab.hlsl
+@@ -246,11 +246,21 @@
+ 
+ int3 Quantize(float3 correction)
+ {
+-    return int3(0, 0, 0);
++    // Adding 0.5 first can round a float just below half up to one.
++    // Split the fraction before the exact bounded integer increment instead.
++    float3 scaled = abs(correction * Scale);
++    float3 whole = floor(scaled);
++    float3 fraction = scaled - whole;
++    int3 magnitude = int3(whole) + int3(fraction >= 0.5);
++    return int3(sign(correction)) * magnitude;
+ }
+ void AddIntegers(uint particle, float3 correction)
+ {
+-    // The integer-atomic checkpoint will quantize and accumulate bounded vectors.
++    int3 fixed = Quantize(correction);
++    uint address = Integers + particle * 16;
++    Arena.InterlockedAdd(address, fixed.x);
++    Arena.InterlockedAdd(address + 4, fixed.y);
++    Arena.InterlockedAdd(address + 8, fixed.z);
+ }
+ 
+ [numthreads(32, 1, 1)]
