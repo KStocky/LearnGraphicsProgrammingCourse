@@ -1,0 +1,48 @@
+--- a/chapters/sph-particle-fluid-simulation/Starter/Physics.hlsli
++++ b/chapters/sph-particle-fluid-simulation/Starter/Physics.hlsli
+@@ -1,22 +1,30 @@
+-#define SPH_STAGE 0
++#define SPH_STAGE 1
+ static const float PI = 3.14159265358979323846;
+ 
+-// Stage 1: replace the zero probes with the support-radius kernels.
++// 3D support radius R; units W=m^-3, gradient=m^-4, Laplacian=m^-5.
+ float Poly6(float r)
+ {
+-    return 0;
++    if (r >= radius) return 0;
++    float q = 1 - r * r / (radius * radius);
++    return 315 / (64 * PI * radius * radius * radius) * q * q * q;
+ }
+ float3 Poly6Gradient(float3 d)
+ {
+-    return 0;
++    float r = length(d);
++    if (r >= radius) return 0;
++    float q = 1 - dot(d, d) / (radius * radius);
++    return -945 / (32 * PI * pow(radius, 5)) * q * q * d;
+ }
+ float3 SpikyGradient(float3 d)
+ {
+-    return 0;
++    float r = length(d);
++    if (r == 0 || r >= radius) return 0;
++    float q = 1 - r / radius;
++    return -45 / (PI * pow(radius, 4)) * q * q * d / r;
+ }
+ float ViscosityLaplacian(float r)
+ {
+-    return 0;
++    return r < radius ? 45 / (PI * pow(radius, 5)) * (1 - r / radius) : 0;
+ }
+ 
+ // Stage 2: include each accepted mass, including self, and convert density to pressure.
+--- a/chapters/sph-particle-fluid-simulation/Starter/Stage.hpp
++++ b/chapters/sph-particle-fluid-simulation/Starter/Stage.hpp
+@@ -1,5 +1,5 @@
+ #include "../Common/SphContracts.hpp"
+ namespace ch42::sph::LGP_SPH_VARIANT
+ {
+-inline constexpr Stage kStage = Stage::Gravity;
++inline constexpr Stage kStage = Stage::Kernels;
+ }

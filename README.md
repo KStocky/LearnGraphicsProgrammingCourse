@@ -1,10 +1,10 @@
 # Learn Graphics Programming
 
-Published learner version: `course-v2026.10.06.6`
+Published learner version: `course-v2026.10.06.7`
 
 This is a complete standalone learner repository. It contains the framework,
 Starter and Solution projects, assets, and cumulative teaching patches for every
-chapter available in `course-v2026.10.06.6`. It does not require a checkout of the private
+chapter available in `course-v2026.10.06.7`. It does not require a checkout of the private
 authoring repository.
 
 ## Requirements
@@ -69,8 +69,9 @@ not included in this learner distribution.
 - [GPU Spatial Binning, Sorting, and Neighbor Search](chapters/gpu-spatial-binning)
 - [GPU Position-Based Dynamics Fundamentals](chapters/gpu-position-based-dynamics-fundamentals)
 - [GPU Cloth, Soft Bodies, and Collision](chapters/gpu-cloth-soft-bodies-and-collision)
+- [SPH Particle Fluid Simulation](chapters/sph-particle-fluid-simulation)
 - [Eulerian Fluid Advection and Boundaries](chapters/eulerian-fluid-advection)
 - [GPU Pressure Projection and Linear Solvers](chapters/gpu-pressure-projection)
 
-The matching course site and tagged source archive use the same `course-v2026.10.06.6`
+The matching course site and tagged source archive use the same `course-v2026.10.06.7`
 identifier. Report learner-facing problems in this repository's Issues page.

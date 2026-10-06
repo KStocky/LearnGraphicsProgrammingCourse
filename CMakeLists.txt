@@ -69,6 +69,7 @@ set(
     gpu-spatial-binning
     gpu-position-based-dynamics-fundamentals
     gpu-cloth-soft-bodies-and-collision
+    sph-particle-fluid-simulation
     eulerian-fluid-advection
     gpu-pressure-projection)
 
@@ -86,7 +87,7 @@ function(lgp_chapter_is_selected chapter result)
     endif()
 endfunction()
 
-set(LGP_COURSE_VERSION "course-v2026.10.06.6" CACHE STRING "Published course version" FORCE)
+set(LGP_COURSE_VERSION "course-v2026.10.06.7" CACHE STRING "Published course version" FORCE)
 set(CMAKE_CXX_STANDARD 23)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)

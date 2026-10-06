@@ -1,0 +1,37 @@
+--- a/chapters/sph-particle-fluid-simulation/Starter/Physics.hlsli
++++ b/chapters/sph-particle-fluid-simulation/Starter/Physics.hlsli
+@@ -1,4 +1,4 @@
+-#define SPH_STAGE 2
++#define SPH_STAGE 3
+ static const float PI = 3.14159265358979323846;
+ 
+ // 3D support radius R; units W=m^-3, gradient=m^-4, Laplacian=m^-5.
+@@ -37,10 +37,17 @@
+     return signedPressure != 0 ? p : max(p, 0);
+ }
+ 
+-// Stage 3: gather pair pressure and dynamic-viscosity acceleration.
+ float3 PairAcceleration(Particle a, Particle b, Sample sa, Sample sb)
+ {
+-    return 0;
++    float3 d = a.position - b.position;
++    float r = length(d);
++    if (a.identity == b.identity || r >= radius) return 0;
++    float3 pressure = -b.mass * (sa.pressure / (sa.density * sa.density) +
++                               sb.pressure / (sb.density * sb.density)) * SpikyGradient(d);
++    // Dynamic viscosity mu [kg/(m*s)]; F_ij=mu*m_i*m_j/(rho_i*rho_j)*(v_j-v_i)*lap.
++    float3 viscosity = dynamicViscosity * b.mass / (sa.density * sb.density) *
++                       (b.velocity - a.velocity) * ViscosityLaplacian(r);
++    return pressure + viscosity;
+ }
+ 
+ // Supplied gravity-only baseline. Stage 4 adds explicit projection/restitution.
+--- a/chapters/sph-particle-fluid-simulation/Starter/Stage.hpp
++++ b/chapters/sph-particle-fluid-simulation/Starter/Stage.hpp
+@@ -1,5 +1,5 @@
+ #include "../Common/SphContracts.hpp"
+ namespace ch42::sph::LGP_SPH_VARIANT
+ {
+-inline constexpr Stage kStage = Stage::Density;
++inline constexpr Stage kStage = Stage::Forces;
+ }

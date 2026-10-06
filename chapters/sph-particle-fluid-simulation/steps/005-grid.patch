@@ -1,0 +1,71 @@
+--- a/chapters/sph-particle-fluid-simulation/Starter/Physics.hlsli
++++ b/chapters/sph-particle-fluid-simulation/Starter/Physics.hlsli
+@@ -1,4 +1,4 @@
+-#define SPH_STAGE 4
++#define SPH_STAGE 5
+ static const float PI = 3.14159265358979323846;
+ 
+ // 3D support radius R; units W=m^-3, gradient=m^-4, Laplacian=m^-5.
+@@ -84,11 +84,49 @@
+     if (any(p.position < -2) || any(p.position >= 2)) Fail(5);
+ }
+ 
+-// Stage 5: replace this complete O(N) query with the sorted-cell cursor.
++// Serial cursor per owner, binary lower bound for each of the complete 27 neighboring cells.
+ bool NextCandidate(float3 position, inout uint cursor, inout uint record, out uint identity)
+ {
+     identity = 0;
+-    if (record >= count) return false;
+-    identity = record++;
+-    return true;
++    if (useGrid == 0)
++    {
++        if (record >= count) return false;
++        identity = record++;
++        return true;
++    }
++    int3 home = int3(floor((position + 2) / radius));
++    uint dimensions = uint(4 / radius);
++    // The snapshot already rejected invalid positions; match the last-cell rounding policy.
++    home = min(home, int3(dimensions - 1, dimensions - 1, dimensions - 1));
++    while (cursor < 27)
++    {
++        int3 offset = int3(int(cursor % 3) - 1, int((cursor / 3) % 3) - 1, int(cursor / 9) - 1);
++        int3 cell = home + offset;
++        if (any(cell < 0) || any(cell >= int(dimensions)))
++        {
++            ++cursor;
++            record = 0xffffffff;
++            continue;
++        }
++        uint key = uint(cell.x) + dimensions * (uint(cell.y) + dimensions * uint(cell.z));
++        if (record == 0xffffffff)
++        {
++            uint lo = 0, hi = count;
++            while (lo < hi)
++            {
++                uint mid = (lo + hi) / 2;
++                if (arena.Load(KEYS + mid * 8) < key) lo = mid + 1;
++                else hi = mid;
++            }
++            record = lo;
++        }
++        if (record < count && arena.Load(KEYS + record * 8) == key)
++        {
++            identity = arena.Load(KEYS + record++ * 8 + 4);
++            return true;
++        }
++        ++cursor;
++        record = 0xffffffff;
++    }
++    return false;
+ }
+--- a/chapters/sph-particle-fluid-simulation/Starter/Stage.hpp
++++ b/chapters/sph-particle-fluid-simulation/Starter/Stage.hpp
+@@ -1,5 +1,5 @@
+ #include "../Common/SphContracts.hpp"
+ namespace ch42::sph::LGP_SPH_VARIANT
+ {
+-inline constexpr Stage kStage = Stage::Contact;
++inline constexpr Stage kStage = Stage::Grid;
+ }

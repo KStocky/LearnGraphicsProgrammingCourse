@@ -1,0 +1,46 @@
+--- a/chapters/sph-particle-fluid-simulation/Starter/Physics.hlsli
++++ b/chapters/sph-particle-fluid-simulation/Starter/Physics.hlsli
+@@ -1,4 +1,4 @@
+-#define SPH_STAGE 3
++#define SPH_STAGE 4
+ static const float PI = 3.14159265358979323846;
+ 
+ // 3D support radius R; units W=m^-3, gradient=m^-4, Laplacian=m^-5.
+@@ -50,7 +50,6 @@
+     return pressure + viscosity;
+ }
+ 
+-// Supplied gravity-only baseline. Stage 4 adds explicit projection/restitution.
+ void IntegrateParticle(inout Particle p, float3 acceleration, out float motion, out uint contacts)
+ {
+     p.velocity += (acceleration + gravity) * dt;
+@@ -68,6 +67,20 @@
+         return;
+     }
+     p.position += displacement;
++    if (walls != 0)
++    {
++        for (uint axis = 0; axis < 3; ++axis)
++        {
++            if (p.position[axis] < -1.99 || p.position[axis] > 1.99)
++            {
++                p.position[axis] = clamp(p.position[axis], -1.99, 1.99);
++                if ((p.position[axis] < 0 && p.velocity[axis] < 0) ||
++                    (p.position[axis] > 0 && p.velocity[axis] > 0))
++                    p.velocity[axis] *= -restitution;
++                ++contacts;
++            }
++        }
++    }
+     if (any(p.position < -2) || any(p.position >= 2)) Fail(5);
+ }
+ 
+--- a/chapters/sph-particle-fluid-simulation/Starter/Stage.hpp
++++ b/chapters/sph-particle-fluid-simulation/Starter/Stage.hpp
+@@ -1,5 +1,5 @@
+ #include "../Common/SphContracts.hpp"
+ namespace ch42::sph::LGP_SPH_VARIANT
+ {
+-inline constexpr Stage kStage = Stage::Forces;
++inline constexpr Stage kStage = Stage::Contact;
+ }
