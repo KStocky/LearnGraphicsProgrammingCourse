@@ -1,0 +1,46 @@
+--- a/chapters/pic-flip-particle-grid-transfers/Starter/Transfers.hlsli
++++ b/chapters/pic-flip-particle-grid-transfers/Starter/Transfers.hlsli
+@@ -1,8 +1,30 @@
+-// Stage zero deliberately performs identity transfer; unfinished helpers are gated off.
++// Reader-owned transfer math. Addressing never precedes geometric clipping.
+ struct Stencil { uint face[8]; float weight[8]; uint count; };
+ Stencil Support(float3 position, uint axis)
+ {
+-    return (Stencil)0;
++    Stencil s = (Stencil)0;
++    float3 offset = 0.5;
++    offset[axis] = 0;
++    float3 q = (position + 1) / 0.5 - offset;
++    int3 base = int3(floor(q));
++    float3 fraction = q - floor(q);
++    int3 shape = 4;
++    shape[axis] = 5;
++    float sum = 0;
++    for (uint corner = 0; corner < 8; ++corner)
++    {
++        int3 bit = int3(corner & 1, (corner >> 1) & 1, (corner >> 2) & 1);
++        int3 index = base + bit;
++        float3 tent = lerp(1 - fraction, fraction, float3(bit));
++        float w = tent.x * tent.y * tent.z;
++        if (any(index < 0) || any(index >= shape) || w <= 0) continue;
++        s.face[s.count] = axis * 80 + uint(index.x + shape.x * (index.y + shape.y * index.z));
++        s.weight[s.count++] = w;
++        sum += w;
++    }
++    if (sum <= 0) { Fail(6); return s; }
++    for (uint j = 0; j < s.count; ++j) s.weight[j] /= sum;
++    return s;
+ }
+ void AddFloat(uint address, float value)
+ {
+--- a/chapters/pic-flip-particle-grid-transfers/Starter/Stage.hpp
++++ b/chapters/pic-flip-particle-grid-transfers/Starter/Stage.hpp
+@@ -1,6 +1,6 @@
+ #pragma once
+ #ifdef __HLSL_VERSION
+-#define TRANSFER_STAGE 0
++#define TRANSFER_STAGE 1
+ #else
+-inline constexpr Stage kStage = Stage::Identity;
++inline constexpr Stage kStage = Stage::Support;
+ #endif

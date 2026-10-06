@@ -1,0 +1,41 @@
+--- a/chapters/pic-flip-particle-grid-transfers/Starter/Transfers.hlsli
++++ b/chapters/pic-flip-particle-grid-transfers/Starter/Transfers.hlsli
+@@ -28,9 +28,27 @@
+ }
+ void AddFloat(uint address, float value)
+ {
++    uint expected = AtomicLoad(address);
++    for (uint retry = 0; retry < 4096; ++retry)
++    {
++        float sum = asfloat(expected) + value;
++        if (!isfinite(sum)) { Fail(3); return; }
++        uint observed, unused;
++        arena.InterlockedAdd(STATUS + 12, 1, unused);
++        arena.InterlockedCompareExchange(address, expected, asuint(sum), observed);
++        if (observed == expected) return;
++        expected = observed;
++    }
++    Fail(9);
+ }
+ void ScatterParticle(Particle p, uint axis, Stencil s)
+ {
++    for (uint j = 0; j < s.count; ++j)
++    {
++        float m = p.mass * s.weight[j];
++        AddFloat(FACES + s.face[j] * 32, m);
++        AddFloat(FACES + s.face[j] * 32 + 4, m * p.velocity[axis]);
++    }
+ }
+ void NormalizeFace(uint face)
+ {
+--- a/chapters/pic-flip-particle-grid-transfers/Starter/Stage.hpp
++++ b/chapters/pic-flip-particle-grid-transfers/Starter/Stage.hpp
+@@ -1,6 +1,6 @@
+ #pragma once
+ #ifdef __HLSL_VERSION
+-#define TRANSFER_STAGE 1
++#define TRANSFER_STAGE 2
+ #else
+-inline constexpr Stage kStage = Stage::Support;
++inline constexpr Stage kStage = Stage::Scatter;
+ #endif

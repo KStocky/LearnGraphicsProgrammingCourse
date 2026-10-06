@@ -71,7 +71,8 @@ set(
     gpu-cloth-soft-bodies-and-collision
     sph-particle-fluid-simulation
     eulerian-fluid-advection
-    gpu-pressure-projection)
+    gpu-pressure-projection
+    pic-flip-particle-grid-transfers)
 
 foreach(chapter IN LISTS LGP_SELECTED_CHAPTERS)
     if(NOT chapter IN_LIST LGP_IMPLEMENTED_CHAPTERS)
@@ -87,7 +88,7 @@ function(lgp_chapter_is_selected chapter result)
     endif()
 endfunction()
 
-set(LGP_COURSE_VERSION "course-v2026.10.06.7" CACHE STRING "Published course version" FORCE)
+set(LGP_COURSE_VERSION "course-v2026.10.06.8" CACHE STRING "Published course version" FORCE)
 set(CMAKE_CXX_STANDARD 23)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)

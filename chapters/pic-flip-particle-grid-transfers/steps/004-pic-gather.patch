@@ -1,0 +1,34 @@
+--- a/chapters/pic-flip-particle-grid-transfers/Starter/Transfers.hlsli
++++ b/chapters/pic-flip-particle-grid-transfers/Starter/Transfers.hlsli
+@@ -71,7 +71,19 @@
+ }
+ float Gather(Stencil s, bool delta)
+ {
+-    return 0;
++    float value = 0, sum = 0;
++    for (uint j = 0; j < s.count; ++j)
++    {
++        uint address = FACES + s.face[j] * 32;
++        uint2 valid = arena.Load2(address + 16);
++        if (delta && valid.x != valid.y) { Fail(7); return 0; }
++        if (valid.y == 0 || (delta && valid.x == 0)) continue;
++        float2 velocity = asfloat(arena.Load2(address + 8));
++        value += s.weight[j] * (delta ? velocity.y - velocity.x : velocity.y);
++        sum += s.weight[j];
++    }
++    if (sum <= 0) { Fail(6); return 0; }
++    return value / sum;
+ }
+ float3 TransferVelocity(Particle p, float3 pic, float3 delta)
+ {
+--- a/chapters/pic-flip-particle-grid-transfers/Starter/Stage.hpp
++++ b/chapters/pic-flip-particle-grid-transfers/Starter/Stage.hpp
+@@ -1,6 +1,6 @@
+ #pragma once
+ #ifdef __HLSL_VERSION
+-#define TRANSFER_STAGE 3
++#define TRANSFER_STAGE 4
+ #else
+-inline constexpr Stage kStage = Stage::Normalize;
++inline constexpr Stage kStage = Stage::Pic;
+ #endif

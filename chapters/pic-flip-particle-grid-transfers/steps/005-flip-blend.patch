@@ -1,0 +1,20 @@
+--- a/chapters/pic-flip-particle-grid-transfers/Starter/Transfers.hlsli
++++ b/chapters/pic-flip-particle-grid-transfers/Starter/Transfers.hlsli
+@@ -87,5 +87,5 @@
+ }
+ float3 TransferVelocity(Particle p, float3 pic, float3 delta)
+ {
+-    return p.velocity;
++    return (1 - alpha) * pic + alpha * (p.velocity + delta);
+ }
+--- a/chapters/pic-flip-particle-grid-transfers/Starter/Stage.hpp
++++ b/chapters/pic-flip-particle-grid-transfers/Starter/Stage.hpp
+@@ -1,6 +1,6 @@
+ #pragma once
+ #ifdef __HLSL_VERSION
+-#define TRANSFER_STAGE 4
++#define TRANSFER_STAGE 5
+ #else
+-inline constexpr Stage kStage = Stage::Pic;
++inline constexpr Stage kStage = Stage::Flip;
+ #endif

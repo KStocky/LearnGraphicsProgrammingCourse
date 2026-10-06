@@ -1,0 +1,36 @@
+--- a/chapters/pic-flip-particle-grid-transfers/Starter/Transfers.hlsli
++++ b/chapters/pic-flip-particle-grid-transfers/Starter/Transfers.hlsli
+@@ -52,6 +52,22 @@
+ }
+ void NormalizeFace(uint face)
+ {
++    uint address = FACES + face * 32;
++    float mass = asfloat(arena.Load(address));
++    if (mass <= 0) return; // Clear explicitly marked this face invalid.
++    float momentum = asfloat(arena.Load(address + 4));
++    uint axis = face / 80;
++    float before = momentum / mass;
++    if (field == 1) before = float(axis + 1);
++    if (field == 2)
++    {
++        float3 p = FacePosition(face);
++        before = float(axis + 1) + 0.3 * p.x - 0.2 * p.y + 0.1 * p.z;
++    }
++    float after = before + increment[axis];
++    if (!isfinite(before) || !isfinite(after)) { Fail(3); return; }
++    arena.Store2(address + 8, asuint(float2(before, after)));
++    arena.Store2(address + 16, uint2(field == 4 ? 0 : 1, field >= 3 ? 0 : 1));
+ }
+ float Gather(Stencil s, bool delta)
+ {
+--- a/chapters/pic-flip-particle-grid-transfers/Starter/Stage.hpp
++++ b/chapters/pic-flip-particle-grid-transfers/Starter/Stage.hpp
+@@ -1,6 +1,6 @@
+ #pragma once
+ #ifdef __HLSL_VERSION
+-#define TRANSFER_STAGE 2
++#define TRANSFER_STAGE 3
+ #else
+-inline constexpr Stage kStage = Stage::Scatter;
++inline constexpr Stage kStage = Stage::Normalize;
+ #endif
